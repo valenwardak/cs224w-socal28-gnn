@@ -219,9 +219,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# meters.txt
-meters.txt
-
 # my credentials
 dataset_api_credentials.json
 
