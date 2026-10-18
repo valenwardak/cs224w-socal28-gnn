@@ -231,3 +231,6 @@ download_log.csv
 
 # Local link to the merged data folder, never committed
 data
+
+# Caltech topology files are small and must be committed
+!topology/**/*.csv
