@@ -4,6 +4,8 @@
 #              GNN event detection on the SoCal 28-Bus dataset
 # Authors:     Valen Wardak and Landon Choy, Stanford University
 # Created:     2026-10-16
+# Revised:     2026-10-18  never write into or delete a pre-existing folder;
+#                          print error types; tolerate existing _failed entries
 #
 # Purpose:     Helper functions for downloading SoCal 28-Bus data from the
 #              Caltech API, one meter and one month per request, into the
@@ -25,11 +27,10 @@
 #              2. whole month, one channel at a time
 #              3. split the date range in half, repeat, down to one day
 #
-# Why this layout:
-#              The Caltech client names each output file by channel only
-#              (no date in the name). Two calls into the same folder
-#              overwrite each other. One folder per meter and date range
-#              avoids this.
+# Safety:      A folder that already exists is never written into and never
+#              deleted, whether or not it has a DONE marker. Only a folder
+#              this run creates is downloaded into, and only that folder is
+#              removed if its download fails.
 #
 # Requirements:
 #              dataset_api_client.py (from caltech-netlab/digital-twin-dataset)
@@ -49,7 +50,7 @@ import csv
 import json
 # Standard library: file and folder operations
 import os
-# Standard library: removing partial folders after a failed attempt
+# Standard library: removing a folder this run created, after a failed attempt
 import shutil
 # Standard library: pausing between retries
 import time
@@ -182,9 +183,20 @@ def mark_done(folder):
 
 
 def mark_failed(meter_dir, label):
-    """Create an empty marker folder under _failed for a failed attempt."""
-    # Make the marker folder, fine if it already exists
-    os.makedirs(os.path.join(meter_dir, FAILED_DIR, label), exist_ok=True)
+    """
+    Create an empty marker under _failed for a failed attempt.
+
+    Older downloads stored these markers as files rather than folders, so
+    an existing entry of either kind is left as it is.
+    """
+    # Full path of the marker
+    marker = os.path.join(meter_dir, FAILED_DIR, label)
+    # Leave an existing file or folder alone
+    if os.path.exists(marker):
+        # Nothing to do
+        return
+    # Make the marker folder
+    os.makedirs(marker)
 
 
 def write_request(folder, payload):
@@ -238,9 +250,10 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
     """
     Make one request for the given channels and date range, with retries.
 
-    Writes request.json first, then calls the Caltech client. On success
-    writes DONE and returns ("ok", attempts). On failure removes the partial
-    folder and returns ("failed", attempts).
+    The folder must not exist yet; the caller checks that. Writes
+    request.json first, then calls the Caltech client. On success writes
+    DONE and returns ("ok", attempts). On failure removes the folder this
+    call created and returns ("failed", attempts).
     """
     # Element names such as egauge_1-L1
     elements = [f"{meter}-{channel}" for channel in channels]
@@ -248,7 +261,7 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
     kwarg_name = CLIENT_KWARG[data_type]
     # The server's end bound is exclusive, so request through the end of the last day
     time_range = (datetime.combine(start, datetime.min.time()), datetime.combine(end + timedelta(days=1), datetime.min.time()))
-    # Record what we are asking for
+    # Record what we are asking for; this also creates the folder
     write_request(folder, {
         # Meter name
         "meter": meter,
@@ -275,13 +288,13 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
             return "ok", attempt
         # Something went wrong on this attempt
         except Exception as error:
-            # Report the failure
-            print(f"    attempt {attempt} failed: {error}")
+            # Report the failure with its type, since some errors carry no message
+            print(f"    attempt {attempt} failed: {type(error).__name__}: {error!r}")
             # Wait before trying again, unless this was the last attempt
             if attempt <= retries:
                 # Pause
                 time.sleep(retry_wait)
-    # Remove the partial folder so a rerun does not mistake it for data
+    # Remove only the folder this call created
     shutil.rmtree(folder, ignore_errors=True)
     # All attempts failed
     return "failed", retries + 1
@@ -301,6 +314,14 @@ def download_channel_range(client, output_dir, meter, data_type, channel, start,
     # Skip if already complete
     if is_done(folder):
         # Nothing to do
+        return
+    # Never touch a folder that exists without a DONE marker
+    if os.path.exists(folder):
+        # Report and leave it alone
+        print(f"  {meter} {label} exists without DONE, skipped")
+        # Record in the log
+        append_log(output_dir, [meter, data_type, label, "skipped_existing", 0, datetime.now().isoformat(timespec="seconds")])
+        # Nothing more
         return
     # Progress line
     print(f"  {meter} {label}")
@@ -343,6 +364,14 @@ def download_meter_month(client, output_dir, meter, data_type, channels, start, 
         print(f"  skip {meter} {label} (DONE)")
         # Nothing to do
         return
+    # Never touch a folder that exists without a DONE marker
+    if os.path.exists(folder):
+        # Report and leave it alone
+        print(f"  {meter} {label} exists without DONE, skipped")
+        # Record in the log
+        append_log(output_dir, [meter, data_type, label, "skipped_existing", 0, datetime.now().isoformat(timespec="seconds")])
+        # Nothing more
+        return
     # Progress line
     print(f"  {meter} {label} ({len(channels)} channels)")
     # Make the request for all channels
@@ -363,8 +392,11 @@ def download_meter_month(client, output_dir, meter, data_type, channels, start, 
 
 def find_missing_channels(output_dir, meters):
     """
-    Scan every DONE folder, compare the channels in request.json with the
-    files present, and return {meter: {label: [missing channels]}}.
+    Scan every DONE folder that has a request.json, compare the channels
+    requested with the files present, and return
+    {meter: {label: [missing channels]}}.
+
+    Folders from older downloads without request.json are skipped.
     """
     # Result dictionary
     missing = {}
@@ -384,10 +416,20 @@ def find_missing_channels(output_dir, meters):
             if not is_done(folder):
                 # Next folder
                 continue
+            # Path of the request record
+            request_path = os.path.join(folder, REQUEST_FILE)
+            # Skip folders without one
+            if not os.path.exists(request_path):
+                # Next folder
+                continue
             # Read what was requested
-            with open(os.path.join(folder, REQUEST_FILE)) as f:
+            with open(request_path) as f:
                 # Parse JSON
                 request = json.load(f)
+            # Older request files may not have a channels list
+            if "channels" not in request:
+                # Next folder
+                continue
             # Collect every file name under the folder
             present = {name for _, _, files in os.walk(folder) for name in files}
             # Channels whose file did not come back
