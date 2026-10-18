@@ -20,7 +20,8 @@ The data is not stored in this repo. Each team member downloads it with the scri
 
 1. Download: `main_socal.py` pulls raw phasor CSVs from the Caltech API into `data/`.
 2. Preprocess: `main_preprocess.py` turns the raw files into aligned, masked Parquet tables in `data/processed/`, plus the event table and a coverage report.
-3. Graph and models: built from `data/processed/` and `topology/` (next stage).
+3. Split: `main_splits.py` writes `splits.json`, the fixed train / validation / test blocks that every later script reads.
+4. Graph and models: built from `data/processed/`, `topology/`, and `splits.json` (next stage).
 
 ## Step 1: get access (once per person)
 
@@ -94,7 +95,7 @@ Needs the `topology/` folder, which is Caltech's `sample_dataset/topology` copie
 python main_preprocess.py
 ```
 
-Rerunning skips months already built. `--force` rebuilds. Options: `python main_preprocess.py --help`
+Rerunning skips months already built. `--force` rebuilds. Options: `python main_preprocess.py --help`. The full run takes about an hour and produces about 25 GB.
 
 Output under `data/processed/`:
 
@@ -107,17 +108,36 @@ Output under `data/processed/`:
 
 Read a table with `pandas.read_parquet`. Drop the columns you do not need; the harmonics 1 and 2 columns are kept so nobody has to rerun preprocessing to test them.
 
+## Step 5: splits
+
+```bash
+python main_splits.py
+```
+
+Writes `splits.json` in the repo root and prints, per split, the days, coverage, events, and episodes it contains. `splits.json` is committed: it is the single definition of which dates are train, validation, and test, and every model and evaluation script reads it. Dates in it are inclusive calendar days in fixed Pacific Standard Time, with UTC bounds given for each block.
+
+The split is by time blocks, fixed before any model is trained:
+
+- test_events: each event day with a 2-day margin on both sides; November 26 to December 7, 2023 is one block.
+- test_normal: April 1 to August 31, 2025, where false alarms per day are measured.
+- validation: January 8 to 21, 2024 and February 3 to 16, 2025, for early stopping and conformal calibration.
+- train: everything else from August 15, 2023 to September 3, 2025.
+
+Train and validation contain no scored event. The event log is used only to define normal data and to score; the models never see a label.
+
 ## Data facts the code relies on
 
-Established by the scripts in `checks/`, which can be rerun with `--data-dir ../data`:
+Established by the scripts in `checks/`, which can be rerun with `--data-dir ../data`, and by the coverage report:
 
 - Meter timestamps are fixed Pacific Standard Time all year, no daylight saving shift (`main_dst.py`: 15 of 15 clock-change nights show normal row counts).
 - All meter clocks agree to within one ten-second reading (`main_clocks.py`: 20 meters stop at 17:52:10 on November 13, 2024).
 - The operator log uses the same time base as the meters (`main_clocks.py`: 14 meters stop at 14:04:10 on September 17, 2023, logged 14:04:17). UTC is therefore time plus 8 hours for readings and log alike.
 - egauge_1 and egauge_2 are not in the network file and are excluded. egauge_23 and egauge_24 are in it and are downloaded.
+- Meters present over time: egauge_3 and 4 report from September 2024 only; egauge_15 stops after September 2024; egauge_23 stops after June 2024. So 20 meters report in each year, not the same 20.
 - Phase labels for egauge_13, 14, 15, 20 follow the network file, not the L1 L2 L3 order. `meters.json` carries the map.
 - February 1, 2024 is logged at exactly midnight with nothing visible in the readings and is not scored. That leaves 32 changes on 5 days in about 7 episodes.
 - September 26, 2023 shows large current steps one hour before the logged times on several meters. The logged times for that day are unverified against the readings.
+- Site-wide outages: September 28 to October 27, 2023; July 18 to September 4, 2024; October 30 to November 6 and December 12 to 22, 2024. August 2025 has meter-specific gaps on egauge_4, 10, 11, 12, 14, 16.
 
 ## Files
 
@@ -128,6 +148,8 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `dataset_api_client.py` | Caltech's API client, unchanged |
 | `main_preprocess.py` | Preprocessing main script |
 | `socal_preprocess.py` | Preprocessing helper functions |
+| `main_splits.py` | Writes `splits.json` and reports each split |
+| `splits.json` | The fixed train / validation / test blocks |
 | `merge_years.sh` | Merges two per-year download folders into one |
 | `meters.txt` | The 22 meters, one per line |
 | `requirements.txt` | Python packages |

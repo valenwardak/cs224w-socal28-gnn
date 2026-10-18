@@ -1,0 +1,112 @@
+{
+  "time_base": "Dates are inclusive calendar days in fixed Pacific Standard Time (UTC-8, no daylight saving). UTC bounds are given for each block; end_utc_exclusive is the first instant after the block.",
+  "utc_offset_hours": 8,
+  "record": {
+    "start": "2023-08-15",
+    "end": "2025-09-03"
+  },
+  "train": [
+    {
+      "start": "2023-08-15",
+      "end": "2023-09-14",
+      "start_utc": "2023-08-15T08:00:00+00:00",
+      "end_utc_exclusive": "2023-09-15T08:00:00+00:00"
+    },
+    {
+      "start": "2023-09-20",
+      "end": "2023-09-23",
+      "start_utc": "2023-09-20T08:00:00+00:00",
+      "end_utc_exclusive": "2023-09-24T08:00:00+00:00"
+    },
+    {
+      "start": "2023-09-29",
+      "end": "2023-11-23",
+      "start_utc": "2023-09-29T08:00:00+00:00",
+      "end_utc_exclusive": "2023-11-24T08:00:00+00:00"
+    },
+    {
+      "start": "2023-12-10",
+      "end": "2024-01-07",
+      "start_utc": "2023-12-10T08:00:00+00:00",
+      "end_utc_exclusive": "2024-01-08T08:00:00+00:00"
+    },
+    {
+      "start": "2024-01-22",
+      "end": "2024-11-10",
+      "start_utc": "2024-01-22T08:00:00+00:00",
+      "end_utc_exclusive": "2024-11-11T08:00:00+00:00"
+    },
+    {
+      "start": "2024-11-16",
+      "end": "2025-02-02",
+      "start_utc": "2024-11-16T08:00:00+00:00",
+      "end_utc_exclusive": "2025-02-03T08:00:00+00:00"
+    },
+    {
+      "start": "2025-02-17",
+      "end": "2025-03-31",
+      "start_utc": "2025-02-17T08:00:00+00:00",
+      "end_utc_exclusive": "2025-04-01T08:00:00+00:00"
+    },
+    {
+      "start": "2025-09-01",
+      "end": "2025-09-03",
+      "start_utc": "2025-09-01T08:00:00+00:00",
+      "end_utc_exclusive": "2025-09-04T08:00:00+00:00"
+    }
+  ],
+  "validation": [
+    {
+      "start": "2024-01-08",
+      "end": "2024-01-21",
+      "start_utc": "2024-01-08T08:00:00+00:00",
+      "end_utc_exclusive": "2024-01-22T08:00:00+00:00"
+    },
+    {
+      "start": "2025-02-03",
+      "end": "2025-02-16",
+      "start_utc": "2025-02-03T08:00:00+00:00",
+      "end_utc_exclusive": "2025-02-17T08:00:00+00:00"
+    }
+  ],
+  "test_events": [
+    {
+      "start": "2023-09-15",
+      "end": "2023-09-19",
+      "start_utc": "2023-09-15T08:00:00+00:00",
+      "end_utc_exclusive": "2023-09-20T08:00:00+00:00"
+    },
+    {
+      "start": "2023-09-24",
+      "end": "2023-09-28",
+      "start_utc": "2023-09-24T08:00:00+00:00",
+      "end_utc_exclusive": "2023-09-29T08:00:00+00:00"
+    },
+    {
+      "start": "2023-11-24",
+      "end": "2023-12-09",
+      "start_utc": "2023-11-24T08:00:00+00:00",
+      "end_utc_exclusive": "2023-12-10T08:00:00+00:00"
+    },
+    {
+      "start": "2024-11-11",
+      "end": "2024-11-15",
+      "start_utc": "2024-11-11T08:00:00+00:00",
+      "end_utc_exclusive": "2024-11-16T08:00:00+00:00"
+    }
+  ],
+  "test_normal": [
+    {
+      "start": "2025-04-01",
+      "end": "2025-08-31",
+      "start_utc": "2025-04-01T08:00:00+00:00",
+      "end_utc_exclusive": "2025-09-01T08:00:00+00:00"
+    }
+  ],
+  "scoring": {
+    "excluded_event_days": [
+      "2024-02-01"
+    ],
+    "event_margin_days": 2
+  }
+}
