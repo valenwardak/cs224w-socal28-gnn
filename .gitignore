@@ -228,3 +228,6 @@ egauge_*/
 missing_channels.json
 download_log.csv
 *.csv
+
+# Local link to the merged data folder, never committed
+data
