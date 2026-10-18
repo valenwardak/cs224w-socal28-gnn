@@ -1,0 +1,7 @@
+requests
+stream-unzip
+tqdm
+pyperclip
+pandas
+numpy
+pyarrow
