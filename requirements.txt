@@ -11,3 +11,6 @@ networkx
 shapely
 matplotlib
 python-dateutil
+scipy
+pytz
+ntplib
