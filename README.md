@@ -21,7 +21,8 @@ The data is not stored in this repo. Each team member downloads it with the scri
 1. Download: `main_socal.py` pulls raw phasor CSVs from the Caltech API into `data/`.
 2. Preprocess: `main_preprocess.py` turns the raw files into aligned, masked Parquet tables in `data/processed/`, plus the event table and a coverage report.
 3. Split: `main_splits.py` writes `splits.json`, the fixed train / validation / test blocks that every later script reads.
-4. Graph and models: built from `data/processed/`, `topology/`, and `splits.json` (next stage).
+4. Physics baseline: `main_physics.py` runs a least-squares state estimator with no learning over any window or split and writes a residual per ten-second slot to `data/processed/physics/`.
+5. Learned models: GRU baseline and the GNNs, built from `data/processed/`, `topology/`, and `splits.json` (next stage).
 
 ## Step 1: get access (once per person)
 
@@ -127,6 +128,39 @@ The split is by time blocks, fixed before any model is trained:
 
 Train and validation contain no scored event. The event log is used only to define normal data and to score; the models never see a label.
 
+## Step 6: physics baseline
+
+A least-squares state estimator, following Caltech's bus injection model in their `code_examples/state_estimation_phasor.py`. For every ten-second slot it takes the measured voltage and current phasors and the admittance matrix of a fixed reference wiring (the normal switch state), solves for the bus voltages that best fit the circuit equations, and reports the residual: the leftover gap between the readings and the wiring, averaged over readings and expressed in percent of nominal. When a switch changes state the readings stop fitting the fixed wiring and the residual shifts. No training.
+
+Needs `caltech_utils/`, which is Caltech's `utils` folder copied unchanged into this repo. Their `global_param.py` expects that folder to be named `utils/` and the topology to sit under `sample_dataset/`; `socal_physics.py` redirects those paths at startup, so their files are not edited.
+
+The reference wiring, the connected component to keep, and the map from meter currents to bus injections (with the clamp sign for each) are in `physics_config.json`. The map and signs are copied from Caltech's example and cover the A-side circuit, meters 3, 7, 9, 11, 13, 15, 19, 21. Phase angles are shifted to the slot time with `toff` before use.
+
+First check, Caltech's normal hour (paper Section VI-A reports 0.851 percent; this code gives 0.55 percent on the same hour with two more voltage meters):
+
+```bash
+python main_physics.py --start 2024-11-14T15:00:00 --end 2024-11-14T16:00:00
+```
+
+A whole split:
+
+```bash
+python main_physics.py --split test_events
+```
+
+Options: `python main_physics.py --help`. `--solver cvxpy` (default) matches Caltech's objective, about 200 slots per second. `--solver numpy` is the plain least-squares version, much faster, for long windows.
+
+Output under `data/processed/physics/`, one pair of files per block:
+
+| File | Content |
+|------|---------|
+| `<label>.parquet` | Per slot: `residual` (objective value), `residual_mean` (per reading, fraction), `n_voltage`, `n_current`, `status` (`ok`, `no_data`, `too_few`, `solver_failed`). Slots without readings are marked, never scored as zero. |
+| `<label>.json` | Summary: scored slots, mean, median, and 99th percentile residual in percent, status counts, options used. |
+
+`checks/main_physics_events.py` lines the residual up against `events.csv` and prints the level before, during, and after each episode.
+
+What it finds on the event blocks: the November 13 to 14, 2024 episode (swmp_17 and cb_121, which change the feed of the whole A-side) raises the residual from 0.55 percent to 20 to 27 percent for the five and a half hours the switch is open, and the restoration brings it back within minutes. The 2023 episodes are building transfers (one breaker opens, the tie breaker to the B-side closes) and leave the A-side residual flat: to the A-side model a transferred building looks like a building that switched off, since its breaker current drops to zero and its bus voltage stays at the same campus level. Detecting transfers from physics would need the B-side circuit in the model as well, which is a later extension.
+
 ## Data facts the code relies on
 
 Established by the scripts in `checks/`, which can be rerun with `--data-dir ../data`, and by the coverage report:
@@ -153,9 +187,13 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `socal_preprocess.py` | Preprocessing helper functions |
 | `main_splits.py` | Writes `splits.json` and reports each split |
 | `splits.json` | The fixed train / validation / test blocks |
+| `main_physics.py` | Physics baseline main script |
+| `socal_physics.py` | Physics baseline helper functions |
+| `physics_config.json` | Reference wiring, kept component, injection map and signs for the physics baseline |
+| `caltech_utils/` | Caltech's `utils` folder, unchanged: graph and admittance code |
 | `merge_years.sh` | Merges two per-year download folders into one |
 | `meters.txt` | The 22 meters, one per line |
 | `requirements.txt` | Python packages |
 | `topology/` | Caltech's network description, breaker status files, change logs |
-| `checks/` | One-off scripts that established the data facts above |
+| `checks/` | One-off scripts that established the data facts above, plus `main_physics_events.py` |
 | `notes/` | Data notes: gaps, outages, known issues. Read before analysis. |
