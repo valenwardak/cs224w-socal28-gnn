@@ -234,3 +234,6 @@ data
 
 # Caltech topology files are small and must be committed
 !topology/**/*.csv
+
+# Added DS Store For Mac
+.DS_Store
