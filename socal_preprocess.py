@@ -10,15 +10,50 @@
 #              main_preprocess.py. Also imported later by the model code,
 #              so the same functions define the data everywhere.
 #
+# Functions:
+#   Reading the raw download
+#     read_meters(meters_file)            meter names from a text file
+#     parse_date(text)                    "YYYY-MM-DD" -> date
+#     month_chunks(start, end)            yield one (start, end) pair per month
+#     parse_folder_label(label)           request folder name -> (start, end, channel)
+#     find_channel_files(...)             CSV paths for one meter and channel in a range
+#     load_channel(paths, value_columns)  read and stack the CSVs, dedupe timestamps
+#   Time handling and gridding
+#     to_utc(naive_times, offset)         fixed standard time -> UTC
+#     month_grid(start, end, offset)      ten-second UTC grid for a month
+#     grid_channel(df, grid, offset)      place readings on the grid, add toff
+#     build_meter_month(...)              one meter-month table: values, masks, toff
+#   Network file
+#     load_network(topology_dir)          read the network JSON
+#     meter_metadata(network)             meter -> bus, elements, phase map, has_L3
+#   Events
+#     build_events(...)                   device changes from the operator log
+#   Coverage
+#     coverage_rows(table, meter, month)  present-reading counts per channel
+#     append_coverage(out_dir, rows)      append rows to coverage.csv
+#
 # What it produces, under <out_dir>:
 #              <YYYY-MM>/<meter>.parquet   one file per meter and month:
 #                  index  = ten-second UTC grid covering the whole month
 #                  columns "<meter>|<channel>|<value>"  float32 readings
 #                  columns "mask|<meter>|<channel>"     True where a reading exists
+#                  column  "<meter>|toff"               float32 seconds between the
+#                                                       exact capture time and the
+#                                                       slot time (capture minus slot)
 #              meters.json      meter -> voltage bus, current elements, phase map
 #              events.csv       every logged device change, UTC and standard time,
 #                               with episode id and scored flag
 #              coverage.csv     per month, meter, channel: slots, present, fraction
+#
+# Why toff exists:
+#              Each phase angle is measured relative to the exact moment the
+#              meter's own capture started. Captures on different meters start
+#              a few milliseconds apart, and at 60 Hz one millisecond is 21.6
+#              degrees, so angles are only comparable across meters after each
+#              is shifted to a common time. The shift to the slot time is
+#                  angle_at_slot = angle - 360 * freq * toff   (degrees)
+#              All channels of one meter share one capture time, so toff is
+#              stored once per meter.
 #
 # Facts this code relies on (verified 2026-10-18):
 #              Meter timestamps and the operator log are both fixed Pacific
@@ -70,6 +105,8 @@ VALUE_COLUMNS = {
 GRID_SECONDS = 10
 # Separator used in output column names
 SEP = "|"
+# Name of the per-meter capture-offset column
+TOFF = "toff"
 
 
 # -----------------------------------------------------------------------------
@@ -281,18 +318,23 @@ def grid_channel(df, grid, utc_offset_hours):
     Each reading is assigned to the ten-second slot it falls in. If two
     readings land in one slot (overlapping fallback files), the first is
     kept. Slots with no reading are NaN. Returns a DataFrame indexed by
-    the grid with the value columns only.
+    the grid with the value columns plus a "toff" column holding the
+    seconds between the exact capture time and the slot time.
     """
+    # Names of the value columns, everything except t
+    value_names = [c for c in df.columns if c != "t"]
     # No readings at all
     if df.empty:
-        # All-NaN frame on the grid
-        return pd.DataFrame(np.nan, index=grid, columns=[c for c in df.columns if c != "t"])
+        # All-NaN frame on the grid, with the toff column included
+        return pd.DataFrame(np.nan, index=grid, columns=value_names + [TOFF])
     # UTC-aware timestamps
     t_utc = to_utc(df["t"], utc_offset_hours)
     # Slot each reading belongs to
     slot = t_utc.dt.floor(f"{GRID_SECONDS}s")
     # Value columns only
     out = df.drop(columns=["t"]).copy()
+    # Seconds from the slot time to the exact capture time
+    out[TOFF] = (t_utc - slot).dt.total_seconds().to_numpy()
     # Index by slot, keeping the UTC label
     out.index = pd.DatetimeIndex(slot)
     # Keep the first reading when two share a slot
@@ -306,12 +348,16 @@ def build_meter_month(data_dir, meter, channels, month_start, month_end, value_c
     Build the aligned table for one meter and one month.
 
     Returns a DataFrame indexed by the UTC grid with float32 value columns
-    "<meter>|<channel>|<value>" and boolean columns "mask|<meter>|<channel>".
+    "<meter>|<channel>|<value>", boolean columns "mask|<meter>|<channel>",
+    and one float32 column "<meter>|toff" with the capture offset in
+    seconds, taken from whichever channel has a reading in each slot.
     """
     # The grid for this month
     grid = month_grid(month_start, month_end, utc_offset_hours)
     # Pieces to join
     pieces = []
+    # Capture offsets, one series per channel
+    offsets = []
     # Loop over channels
     for channel in channels:
         # Files overlapping the month
@@ -320,6 +366,8 @@ def build_meter_month(data_dir, meter, channels, month_start, month_end, value_c
         raw = load_channel(paths, list(value_columns.keys()))
         # On the grid
         gridded = grid_channel(raw, grid, utc_offset_hours)
+        # Pull the offset out before renaming the value columns
+        offsets.append(gridded.pop(TOFF))
         # Rename to output names
         gridded.columns = [f"{meter}{SEP}{channel}{SEP}{value_columns[c]}" for c in gridded.columns]
         # Store as float32 to halve the size
@@ -330,6 +378,10 @@ def build_meter_month(data_dir, meter, channels, month_start, month_end, value_c
         pieces.append(gridded)
     # Join all channels side by side
     table = pd.concat(pieces, axis=1)
+    # Offsets side by side, one column per channel
+    offset_table = pd.concat(offsets, axis=1)
+    # One offset per slot: the first channel that has a reading in that slot
+    table[f"{meter}{SEP}{TOFF}"] = offset_table.bfill(axis=1).iloc[:, 0].astype("float32")
     # Name the index
     table.index.name = "t_utc"
     # Return
