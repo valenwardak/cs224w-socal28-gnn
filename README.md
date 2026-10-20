@@ -95,18 +95,20 @@ Needs the `topology/` folder, which is Caltech's `sample_dataset/topology` copie
 python main_preprocess.py
 ```
 
-Rerunning skips months already built. `--force` rebuilds. Options: `python main_preprocess.py --help`. The full run takes about an hour and produces about 25 GB.
+Rerunning skips months already built. `--force` rebuilds. Options: `python main_preprocess.py --help`. The full run takes from twenty minutes to an hour and produces about 25 GB.
 
 Output under `data/processed/`:
 
 | File | Content |
 |------|---------|
-| `<YYYY-MM>/<meter>.parquet` | One file per meter and month. Index: ten-second UTC grid for the whole month. Columns `<meter>\|<channel>\|<value>` as float32 for values `rms, freq, ang0, mag0, ang1, mag1, ang2, mag2`, and `mask\|<meter>\|<channel>` as boolean, True where a reading exists. Gaps are never filled. |
+| `<YYYY-MM>/<meter>.parquet` | One file per meter and month. Index: ten-second UTC grid for the whole month. Columns `<meter>\|<channel>\|<value>` as float32 for values `rms, freq, ang0, mag0, ang1, mag1, ang2, mag2`, `mask\|<meter>\|<channel>` as boolean, True where a reading exists, and one column `<meter>\|toff` as float32: seconds from the slot time to the meter's exact capture time. Gaps are never filled. |
 | `meters.json` | For each meter: the bus its voltages are measured on, the elements its currents are measured on, the channel-to-phase map from the network file, and whether L3 exists. |
 | `events.csv` | Every logged device change with time in standard time and UTC, device, from and to status, day, episode id, and a scored flag. |
 | `coverage.csv` | Per month, meter, channel: slots, slots with a reading, fraction. |
 
 Read a table with `pandas.read_parquet`. Drop the columns you do not need; the harmonics 1 and 2 columns are kept so nobody has to rerun preprocessing to test them.
+
+Phase angles are measured relative to each meter's own capture time. Captures on different meters start a few milliseconds apart, and at 60 Hz one millisecond is 21.6 degrees, so angles are only comparable across meters after each is shifted to the slot time: `angle_at_slot = angle - 360 * freq * toff` in degrees. Angles within one meter share one capture time and need no shift.
 
 ## Step 5: splits
 
@@ -138,6 +140,7 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 - February 1, 2024 is logged at exactly midnight with nothing visible in the readings and is not scored. That leaves 32 changes on 5 days in about 7 episodes.
 - September 26, 2023 shows large current steps one hour before the logged times on several meters. The logged times for that day are unverified against the readings.
 - Site-wide outages: September 28 to October 27, 2023; July 18 to September 4, 2024; October 30 to November 6 and December 12 to 22, 2024. August 2025 has meter-specific gaps on egauge_4, 10, 11, 12, 14, 16.
+- Captures land about 36 milliseconds after each ten-second boundary on a typical meter (median `toff`), with rare captures up to a full slot late.
 
 ## Files
 

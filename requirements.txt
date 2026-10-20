@@ -5,3 +5,9 @@ pyperclip
 pandas
 numpy
 pyarrow
+cvxpy
+ecos
+networkx
+shapely
+matplotlib
+python-dateutil
