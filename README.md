@@ -22,7 +22,8 @@ The data is not stored in this repo. Each team member downloads it with the scri
 2. Preprocess: `main_preprocess.py` turns the raw files into aligned, masked Parquet tables in `data/processed/`, plus the event table and a coverage report.
 3. Split: `main_splits.py` writes `splits.json`, the fixed train / validation / test blocks that every later script reads.
 4. Physics baseline: `main_physics.py` runs a least-squares state estimator with no learning over any window or split and writes a residual per ten-second slot to `data/processed/physics/`.
-5. Learned models: GRU baseline and the GNNs, built from `data/processed/`, `topology/`, and `splits.json` (next stage).
+5. Feature tables: `main_features.py` exports the processed tables as compact monthly files in `data/features/` for training on Colab.
+6. Learned models: GRU baseline and the GNNs, trained on Colab from `data/features/`, `topology/`, and `splits.json` (next stage).
 
 ## Step 1: get access (once per person)
 
@@ -161,6 +162,30 @@ Output under `data/processed/physics/`, one pair of files per block:
 
 What it finds on the event blocks: the November 13 to 14, 2024 episode (swmp_17 and cb_121, which change the feed of the whole A-side) raises the residual from 0.55 percent to 20 to 27 percent for the five and a half hours the switch is open, and the restoration brings it back within minutes. The 2023 episodes are building transfers (one breaker opens, the tie breaker to the B-side closes) and leave the A-side residual flat: to the A-side model a transferred building looks like a building that switched off, since its breaker current drops to zero and its bus voltage stays at the same campus level. Detecting transfers from physics would need the B-side circuit in the model as well, which is a later extension.
 
+## Step 7: feature tables for training
+
+Training runs on Google Colab, so the data has to fit on Google Drive and load fast. `main_features.py` reads the Parquet tables and writes one compressed file per month holding only what the models use, in fixed-order dense arrays. The Parquet tables stay the authoritative data.
+
+```bash
+python main_features.py
+```
+
+Rerunning skips months already written. `--force` rebuilds. `--keep-harmonics` adds harmonics 1 and 2. Options: `python main_features.py --help`. The full run takes under an hour. One month is about 130 MB, the whole period about 3.4 GB.
+
+Output under `data/features/`:
+
+| File | Content |
+|------|---------|
+| `<YYYY-MM>.npz` | Arrays for the month. `t` int64 (T,) slot start in seconds since 1970 UTC. `rms` float16 (T, M, C) magnitude in volts or amps. `ang` float32 (T, M, C) fundamental angle in degrees at the slot time, NaN where rejected. `freq` float32 (T, M) hertz, from the meter's voltage channels. `mask` bool (T, M, C) True where a reading exists. `angle_ok` bool (T, M, C) True where the angle passed the checks. With `--keep-harmonics` also `mag1, ang1, mag2, ang2`. T is slots in the month, M the 22 meters in `meters.txt` order, C the six channels L1 L2 L3 S1 S2 S3. |
+| `manifest.json` | Meter order, channel order, array names, units, dtypes, the alignment rule, and the format version. Read it instead of guessing. |
+| `build_log.csv` | Per month: slots, meters with files, size, spot-check errors against the Parquet, frequency disagreements, share of readings with a usable angle. |
+
+Precision: magnitudes are float16, about three and a half significant digits, so a 9,526 volt reading is kept to within 4 volts. Angles and frequency are float32. Convert to float32 before arithmetic. Models should turn angles into cos and sin, since degrees wrap at 180.
+
+Angle validity: Caltech's frequency estimate takes the strongest peak in each channel's spectrum. On current channels carrying only a few amps that peak can land a bin or two away from 60 Hz, and the angle reported there is the phase of the wrong component. The export aligns every angle with the meter's voltage frequency, accepts it only when the channel's own frequency agrees within 0.01 Hz (the same FFT bin), and stores rejected angles as NaN with `angle_ok` False. The rms and the presence mask are untouched. On September 2024, 98 percent of readings keep their angle. `angle_ok` means passed the checks, not certified accurate.
+
+For Colab: upload `data/features/` to Google Drive once, and at the start of each session copy the month files to the local disk before training. Reading training windows through the Drive mount is slow.
+
 ## Data facts the code relies on
 
 Established by the scripts in `checks/`, which can be rerun with `--data-dir ../data`, and by the coverage report:
@@ -175,6 +200,7 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 - September 26, 2023 shows large current steps one hour before the logged times on several meters. The logged times for that day are unverified against the readings.
 - Site-wide outages: September 28 to October 27, 2023; July 18 to September 4, 2024; October 30 to November 6 and December 12 to 22, 2024. August 2025 has meter-specific gaps on egauge_4, 10, 11, 12, 14, 16.
 - Captures land about 36 milliseconds after each ten-second boundary on a typical meter (median `toff`), with rare captures up to a full slot late.
+- Voltage channels always agree on frequency within a meter. Current channels carrying a few amps (egauge_6 at 4.5 A on 55 to 71 percent of slots, egauge_18 and egauge_20 on 2 to 10 percent, egauge_16 rarely) report a frequency 1 to 4 Hz off, a wrong FFT bin, and their angles on those slots are not usable (`main_freqcheck.py`, September 2024).
 
 ## Files
 
@@ -191,9 +217,11 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `socal_physics.py` | Physics baseline helper functions |
 | `physics_config.json` | Reference wiring, kept component, injection map and signs for the physics baseline |
 | `caltech_utils/` | Caltech's `utils` folder, unchanged: graph and admittance code |
+| `main_features.py` | Feature export main script |
+| `socal_features.py` | Feature export helper functions |
 | `merge_years.sh` | Merges two per-year download folders into one |
 | `meters.txt` | The 22 meters, one per line |
 | `requirements.txt` | Python packages |
 | `topology/` | Caltech's network description, breaker status files, change logs |
-| `checks/` | One-off scripts that established the data facts above, plus `main_physics_events.py` |
+| `checks/` | One-off scripts that established the data facts above, plus `main_physics_events.py` and `main_freqcheck.py` |
 | `notes/` | Data notes: gaps, outages, known issues. Read before analysis. |
