@@ -135,7 +135,7 @@ A least-squares state estimator, following Caltech's bus injection model in thei
 
 Needs `caltech_utils/`, which is Caltech's `utils` folder copied unchanged into this repo. Their `global_param.py` expects that folder to be named `utils/` and the topology to sit under `sample_dataset/`; `socal_physics.py` redirects those paths at startup, so their files are not edited.
 
-The reference wiring, the connected component to keep, and the map from meter currents to bus injections (with the clamp sign for each) are in `physics_config.json`. The map and signs are copied from Caltech's example and cover the A-side circuit, meters 3, 7, 9, 11, 13, 15, 19, 21. Phase angles are shifted to the slot time with `toff` before use.
+The reference wiring, the connected component to keep, and the map from meter currents to bus injections (with the clamp sign for each) are in `physics_config.json`. The map and signs are copied from Caltech's example and cover the A-side circuit, meters 3, 7, 9, 11, 13, 15, 19, 21. Phase angles are shifted to the slot time with `toff` before use. Every angle is shifted with the meter's voltage frequency, and a reading whose own frequency estimate differs from it by more than `--freq-tolerance` (default 0.01 Hz, the same FFT bin) is dropped from that slot's equations rather than used or read as zero, for the reason given in Step 7.
 
 First check, Caltech's normal hour (paper Section VI-A reports 0.851 percent; this code gives 0.55 percent on the same hour with two more voltage meters):
 
@@ -170,7 +170,7 @@ Training runs on Google Colab, so the data has to fit on Google Drive and load f
 python main_features.py
 ```
 
-Rerunning skips months already written. `--force` rebuilds. `--keep-harmonics` adds harmonics 1 and 2. Options: `python main_features.py --help`. The full run takes under an hour. One month is about 130 MB, the whole period about 3.4 GB.
+Rerunning skips months already written. `--force` rebuilds. `--keep-harmonics` adds harmonics 1 and 2. Options: `python main_features.py --help`. The full run takes about an hour. A full month is about 130 MB, the whole period 2.9 GB.
 
 Output under `data/features/`:
 
@@ -182,7 +182,7 @@ Output under `data/features/`:
 
 Precision: magnitudes are float16, about three and a half significant digits, so a 9,526 volt reading is kept to within 4 volts. Angles and frequency are float32. Convert to float32 before arithmetic. Models should turn angles into cos and sin, since degrees wrap at 180.
 
-Angle validity: Caltech's frequency estimate takes the strongest peak in each channel's spectrum. On current channels carrying only a few amps that peak can land a bin or two away from 60 Hz, and the angle reported there is the phase of the wrong component. The export aligns every angle with the meter's voltage frequency, accepts it only when the channel's own frequency agrees within 0.01 Hz (the same FFT bin), and stores rejected angles as NaN with `angle_ok` False. The rms and the presence mask are untouched. On September 2024, 98 percent of readings keep their angle. `angle_ok` means passed the checks, not certified accurate.
+Angle validity: Caltech's frequency estimate takes the strongest peak in each channel's spectrum. On current channels carrying only a few amps that peak can land a bin or two away from 60 Hz, and the angle reported there is the phase of the wrong component. The export aligns every angle with the meter's voltage frequency, accepts it only when the channel's own frequency agrees within 0.01 Hz (the same FFT bin), and stores rejected angles as NaN with `angle_ok` False. The rms and the presence mask are untouched. From October 2024 on, 98 percent of readings keep their angle. From August 2023 to July 2024 only 78 to 84 percent do, so the first year has far more small-current channels, which is noted but not yet explained. `angle_ok` means passed the checks, not certified accurate.
 
 For Colab: upload `data/features/` to Google Drive once, and at the start of each session copy the month files to the local disk before training. Reading training windows through the Drive mount is slow.
 
