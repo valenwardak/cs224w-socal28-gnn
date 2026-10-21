@@ -46,12 +46,13 @@
 #     months_in_range(start_utc, end_utc)        "YYYY-MM" folders a window touches
 #     load_block(processed_dir, meters, start_utc, end_utc)
 #                                                one table of the needed columns
-#     aligned_phasor(table, meter, channel)      complex phasor shifted to slot time
+#     meter_frequency(table, meter)              grid frequency per slot from the voltage channels
+#     aligned_phasor(table, meter, channel, tol) complex phasor shifted to slot time, off-bin readings dropped
 #   Assembling and solving
 #     assemble(model, plan, table)               measured vectors, nominals, row masks
 #     solve_slot_numpy(...)                      weighted least squares, closed form
 #     solve_slot_cvxpy(...)                      Caltech's objective via cvxpy and ECOS
-#     run_block(model, plan, table, solver, weight, step, progress)
+#     run_block(model, plan, table, solver, weight, step, progress, freq_tolerance)
 #                                                residual per slot for one window
 #     summarize(results)                         mean, percentiles, valid count
 # =============================================================================
@@ -79,6 +80,8 @@ SEP = "|"
 TOFF = "toff"
 # Value columns the baseline reads for every channel
 NEEDED_VALUES = ("rms", "ang0", "freq")
+# Voltage channels, used for the meter frequency
+VOLTAGE_CHANNELS = ("L1", "L2", "L3")
 # Phase letters in matrix order
 PHASES = ("a", "b", "c")
 
@@ -444,17 +447,40 @@ def load_block(processed_dir, meters, start_utc, end_utc):
     return table
 
 
-def aligned_phasor(table, meter, channel):
+def meter_frequency(table, meter):
+    """
+    The meter's grid frequency at every slot: the first present voltage
+    channel's estimate (L1, then L2, then L3). Current channels are not
+    used, since their estimate is unreliable at small currents. NaN where
+    no voltage channel has a reading.
+    """
+    # Voltage frequency columns that exist, in order
+    cols = [f"{meter}{SEP}{c}{SEP}freq" for c in VOLTAGE_CHANNELS if f"{meter}{SEP}{c}{SEP}freq" in table.columns]
+    # None at all
+    if not cols:
+        # All NaN
+        return np.full(len(table), np.nan, dtype=np.float64)
+    # First present value per slot
+    return table[cols].astype("float64").bfill(axis=1).iloc[:, 0].to_numpy(dtype=np.float64)
+
+
+def aligned_phasor(table, meter, channel, freq_tolerance):
     """
     Complex phasor for one meter channel at every slot, shifted to the
-    slot time: magnitude = rms, angle = ang0 - 360 * freq * toff degrees.
-    Slots without a reading are NaN.
+    slot time with the meter's voltage frequency:
+        magnitude = rms, angle = ang0 - 360 * freq_meter * toff degrees.
+    A reading is dropped (NaN) when its own frequency estimate differs
+    from the meter's voltage frequency by more than freq_tolerance hertz.
+    Caltech's estimate takes the strongest spectral peak, and on a current
+    channel carrying a few amps that peak can land a bin away from 60 Hz,
+    so the angle there belongs to the wrong component and cannot be
+    repaired by shifting. Slots without a reading are NaN.
     """
     # Column names
     rms_col = f"{meter}{SEP}{channel}{SEP}rms"
     # Angle
     ang_col = f"{meter}{SEP}{channel}{SEP}ang0"
-    # Frequency
+    # The channel's own frequency
     freq_col = f"{meter}{SEP}{channel}{SEP}freq"
     # Offset
     toff_col = f"{meter}{SEP}{TOFF}"
@@ -468,21 +494,25 @@ def aligned_phasor(table, meter, channel):
     rms = table[rms_col].to_numpy(dtype=np.float64)
     # Angle at capture, degrees
     ang = table[ang_col].to_numpy(dtype=np.float64)
-    # Frequency
-    freq = table[freq_col].to_numpy(dtype=np.float64)
+    # The channel's own frequency estimate
+    freq_channel = table[freq_col].to_numpy(dtype=np.float64)
+    # The meter's voltage frequency
+    freq_meter = meter_frequency(table, meter)
     # Capture offset
     toff = table[toff_col].to_numpy(dtype=np.float64)
-    # Angle at the slot time, degrees
-    ang_slot = ang - 360.0 * freq * toff
-    # Complex phasor
-    return rms * np.exp(1j * np.deg2rad(ang_slot))
+    # Accept only where the channel agrees with the meter frequency
+    agree = np.abs(freq_channel - freq_meter) <= freq_tolerance
+    # Angle at the slot time with the meter frequency, degrees
+    ang_slot = ang - 360.0 * freq_meter * toff
+    # Complex phasor, NaN where rejected
+    return np.where(agree, rms * np.exp(1j * np.deg2rad(ang_slot)), np.nan + 0j)
 
 
 # -----------------------------------------------------------------------------
 # Assembling and solving
 # -----------------------------------------------------------------------------
 
-def assemble(model, plan, table):
+def assemble(model, plan, table, freq_tolerance):
     """
     Turn the table into measurement arrays.
 
@@ -503,7 +533,7 @@ def assemble(model, plan, table):
     # Loop over planned voltages
     for v in plan["voltages"]:
         # Phasor
-        V_meas.append(aligned_phasor(table, v["meter"], v["channel"]))
+        V_meas.append(aligned_phasor(table, v["meter"], v["channel"], freq_tolerance))
         # State row: node index times three plus phase
         V_idx.append(3 * v["node_idx"] + v["phase_idx"])
         # Nominal
@@ -521,7 +551,7 @@ def assemble(model, plan, table):
             # Loop over terms
             for term in inj["terms"]:
                 # Signed phasor
-                total = total + term["sign"] * aligned_phasor(table, term["meter"], term["channels"][p])
+                total = total + term["sign"] * aligned_phasor(table, term["meter"], term["channels"][p], freq_tolerance)
                 # Rating
                 ratings.append(term["rating"])
             # Store
@@ -619,7 +649,7 @@ def solve_slot_cvxpy(Y, V_meas, V_idx, V_nom, I_meas, I_rows, I_nom, weight, n_s
     return np.asarray(V.value).flatten()
 
 
-def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=True):
+def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=True, freq_tolerance=0.01):
     """
     Solve every step-th slot in the table and return a DataFrame indexed
     by slot time with columns:
@@ -634,8 +664,8 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
     Y = model["Y"].astype(np.complex128)
     # State size
     n_state = 3 * model["n_nodes"]
-    # Arrays
-    m = assemble(model, plan, table)
+    # Arrays, readings with an off-bin frequency dropped
+    m = assemble(model, plan, table, freq_tolerance)
     # Slot times
     times = table.index[::step]
     # Row positions

@@ -74,6 +74,8 @@ def parse_args():
     parser.add_argument("--current-weight", type=float, default=None, help="Weight on current residuals, default from config (Caltech uses 0.1)")
     # Slot stride
     parser.add_argument("--step", type=int, default=1, help="Solve every step-th slot, 1 means all")
+    # Frequency tolerance
+    parser.add_argument("--freq-tolerance", type=float, default=0.01, help="Hertz; a reading is dropped when its own frequency differs from the meter's voltage frequency by more (0.01 means the same FFT bin)")
     # No progress bar
     parser.add_argument("--quiet", action="store_true", help="Do not show a progress bar")
     # Parse
@@ -141,11 +143,11 @@ def main():
             # Next
             continue
         # Solve
-        results = sp.run_block(model, plan, table, solver=args.solver, weight=weight, step=args.step, progress=not args.quiet)
+        results = sp.run_block(model, plan, table, solver=args.solver, weight=weight, step=args.step, progress=not args.quiet, freq_tolerance=args.freq_tolerance)
         # Summary
         summary = sp.summarize(results)
         # Add the options used
-        summary.update({"label": label, "start_utc": start_utc, "end_utc": end_utc, "solver": args.solver, "current_weight": weight, "step": args.step, "reference_time": config["reference_time"]})
+        summary.update({"label": label, "start_utc": start_utc, "end_utc": end_utc, "solver": args.solver, "current_weight": weight, "step": args.step, "freq_tolerance": args.freq_tolerance, "reference_time": config["reference_time"]})
         # Write results
         results.to_parquet(os.path.join(args.out_dir, f"{label}.parquet"))
         # Write summary
