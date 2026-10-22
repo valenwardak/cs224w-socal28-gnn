@@ -37,6 +37,9 @@
 #     load_config(path)                          read physics_config.json
 #     build_reference_model(ct, topology_dir, config)
 #                                                electrical graph, node list, Y matrix
+#     export_graph(ct, topology_dir, config, path)
+#                                                write the whole electrical graph to graph.json
+#                                                for the learned models (all components)
 #   Measurement plan
 #     register_lookup(net_data)                  element.phase -> (meter, channel, unit, rating)
 #     bus_to_node(node_list)                     bus name -> electrical node name
@@ -204,6 +207,138 @@ def build_reference_model(ct, topology_dir, config):
     return {"net_data": net_data, "node_list": node_list, "Y": Y, "edges": edges_kept, "n_nodes": len(node_list)}
 
 
+def export_graph(ct, topology_dir, config, path):
+    """
+    Build the electrical graph of the whole grid at config["reference_time"]
+    and write it to a JSON file that the learned models load. Unlike
+    build_reference_model, nothing is pruned and every connected component
+    is kept, so the GNNs see the full wiring.
+
+    The file holds:
+      reference_time   the switch state the graph reflects
+      nodes            list, in index order, each with name, the buses it
+                       combines, nominal voltage per bus, and component id
+      edges            list, each with source and target node index, element
+                       name and type (Line or Transformer), a 6x6 admittance
+                       block (real and imaginary parts, 3 phases per end),
+                       and admittance_abs, one scalar per edge for models
+                       that take a single edge weight
+      meters           map from meter name to its node index, voltage bus,
+                       current elements, and channel-to-phase letters
+    Returns the counts (nodes, edges, meters) for the caller to print.
+    """
+    # Folder with the circuit's JSON files
+    net_folder = os.path.join(os.path.abspath(topology_dir), "network_files", "circuit3")
+    # Element type inheritance, needed by Caltech's graph code
+    parents = ct.utils.dict_parents(ct.utils.load_json(ct.global_param.FILE_PATHS["element_inheritance"], raise_err=True))
+    # Network at the reference time, switch states applied
+    net_data = ct.topology.load_net_files([net_folder], t=config["reference_time"], timeseries_dir=ct.global_param.FILE_PATHS["net_params"])
+    # Physical graph
+    nodes, edges, _ = ct.topology.net2graph(net_data, parents, fix_implicit=False, connected_edges=True, print_warning=False)
+    # Electrical graph: open switches removed, closed ones collapsed
+    nodes_e, edges_e, _ = ct.topology.graph2electrical_graph(nodes, edges, {}, net_data, parents)
+    # Node list in a fixed order
+    node_list = sorted(nodes_e.keys())
+    # Node name to index
+    n2i = {n: i for i, n in enumerate(node_list)}
+    # Admittance blocks, this call also stores component_Y on every edge
+    ct.topology.network_Y_matrix(edges_e, node_list, net_data)
+    # Connected components for the node records
+    graph = nx.Graph()
+    # Every node
+    graph.add_nodes_from(node_list)
+    # Every edge
+    graph.add_edges_from([(e["source"], e["target"]) for e in edges_e.values()])
+    # Component id per node, largest component first
+    comp_of = {}
+    # Loop over components sorted by size
+    for cid, comp in enumerate(sorted(nx.connected_components(graph), key=len, reverse=True)):
+        # Assign
+        for n in comp:
+            # Store
+            comp_of[n] = cid
+    # Node records
+    node_records = []
+    # Loop over nodes
+    for name in node_list:
+        # Buses combined into this node
+        buses = name.split(SEP)
+        # Nominal voltage per bus, None when the network file has none
+        nominal = {b: net_data["Bus"].get(b, {}).get("nominal_voltage") for b in buses}
+        # Record
+        node_records.append({"name": name, "buses": buses, "nominal_voltage": nominal, "component": comp_of[name]})
+    # Edge records
+    edge_records = []
+    # Loop over edges
+    for ename, e in edges_e.items():
+        # Admittance block, 6x6 complex
+        block = np.asarray(e["component_Y"])
+        # Coupling between the two ends, 3x3
+        coupling = block[0:3, 3:6]
+        # One scalar: mean magnitude of the phase-to-phase coupling diagonal
+        admittance_abs = float(np.mean(np.abs(np.diag(coupling))))
+        # Record
+        edge_records.append({
+            # Ends
+            "source": n2i[e["source"]], "target": n2i[e["target"]],
+            # Element
+            "element": e["element_name"], "type": e["element_type"],
+            # Full block
+            "Y_real": block.real.tolist(), "Y_imag": block.imag.tolist(),
+            # Scalar weight
+            "admittance_abs": admittance_abs,
+        })
+    # Meter records from the registers
+    b2n = bus_to_node(node_list)
+    # Register table
+    regs = register_lookup(net_data)
+    # Collect per meter
+    meter_records = {}
+    # Loop over registers
+    for element, (meter, channel, unit, rating) in regs.items():
+        # Record for this meter
+        rec = meter_records.setdefault(meter, {"node": None, "voltage_bus": None, "current_elements": [], "phase": {}, "current_rating": {}})
+        # Split "bus_1119.ag" or "cb_146.a"
+        base, _, suffix = element.partition(".")
+        # Voltage register: bus and node
+        if unit == "V":
+            # Bus
+            rec["voltage_bus"] = base
+            # Node index, None if the bus is not in the graph
+            rec["node"] = n2i.get(b2n.get(base)) if b2n.get(base) else None
+            # Phase label as written: "ag" line-to-ground, "ab" line-to-line (egauge_17, egauge_18)
+            rec["phase"][channel] = suffix
+        # Current register: element and rating
+        elif unit == "A":
+            # Element
+            if base not in rec["current_elements"]:
+                # Add
+                rec["current_elements"].append(base)
+            # Phase letter
+            rec["phase"][channel] = suffix[:1]
+            # Rating
+            rec["current_rating"][channel] = rating
+    # File body
+    body = {
+        # Switch state
+        "reference_time": config["reference_time"],
+        # How to read it
+        "note": "Electrical graph from Caltech's topology code at reference_time. Nodes are buses joined by closed zero-impedance elements. Edges are lines and transformers with impedance. Y blocks are 6x6 complex, rows and columns ordered end1 a b c, end2 a b c. admittance_abs is a single scalar weight per edge. Node index order is the nodes list order.",
+        # Nodes
+        "nodes": node_records,
+        # Edges
+        "edges": edge_records,
+        # Meters
+        "meters": meter_records,
+    }
+    # Write
+    with open(path, "w") as f:
+        # Pretty JSON
+        json.dump(body, f, indent=1)
+    # Counts
+    return len(node_records), len(edge_records), len(meter_records)
+
+
 # -----------------------------------------------------------------------------
 # Measurement plan
 # -----------------------------------------------------------------------------
@@ -213,6 +348,7 @@ def register_lookup(net_data):
     From the EgaugeMeter entries build {element.phase: (meter, channel, unit, rating)}.
     Example: "cb_146.a" -> ("egauge_7", "S1", "A", 3200)
              "bus_1119.ag" -> ("egauge_7", "L1", "V", None)
+             "bus_1041.ab" -> ("egauge_17", "L1", "V", None)   line-to-line voltage
     """
     # Result
     lookup = {}
@@ -226,8 +362,9 @@ def register_lookup(net_data):
             if not element:
                 # Next
                 continue
-            # Voltage registers carry the channel in "name", current registers in "value"
-            channel = reg.get("name") if reg.get("unit") == "V" else reg.get("value")
+            # The phasor channel name (L1..L3, S1..S3) sits in "value" for every register;
+            # for egauge_17 and egauge_18 the voltage registers are named V_ab, V_bc, V_ca
+            channel = reg.get("value") or reg.get("name")
             # Keep only the phasor channels we downloaded
             if channel not in ("L1", "L2", "L3", "S1", "S2", "S3"):
                 # Next
