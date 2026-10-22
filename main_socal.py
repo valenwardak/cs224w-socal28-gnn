@@ -45,8 +45,8 @@ DEFAULT_DATA_TYPE = "phasors"
 DEFAULT_CHANNELS = ["L1", "L2", "L3", "S1", "S2", "S3"]
 # Where the Caltech client stores the GitHub login tokens
 DEFAULT_CREDENTIALS_FILE = "dataset_api_credentials.json"
-# Retries per request before treating it as failed (0 => one attempt total)
-DEFAULT_RETRIES = 0
+# Retries per request before treating it as failed
+DEFAULT_RETRIES = 2
 # Seconds to wait between retries
 DEFAULT_RETRY_WAIT = 30
 # Stop splitting a failed range once it is this many days or fewer
@@ -100,12 +100,7 @@ def main():
     # Download everything
     missing = sd.download_all(client, args.output_dir, meters, args.data_type, args.channels, start_date, end_date, args.retries, args.retry_wait, args.min_days)
     # Summary of channels that never came back
-    missing_entries = missing.get("missing", [])
-    meters_with_gaps = len({entry["meter"] for entry in missing_entries})
-    print(
-        f"Finished. {len(missing_entries)} missing range(s) across {meters_with_gaps} meter(s). "
-        f"See {args.output_dir}/{sd.MISSING_FILE}"
-    )
+    print(f"Finished. Meters with missing channels: {len(missing)}. See {args.output_dir}/{sd.MISSING_FILE}")
 
 
 # Run main() only when executed as a script
