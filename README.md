@@ -23,7 +23,8 @@ The data is not stored in this repo. Each team member downloads it with the scri
 3. Split: `main_splits.py` writes `splits.json`, the fixed train / validation / test blocks that every later script reads.
 4. Physics baseline: `main_physics.py` runs a least-squares state estimator with no learning over any window or split and writes a residual per ten-second slot to `data/processed/physics/`.
 5. Feature tables: `main_features.py` exports the processed tables as compact monthly files in `data/features/` for training on Colab.
-6. Learned models: GRU baseline and the GNNs, trained on Colab from `data/features/`, `topology/`, and `splits.json` (next stage).
+6. Graph: `main_graph.py` writes the grid's electrical graph to `graph.json`, which every GNN loads.
+7. Learned models: GRU baseline and the GNNs, trained on Colab from `data/features/`, `graph.json`, and `splits.json` (next stage).
 
 ## Step 1: get access (once per person)
 
@@ -186,6 +187,27 @@ Angle validity: Caltech's frequency estimate takes the strongest peak in each ch
 
 For Colab: upload `data/features/` to Google Drive once, and at the start of each session copy the month files to the local disk before training. Reading training windows through the Drive mount is slow.
 
+## Step 8: the graph
+
+The GNNs need the grid's wiring as a graph. The physics baseline already builds it with Caltech's topology code, so `main_graph.py` saves that graph once to `graph.json` in the repo root, and every model loads the file instead of rebuilding the graph. It is the whole grid at the reference time in `physics_config.json`, every connected component, nothing pruned.
+
+```bash
+python main_graph.py
+python checks/main_graphcheck.py
+```
+
+`graph.json` is committed. Rerun `main_graph.py` only if the reference time changes. It holds:
+
+| Key | Content |
+|-----|---------|
+| `nodes` | List in index order. Each node is a set of buses joined by closed zero-impedance elements, with the bus names, the nominal voltage per bus, and a connected-component id (0 is the largest). |
+| `edges` | Lines and transformers with impedance. Each has `source` and `target` node indices, the element name and type, the 6x6 admittance block (`Y_real`, `Y_imag`, rows and columns ordered end1 a b c, end2 a b c), and `admittance_abs`, one scalar weight for models that take a single number per edge. |
+| `meters` | For each meter: `node` index, `voltage_bus`, `current_elements`, the channel-to-phase map, and the clamp rating per current channel. Use `node` to place each meter's readings on the graph. |
+
+What is in it: 43 nodes, 33 edges (15 lines, 18 transformers), 22 meters all placed. Component 0 (18 nodes) is the B-side with meters 4, 8, 10, 12, 14, 16, 18, 20, 22. Component 1 (13 nodes) is the A-side with meters 3, 7, 9, 11, 13, 15, 17, 19, 21. Components 2 and 3 hold meters 5, 6, 23 and 24. Six buses have no impedance edge. `checks/main_graphcheck.py` verifies the file (edge ends valid, admittances positive, every meter on a node containing its bus, the A-side nodes from the physics config present) and draws it to `graph.png`, colored by component, lines solid and transformers dashed, metered nodes labeled.
+
+The GRU baseline does not use the graph. Each meter forecasts from its own history, which is what makes it the no-graph comparison.
+
 ## Data facts the code relies on
 
 Established by the scripts in `checks/`, which can be rerun with `--data-dir ../data`, and by the coverage report:
@@ -219,9 +241,12 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `caltech_utils/` | Caltech's `utils` folder, unchanged: graph and admittance code |
 | `main_features.py` | Feature export main script |
 | `socal_features.py` | Feature export helper functions |
+| `main_graph.py` | Writes `graph.json` |
+| `graph.json` | The grid's electrical graph: nodes, edges with admittance, meter placement |
+| `graph.png` | Drawing of `graph.json` from the check script |
 | `merge_years.sh` | Merges two per-year download folders into one |
 | `meters.txt` | The 22 meters, one per line |
 | `requirements.txt` | Python packages |
 | `topology/` | Caltech's network description, breaker status files, change logs |
-| `checks/` | One-off scripts that established the data facts above, plus `main_physics_events.py` and `main_freqcheck.py` |
+| `checks/` | One-off scripts that established the data facts above, plus `main_physics_events.py`, `main_freqcheck.py`, and `main_graphcheck.py` |
 | `notes/` | Data notes: gaps, outages, known issues. Read before analysis. |
