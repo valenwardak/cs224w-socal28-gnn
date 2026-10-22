@@ -6,6 +6,8 @@
 # Created:     2026-10-16
 # Revised:     2026-10-18  never write into or delete a pre-existing folder;
 #                          print error types; tolerate existing _failed entries
+#              2026-10-21  validate before DONE; clean partial failures; resume
+#                          incomplete folders; expanded download log and missing list
 #
 # Purpose:     Helper functions for downloading SoCal 28-Bus data from the
 #              Caltech API, one meter and one month per request, into the
@@ -27,10 +29,9 @@
 #              2. whole month, one channel at a time
 #              3. split the date range in half, repeat, down to one day
 #
-# Safety:      A folder that already exists is never written into and never
-#              deleted, whether or not it has a DONE marker. Only a folder
-#              this run creates is downloaded into, and only that folder is
-#              removed if its download fails.
+# Safety:      Folders with DONE are never modified. Incomplete folders from a
+#              prior run are removed and retried. Failed attempts remove all
+#              partial data for that request before continuing.
 #
 # Requirements:
 #              dataset_api_client.py (from caltech-netlab/digital-twin-dataset)
@@ -76,8 +77,34 @@ REQUEST_FILE = "request.json"
 FAILED_DIR = "_failed"
 # File at the root listing channels that never came back
 MISSING_FILE = "missing_channels.json"
-# Log file at the root, one row per attempt
+# Log file at the root, one row per request
 LOG_FILE = "download_log.csv"
+LOG_COLUMNS = [
+    "meter",
+    "data_type",
+    "channels",
+    "start",
+    "end",
+    "label",
+    "status",
+    "attempts",
+    "error_type",
+    "error_message",
+    "finished_at",
+]
+# Subfolder name the API client uses for phasor CSV files
+PHASORS_SUBDIR = "phasors"
+MAGNITUDES_SUBDIR = "magnitudes"
+WAVEFORMS_SUBDIR = "waveforms"
+DATA_SUBDIR = {
+    "phasors": PHASORS_SUBDIR,
+    "magnitudes": MAGNITUDES_SUBDIR,
+    "waveforms": WAVEFORMS_SUBDIR,
+}
+
+
+class DownloadValidationError(Exception):
+    """Raised when the API response unpacked but expected files are missing."""
 
 
 def read_meters(meters_file):
@@ -213,22 +240,257 @@ def append_log(output_dir, row):
     """
     Append one row to download_log.csv, writing the header if new.
 
-    Columns: meter, data_type, label, status, attempts, finished_at
+    ``row`` is a dict with keys from ``LOG_COLUMNS`` or a list in that order.
     """
     # Full path to the log
     log_path = os.path.join(output_dir, LOG_FILE)
     # Header needed only when the file does not exist yet
     write_header = not os.path.exists(log_path)
+    if isinstance(row, dict):
+        row = [row.get(col, "") for col in LOG_COLUMNS]
     # Open in append mode
     with open(log_path, "a", newline="") as f:
         # CSV writer
         writer = csv.writer(f)
         # Header on first write only
         if write_header:
-            # Column names
-            writer.writerow(["meter", "data_type", "label", "status", "attempts", "finished_at"])
-        # The data row
+            writer.writerow(LOG_COLUMNS)
         writer.writerow(row)
+
+
+def channel_csv_name(meter, channel):
+    """File name for one channel under the data-type subfolder."""
+    return f"{meter}-{channel}.csv"
+
+
+def validate_download(folder, meter, data_type, channels):
+    """
+    Return None if every requested channel CSV exists under the folder.
+
+    Empty CSV files are allowed (no data for that range). Raises
+    ``DownloadValidationError`` when a file is missing.
+    """
+    subdir = DATA_SUBDIR[data_type]
+    missing = []
+    for channel in channels:
+        csv_path = os.path.join(folder, subdir, channel_csv_name(meter, channel))
+        if not os.path.isfile(csv_path):
+            missing.append(channel)
+    if missing:
+        raise DownloadValidationError(
+            f"missing channel file(s) after download: {', '.join(missing)}"
+        )
+
+
+def remove_partial_download(folder):
+    """
+    Delete an incomplete download folder. Never touches a folder with DONE.
+    """
+    if not os.path.exists(folder):
+        return
+    if is_done(folder):
+        return
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+def clean_partial_contents(folder):
+    """
+    Remove downloaded files under ``folder`` but keep local ``request.json``.
+
+    Used between retries for the same request. Never runs on a DONE folder.
+    """
+    if not os.path.isdir(folder) or is_done(folder):
+        return
+    for name in os.listdir(folder):
+        if name == REQUEST_FILE:
+            continue
+        path = os.path.join(folder, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.remove(path)
+
+
+def prepare_download_folder(folder):
+    """
+    Return True if this folder should be downloaded into.
+
+    Skips when DONE. Removes and retries incomplete folders from prior runs.
+    """
+    if is_done(folder):
+        return False
+    if os.path.exists(folder):
+        remove_partial_download(folder)
+    return True
+
+
+def log_request_result(
+    output_dir,
+    meter,
+    data_type,
+    channels,
+    start,
+    end,
+    label,
+    status,
+    attempts,
+    error_type="",
+    error_message="",
+):
+    """Append one outcome row for a ``request_range`` call."""
+    append_log(
+        output_dir,
+        {
+            "meter": meter,
+            "data_type": data_type,
+            "channels": " ".join(channels),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "label": label,
+            "status": status,
+            "attempts": attempts,
+            "error_type": error_type,
+            "error_message": error_message,
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
+
+
+def _missing_entries_from_legacy(data):
+    """Convert older ``{meter: {label: [channels]}}`` maps to entry dicts."""
+    entries = []
+    if not isinstance(data, dict):
+        return entries
+    for meter, labels in data.items():
+        if meter == "missing" or not isinstance(labels, dict):
+            continue
+        for label, chans in labels.items():
+            if not isinstance(chans, list):
+                continue
+            start_s, end_s, _ = _parse_label_dates(label)
+            entries.append(
+                {
+                    "meter": meter,
+                    "start": start_s,
+                    "end": end_s,
+                    "channels": chans,
+                    "label": label,
+                }
+            )
+    return entries
+
+
+def _parse_label_dates(label):
+    """
+    Parse ``start_end`` or ``start_end_CHANNEL`` folder names.
+
+    Returns (start_iso, end_iso, channel_or_none).
+    """
+    parts = label.split("_")
+    if len(parts) < 2:
+        return "", "", None
+    start_s = parts[0]
+    end_s = parts[1]
+    channel = parts[2] if len(parts) > 2 else None
+    return start_s, end_s, channel
+
+
+def load_missing_registry(output_dir):
+    """Load persisted missing-download entries from ``missing_channels.json``."""
+    path = os.path.join(output_dir, MISSING_FILE)
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "missing" in data:
+        return list(data["missing"])
+    return _missing_entries_from_legacy(data)
+
+
+def record_missing(output_dir, meter, start, end, channels, label):
+    """Record a channel/date range that could not be downloaded."""
+    entry = {
+        "meter": meter,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "channels": list(channels),
+        "label": label,
+    }
+    entries = load_missing_registry(output_dir)
+    key = (entry["meter"], entry["label"], tuple(entry["channels"]))
+    seen = {(e["meter"], e["label"], tuple(e["channels"])) for e in entries}
+    if key not in seen:
+        entries.append(entry)
+    _write_missing_file(output_dir, entries)
+
+
+def find_absent_in_done_folders(output_dir, meters):
+    """
+    Scan DONE folders whose request.json lists channels with no CSV on disk.
+
+    Returns a list of missing entries (may include multi-channel folders).
+    """
+    entries = []
+    for meter in meters:
+        meter_dir = os.path.join(output_dir, meter)
+        if not os.path.isdir(meter_dir):
+            continue
+        for label in sorted(os.listdir(meter_dir)):
+            folder = os.path.join(meter_dir, label)
+            if not is_done(folder):
+                continue
+            request_path = os.path.join(folder, REQUEST_FILE)
+            if not os.path.exists(request_path):
+                continue
+            with open(request_path) as f:
+                request = json.load(f)
+            if "channels" not in request:
+                continue
+            data_type = request.get("data_type", "phasors")
+            try:
+                validate_download(folder, meter, data_type, request["channels"])
+            except DownloadValidationError:
+                present = set()
+                subdir = DATA_SUBDIR.get(data_type, PHASORS_SUBDIR)
+                sub_path = os.path.join(folder, subdir)
+                if os.path.isdir(sub_path):
+                    present = set(os.listdir(sub_path))
+                absent = [
+                    c
+                    for c in request["channels"]
+                    if channel_csv_name(meter, c) not in present
+                ]
+                if absent:
+                    entries.append(
+                        {
+                            "meter": meter,
+                            "start": request.get("start", _parse_label_dates(label)[0]),
+                            "end": request.get("end", _parse_label_dates(label)[1]),
+                            "channels": absent,
+                            "label": label,
+                        }
+                    )
+    return entries
+
+
+def _merge_missing_entries(*entry_lists):
+    """Deduplicate missing entries by meter, label, and channels."""
+    merged = []
+    seen = set()
+    for entries in entry_lists:
+        for entry in entries:
+            key = (entry["meter"], entry["label"], tuple(entry["channels"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(entry)
+    merged.sort(key=lambda e: (e["meter"], e["label"], e["channels"]))
+    return merged
+
+
+def _write_missing_file(output_dir, entries):
+    with open(os.path.join(output_dir, MISSING_FILE), "w") as f:
+        json.dump({"missing": entries}, f, indent=2)
 
 
 def make_client(credentials_file):
@@ -250,10 +512,9 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
     """
     Make one request for the given channels and date range, with retries.
 
-    The folder must not exist yet; the caller checks that. Writes
-    request.json first, then calls the Caltech client. On success writes
-    DONE and returns ("ok", attempts). On failure removes the folder this
-    call created and returns ("failed", attempts).
+    Writes request.json, calls the Caltech client, validates channel CSVs,
+    then writes DONE. On any failure, removes partial data for this request.
+    Returns (status, attempts, error_type, error_message).
     """
     # Element names such as egauge_1-L1
     elements = [f"{meter}-{channel}" for channel in channels]
@@ -276,28 +537,26 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
         # When the request was made
         "requested_at": datetime.now().isoformat(timespec="seconds"),
     })
+    last_error_type = ""
+    last_error_message = ""
     # Try up to retries + 1 times
     for attempt in range(1, retries + 2):
         # Catch any network or client error
         try:
             # One request to Caltech
             client.download_data(**{kwarg_name: elements}, time_range=time_range, output_dir=folder)
-            # Mark complete
+            validate_download(folder, meter, data_type, channels)
             mark_done(folder)
-            # Success
-            return "ok", attempt
-        # Something went wrong on this attempt
+            return "ok", attempt, "", ""
         except Exception as error:
-            # Report the failure with its type, since some errors carry no message
-            print(f"    attempt {attempt} failed: {type(error).__name__}: {error!r}")
-            # Wait before trying again, unless this was the last attempt
+            last_error_type = type(error).__name__
+            last_error_message = str(error) or repr(error)
+            print(f"    attempt {attempt} failed: {last_error_type}: {last_error_message!r}")
+            clean_partial_contents(folder)
             if attempt <= retries:
-                # Pause
                 time.sleep(retry_wait)
-    # Remove only the folder this call created
-    shutil.rmtree(folder, ignore_errors=True)
-    # All attempts failed
-    return "failed", retries + 1
+    remove_partial_download(folder)
+    return "failed", retries + 1, last_error_type, last_error_message
 
 
 def download_channel_range(client, output_dir, meter, data_type, channel, start, end, retries, retry_wait, min_days):
@@ -311,33 +570,32 @@ def download_channel_range(client, output_dir, meter, data_type, channel, start,
     label = range_label(start, end, channel)
     # Full folder path
     folder = os.path.join(meter_dir, label)
-    # Skip if already complete
-    if is_done(folder):
-        # Nothing to do
-        return
-    # Never touch a folder that exists without a DONE marker
-    if os.path.exists(folder):
-        # Report and leave it alone
-        print(f"  {meter} {label} exists without DONE, skipped")
-        # Record in the log
-        append_log(output_dir, [meter, data_type, label, "skipped_existing", 0, datetime.now().isoformat(timespec="seconds")])
-        # Nothing more
+    if not prepare_download_folder(folder):
         return
     # Progress line
     print(f"  {meter} {label}")
     # Make the request
-    status, attempts = request_range(client, data_type, meter, [channel], start, end, folder, retries, retry_wait)
-    # Log the attempt
-    append_log(output_dir, [meter, data_type, label, status, attempts, datetime.now().isoformat(timespec="seconds")])
-    # Success, done
+    status, attempts, error_type, error_message = request_range(
+        client, data_type, meter, [channel], start, end, folder, retries, retry_wait
+    )
+    log_request_result(
+        output_dir,
+        meter,
+        data_type,
+        [channel],
+        start,
+        end,
+        label,
+        status,
+        attempts,
+        error_type,
+        error_message,
+    )
     if status == "ok":
-        # Nothing more
         return
-    # Failure: leave a marker
     mark_failed(meter_dir, label)
-    # Stop splitting once the range is short enough
     if (end - start).days + 1 <= min_days:
-        # Give up on this piece
+        record_missing(output_dir, meter, start, end, [channel], label)
         return
     # Split in half
     (a_start, a_end), (b_start, b_end) = split_range(start, end)
@@ -358,29 +616,31 @@ def download_meter_month(client, output_dir, meter, data_type, channels, start, 
     label = range_label(start, end)
     # Full folder path
     folder = os.path.join(meter_dir, label)
-    # Skip if already complete
     if is_done(folder):
-        # Say so
         print(f"  skip {meter} {label} (DONE)")
-        # Nothing to do
         return
-    # Never touch a folder that exists without a DONE marker
-    if os.path.exists(folder):
-        # Report and leave it alone
-        print(f"  {meter} {label} exists without DONE, skipped")
-        # Record in the log
-        append_log(output_dir, [meter, data_type, label, "skipped_existing", 0, datetime.now().isoformat(timespec="seconds")])
-        # Nothing more
+    if not prepare_download_folder(folder):
         return
     # Progress line
     print(f"  {meter} {label} ({len(channels)} channels)")
     # Make the request for all channels
-    status, attempts = request_range(client, data_type, meter, channels, start, end, folder, retries, retry_wait)
-    # Log the attempt
-    append_log(output_dir, [meter, data_type, label, status, attempts, datetime.now().isoformat(timespec="seconds")])
-    # Success, done
+    status, attempts, error_type, error_message = request_range(
+        client, data_type, meter, channels, start, end, folder, retries, retry_wait
+    )
+    log_request_result(
+        output_dir,
+        meter,
+        data_type,
+        channels,
+        start,
+        end,
+        label,
+        status,
+        attempts,
+        error_type,
+        error_message,
+    )
     if status == "ok":
-        # Nothing more
         return
     # Failure: leave a marker
     mark_failed(meter_dir, label)
@@ -390,67 +650,44 @@ def download_meter_month(client, output_dir, meter, data_type, channels, start, 
         download_channel_range(client, output_dir, meter, data_type, channel, start, end, retries, retry_wait, min_days)
 
 
+def _entry_is_complete(output_dir, entry):
+    """Return True when a missing entry now has a valid DONE download."""
+    folder = os.path.join(output_dir, entry["meter"], entry["label"])
+    if not is_done(folder):
+        return False
+    data_type = "phasors"
+    request_path = os.path.join(folder, REQUEST_FILE)
+    if os.path.exists(request_path):
+        with open(request_path) as f:
+            data_type = json.load(f).get("data_type", data_type)
+    try:
+        validate_download(folder, entry["meter"], data_type, entry["channels"])
+        return True
+    except DownloadValidationError:
+        return False
+
+
 def find_missing_channels(output_dir, meters):
     """
-    Scan every DONE folder that has a request.json, compare the channels
-    requested with the files present, and return
-    {meter: {label: [missing channels]}}.
+    Return all channel/date ranges not successfully downloaded.
 
-    Folders from older downloads without request.json are skipped.
+    Merges the persisted failure registry with DONE folders that are missing
+    expected CSV files (for example from older runs before validation).
     """
-    # Result dictionary
-    missing = {}
-    # Loop over meters
-    for meter in meters:
-        # Meter folder
-        meter_dir = os.path.join(output_dir, meter)
-        # Skip meters with nothing downloaded
-        if not os.path.isdir(meter_dir):
-            # Next meter
-            continue
-        # Loop over range folders
-        for label in sorted(os.listdir(meter_dir)):
-            # Full path
-            folder = os.path.join(meter_dir, label)
-            # Only completed folders count
-            if not is_done(folder):
-                # Next folder
-                continue
-            # Path of the request record
-            request_path = os.path.join(folder, REQUEST_FILE)
-            # Skip folders without one
-            if not os.path.exists(request_path):
-                # Next folder
-                continue
-            # Read what was requested
-            with open(request_path) as f:
-                # Parse JSON
-                request = json.load(f)
-            # Older request files may not have a channels list
-            if "channels" not in request:
-                # Next folder
-                continue
-            # Collect every file name under the folder
-            present = {name for _, _, files in os.walk(folder) for name in files}
-            # Channels whose file did not come back
-            absent = [c for c in request["channels"] if f"{meter}-{c}.csv" not in present]
-            # Record if any are missing
-            if absent:
-                # Nested dictionary entry
-                missing.setdefault(meter, {})[label] = absent
-    # Return the full map
-    return missing
+    registry = [
+        entry
+        for entry in load_missing_registry(output_dir)
+        if not _entry_is_complete(output_dir, entry)
+    ]
+    absent_done = find_absent_in_done_folders(output_dir, meters)
+    entries = _merge_missing_entries(registry, absent_done)
+    return {"missing": entries}
 
 
 def write_missing_channels(output_dir, meters):
     """Write missing_channels.json at the root of the output folder."""
-    # Compute the map
     missing = find_missing_channels(output_dir, meters)
-    # Write it
-    with open(os.path.join(output_dir, MISSING_FILE), "w") as f:
-        # Readable JSON
-        json.dump(missing, f, indent=2)
-    # Return it for the caller to print a summary
+    _write_missing_file(output_dir, missing["missing"])
     return missing
 
 
@@ -467,8 +704,35 @@ def download_all(client, output_dir, meters, data_type, channels, start_date, en
         print(f"meter {meter}")
         # Loop over months
         for start, end in month_chunks(start_date, end_date):
-            # Download this meter and month
-            download_meter_month(client, output_dir, meter, data_type, channels, start, end, retries, retry_wait, min_days)
+            try:
+                download_meter_month(
+                    client,
+                    output_dir,
+                    meter,
+                    data_type,
+                    channels,
+                    start,
+                    end,
+                    retries,
+                    retry_wait,
+                    min_days,
+                )
+            except Exception as error:
+                label = range_label(start, end)
+                print(f"  {meter} {label} unexpected error: {type(error).__name__}: {error!r}")
+                log_request_result(
+                    output_dir,
+                    meter,
+                    data_type,
+                    channels,
+                    start,
+                    end,
+                    label,
+                    "failed",
+                    0,
+                    type(error).__name__,
+                    str(error) or repr(error),
+                )
         # Update the missing-channel file after each meter so it is always current
         write_missing_channels(output_dir, meters)
     # Final pass
