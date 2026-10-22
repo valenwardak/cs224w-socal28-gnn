@@ -38,7 +38,8 @@ Access is granted per person and tied to your GitHub account.
 ```bash
 git clone https://github.com/valenwardak/cs224w-socal28-gnn.git
 cd cs224w-socal28-gnn
-pip install -r requirements.txt
+micromamba create -n socal-gnn python=3.10
+micromamba run -n socal-gnn pip install -r requirements.txt
 ```
 
 `dataset_api_client.py` is Caltech's client, copied unchanged from their repo. Python 3.10 or newer is required.
