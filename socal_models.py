@@ -36,7 +36,10 @@
 #              "No change" then costs nothing to learn, and the model only has
 #              to capture what persistence misses. Where the history holds no
 #              valid value to start from, the head output stands alone. The
-#              loss, residuals, and scoring are unchanged.
+#              loss, residuals, and scoring are unchanged. The heads start
+#              at zero weights (zero_head below), so the very first forecast
+#              is exactly persistence wherever a valid history value exists,
+#              and training moves away from it only where the data pushes.
 #
 # Batches:     assembled in bulk with array indexing (get_batch on the
 #              datasets, iter_batches below), not one example at a time,
@@ -110,6 +113,7 @@
 #     build_edges(graph, mode, weights, seed)
 #                                     edge_index (2, E) and edge_weight (E,) tensors
 #   Models
+#     zero_head(layer)                start a head at zero weights, for predict-delta
 #     MeterGRU                        shared meter-conditioned GRU with a forecast head
 #     GraphForecaster                 MeterGRU encoder + one GNN layer + head
 #     persistence_forecast(x, C)      last valid reading as the forecast, with validity
@@ -351,6 +355,22 @@ def build_edges(graph, mode="true", weights="admittance", seed=0):
 # Models
 # -----------------------------------------------------------------------------
 
+def zero_head(layer):
+    """
+    Set a linear head's weights and bias to zero in place. Used when
+    predict_delta is on, so the correction added to persistence starts at
+    zero and the model's first forecast is persistence itself.
+    """
+    # No gradient tracking while editing the parameters
+    with torch.no_grad():
+        # Weights
+        layer.weight.zero_()
+        # Bias, if the layer has one
+        if layer.bias is not None:
+            # Zero
+            layer.bias.zero_()
+
+
 class MeterGRU(nn.Module):
     """
     Shared, meter-conditioned GRU forecaster.
@@ -378,6 +398,12 @@ class MeterGRU(nn.Module):
         self.head_mag = nn.Linear(hidden, n_channels)
         # Angle head, cos and sin per channel
         self.head_ang = nn.Linear(hidden, 2 * n_channels)
+        # With predict-delta the heads start at zero, so the first forecast is persistence
+        if predict_delta:
+            # Magnitude
+            zero_head(self.head_mag)
+            # Angle
+            zero_head(self.head_ang)
 
     def encode(self, x, meter):
         """
@@ -470,6 +496,12 @@ class GraphForecaster(nn.Module):
         self.head_mag = nn.Linear(2 * hidden, n_channels)
         # Angle head
         self.head_ang = nn.Linear(2 * hidden, 2 * n_channels)
+        # With predict-delta the heads start at zero, so the first forecast is persistence
+        if predict_delta:
+            # Magnitude
+            zero_head(self.head_mag)
+            # Angle
+            zero_head(self.head_ang)
         # Count of meters per node, for averaging shared nodes
         counts = torch.zeros(n_nodes).index_add_(0, meter_node, torch.ones(len(meter_node)))
         # Keep

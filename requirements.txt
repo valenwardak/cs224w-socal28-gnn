@@ -14,3 +14,5 @@ python-dateutil
 scipy
 pytz
 ntplib
+torch
+torch_geometric
