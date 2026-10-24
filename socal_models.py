@@ -7,7 +7,7 @@
 #
 # Purpose:     The learned models and everything around them: the shared
 #              meter-conditioned GRU, the three GNNs built on top of it
-#              (GCN, GAT, GraphSAGE), the persistence baseline, the loss,
+#              (GCN, GAT, GraphSAGE, RGCN), the persistence baseline, the loss,
 #              the training loop with checkpoints, and the scoring that
 #              writes a residual per slot, meter, and channel. The data
 #              side lives in socal_modeldata.py. Imported by the thin main
@@ -54,7 +54,8 @@
 #              undirected, stored in both directions. GCN uses the scalar
 #              admittance_abs as the edge weight, GAT takes it as a one-
 #              number edge feature, GraphSAGE ignores weights (mean of
-#              neighbors). --edges none|random|true and --edge-weights
+#              neighbors), RGCN uses Line vs Transformer as two relations.
+#              --edges none|random|true and --edge-weights
 #              binary|admittance give the topology ablation. Two limits of
 #              that ablation, stated so nobody over-reads it: with "none",
 #              meters that share a node (19 and 21) are still averaged
@@ -111,7 +112,7 @@
 #     meter_node_index(graph, manifest)
 #                                     (M,) node index per meter
 #     build_edges(graph, mode, weights, seed)
-#                                     edge_index (2, E) and edge_weight (E,) tensors
+#                                     edge_index (2, E), edge_weight (E,), edge_type (E,)
 #   Models
 #     zero_head(layer)                start a head at zero weights, for predict-delta
 #     MeterGRU                        shared meter-conditioned GRU with a forecast head
@@ -303,16 +304,17 @@ def build_edges(graph, mode="true", weights="admittance", seed=0):
               "none"   no edges, message passing sees only self-loops
       weights "admittance" admittance_abs scaled to a 0 to 1 range by its
                            maximum, "binary" all ones
-    Returns (edge_index LongTensor (2, E), edge_weight FloatTensor (E,)).
+    Returns (edge_index LongTensor (2, E), edge_weight FloatTensor (E,),
+             edge_type LongTensor (E,)), Line = 0, Transformer = 1.
     """
     # Node count
     n = len(graph["nodes"])
-    # Source, target, weight lists
-    src, dst, w = [], [], []
+    # Source, target, weight, relation lists
+    src, dst, w, rel = [], [], [], []
     # Loop over edges
     for e in graph["edges"]:
         # Ends
-        src.append(e["source"]); dst.append(e["target"]); w.append(float(e["admittance_abs"]))
+        src.append(e["source"]); dst.append(e["target"]); w.append(float(e["admittance_abs"])); rel.append(0 if e["type"] == "Line" else 1)
     # Random rewiring keeps the edge count
     if mode == "random":
         # Generator
@@ -332,7 +334,7 @@ def build_edges(graph, mode="true", weights="admittance", seed=0):
     # No edges at all
     elif mode == "none":
         # Empty
-        src, dst, w = [], [], []
+        src, dst, w, rel = [], [], [], []
     # Weights
     if weights == "binary" or not w:
         # All ones
@@ -347,8 +349,10 @@ def build_edges(graph, mode="true", weights="admittance", seed=0):
     edge_index = torch.tensor([src + dst, dst + src], dtype=torch.long).reshape(2, -1)
     # Weights for both directions
     edge_weight = torch.tensor(w + w, dtype=torch.float32)
+    # Types for both directions
+    edge_type = torch.tensor(rel + rel, dtype=torch.long)
     # Return
-    return edge_index, edge_weight
+    return edge_index, edge_weight, edge_type
 
 
 # -----------------------------------------------------------------------------
@@ -449,18 +453,18 @@ class GraphForecaster(nn.Module):
     grid graph, and a head that reads each meter's own state together with
     its node's mixed state.
 
-    kind: "gcn", "gat", or "sage". Needs torch_geometric. gnn_layers is
+    kind: "gcn", "gat", "sage", or "rgcn". Needs torch_geometric. gnn_layers is
     the number of message-passing hops; one hop does not reach a meter
     that sits two edges away behind an unmetered node.
     """
 
-    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_index, edge_weight, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True):
+    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_index, edge_weight, n_relations, edge_type, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True):
         # Base class
         super().__init__()
         # Whether the head outputs a correction to the persistence forecast
         self.predict_delta = predict_delta
         # Layers from PyTorch Geometric, imported here so the GRU runs without it
-        from torch_geometric.nn import GCNConv, GATConv, SAGEConv
+        from torch_geometric.nn import GCNConv, GATConv, SAGEConv, RGCNConv
         # Sizes
         self.C, self.hidden, self.n_nodes, self.kind = n_channels, hidden, n_nodes, kind
         # Shared encoder
@@ -471,6 +475,8 @@ class GraphForecaster(nn.Module):
         self.register_buffer("edge_index", edge_index)
         # Weights, fixed
         self.register_buffer("edge_weight", edge_weight)
+        # Relation ids, fixed
+        self.register_buffer("edge_type", edge_type)
         # Learned vector for nodes without a meter
         self.unmetered = nn.Parameter(torch.zeros(hidden))
         # Message passing layers, gnn_layers of them, each one hop
@@ -487,6 +493,9 @@ class GraphForecaster(nn.Module):
             elif kind == "sage":
                 # Mean of neighbors, no weights
                 convs.append(SAGEConv(hidden, hidden))
+            elif kind == "rgcn":
+                # Separate weights per relation
+                convs.append(RGCNConv(hidden, hidden, n_relations))
             else:
                 # Unknown
                 raise ValueError(f"unknown GNN kind: {kind}")
@@ -531,6 +540,8 @@ class GraphForecaster(nn.Module):
         ei = torch.cat([self.edge_index + o for o in offsets], dim=1)
         # Weights repeated
         ew = self.edge_weight.repeat(B)
+        # Types repeated
+        et = self.edge_type.repeat(B)
         # Stacked node features
         mixed = nodes.reshape(B * self.n_nodes, self.hidden)
         # Each layer is one hop, with a residual connection
@@ -542,6 +553,9 @@ class GraphForecaster(nn.Module):
             elif self.kind == "gat":
                 # Weight as a feature
                 out = conv(mixed, ei, edge_attr=ew[:, None])
+            elif self.kind == "rgcn":
+                # Typed
+                out = conv(mixed, ei, edge_type=et)
             else:
                 # Unweighted
                 out = conv(mixed, ei)
@@ -669,7 +683,7 @@ def residuals(y_hat, y, y_valid):
 # -----------------------------------------------------------------------------
 
 def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True):
-    """Build a model by name: "gru", "gcn", "gat", or "sage"."""
+    """Build a model by name: "gru", "gcn", "gat", "sage", or "rgcn"."""
     # Sizes
     M, C = len(manifest["meters"]), len(manifest["channels"])
     # Plain GRU
@@ -683,9 +697,11 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
     # Meter placement
     meter_node = meter_node_index(graph, manifest)
     # Edges
-    edge_index, edge_weight = build_edges(graph, edges, edge_weights, seed)
+    edge_index, edge_weight, edge_type = build_edges(graph, edges, edge_weights, seed)
+    # Relation count from the graph
+    n_relations = len({e["type"] for e in graph["edges"]})
     # Build
-    return GraphForecaster(kind, M, C, len(graph["nodes"]), meter_node, edge_index, edge_weight, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta)
+    return GraphForecaster(kind, M, C, len(graph["nodes"]), meter_node, edge_index, edge_weight, n_relations, edge_type, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta)
 
 
 def new_sums():
