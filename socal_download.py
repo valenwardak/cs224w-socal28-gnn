@@ -4,6 +4,7 @@
 #              GNN event detection on the SoCal 28-Bus dataset
 # Authors:     Valen Wardak and Landon Choy, Stanford University
 # Created:     2026-10-16
+# Revised:     2026-10-25  skip ranges that already have a _failed marker
 # Revised:     2026-10-18  never write into or delete a pre-existing folder;
 #                          print error types; tolerate existing _failed entries
 #
@@ -176,6 +177,12 @@ def is_done(folder):
     return os.path.exists(os.path.join(folder, DONE_FILE))
 
 
+def is_failed(meter_dir, label):
+    """Return True if this range has a _failed marker (file or folder)."""
+    # Same path mark_failed writes
+    return os.path.exists(os.path.join(meter_dir, FAILED_DIR, label))
+
+
 def mark_done(folder):
     """Create the DONE marker in a folder."""
     # Create an empty file
@@ -315,6 +322,12 @@ def download_channel_range(client, output_dir, meter, data_type, channel, start,
     if is_done(folder):
         # Nothing to do
         return
+    # Skip if a previous run already failed this exact request
+    if is_failed(meter_dir, label):
+        # Say so
+        print(f"  skip {meter} {label} (_failed)")
+        # Do not retry or split again
+        return
     # Never touch a folder that exists without a DONE marker
     if os.path.exists(folder):
         # Report and leave it alone
@@ -372,18 +385,24 @@ def download_meter_month(client, output_dir, meter, data_type, channels, start, 
         append_log(output_dir, [meter, data_type, label, "skipped_existing", 0, datetime.now().isoformat(timespec="seconds")])
         # Nothing more
         return
-    # Progress line
-    print(f"  {meter} {label} ({len(channels)} channels)")
-    # Make the request for all channels
-    status, attempts = request_range(client, data_type, meter, channels, start, end, folder, retries, retry_wait)
-    # Log the attempt
-    append_log(output_dir, [meter, data_type, label, status, attempts, datetime.now().isoformat(timespec="seconds")])
-    # Success, done
-    if status == "ok":
-        # Nothing more
-        return
-    # Failure: leave a marker
-    mark_failed(meter_dir, label)
+    # All-channels request already failed: skip retrying it, still try per channel
+    if is_failed(meter_dir, label):
+        # Say so
+        print(f"  skip {meter} {label} (_failed)")
+    # Otherwise try all channels together first
+    else:
+        # Progress line
+        print(f"  {meter} {label} ({len(channels)} channels)")
+        # Make the request for all channels
+        status, attempts = request_range(client, data_type, meter, channels, start, end, folder, retries, retry_wait)
+        # Log the attempt
+        append_log(output_dir, [meter, data_type, label, status, attempts, datetime.now().isoformat(timespec="seconds")])
+        # Success, done
+        if status == "ok":
+            # Nothing more
+            return
+        # Failure: leave a marker
+        mark_failed(meter_dir, label)
     # Fall back to one channel at a time
     for channel in channels:
         # Each channel gets its own folder and its own splitting
