@@ -4,12 +4,14 @@
 #              GNN event detection on the SoCal 28-Bus dataset
 # Authors:     Valen Wardak and Landon Choy, Stanford University
 # Created:     2026-10-16
+# Revised:     2026-10-26  resume leftover incomplete folders in place;
+#                          never overwrite validated CSVs; skip split ranges
+#                          already on disk; suppress Caltech staging warning
 # Revised:     2026-10-25  skip empty ~191B ZIPs; retry only transient errors;
 #                          keep valid CSVs from truncated multi-channel ZIPs
 # Revised:     2026-10-25  optional thread pool for meter-month downloads
 # Revised:     2026-10-25  skip ranges that already have a _failed marker
-# Revised:     2026-10-18  never write into or delete a pre-existing folder;
-#                          print error types; tolerate existing _failed entries
+# Revised:     2026-10-18  print error types; tolerate existing _failed entries
 #
 # Purpose:     Helper functions for downloading SoCal 28-Bus data from the
 #              Caltech API, one meter and one month per request, into the
@@ -35,10 +37,11 @@
 #              HTTP, and Drive errors retry with backoff and are not given
 #              a permanent _failed marker.
 #
-# Safety:      A folder that already exists is never written into and never
-#              deleted, whether or not it has a DONE marker. Only a folder
-#              this run creates is downloaded into, and only that folder is
-#              removed if its download fails.
+# Safety:      Validated CSVs are never overwritten or deleted. A leftover
+#              folder with no validated CSV can be reused. Only folders with
+#              no validated data are removed after a failed attempt. _failed
+#              marks empty ZIPs only; delete those markers to retry if the
+#              API later has data. Transient errors are not marked _failed.
 #
 # Requirements:
 #              dataset_api_client.py (from caltech-netlab/digital-twin-dataset)
@@ -578,19 +581,53 @@ def promote_complete_csvs(src, dest):
             rel = os.path.relpath(path, src)
             # Destination path
             out = os.path.join(dest, rel)
+            # Never replace a CSV that already passed validation
+            if os.path.exists(out) and csv_is_complete(out):
+                # Keep the existing file
+                continue
             # Make the data-type subfolder
             os.makedirs(os.path.dirname(out), exist_ok=True)
             # Copy onto the real output (Drive sees a complete file)
             shutil.copy2(path, out)
 
 
+def channel_range_complete(meter_dir, meter, channel, start, end):
+    """
+    True if this channel already covers [start, end] on disk.
+
+    Accepts a validated CSV in the combined month folder, the matching
+    single-channel folder, or both halves of a previous split.
+    """
+    # Combined month folder for this exact date range
+    if channel in present_channels(os.path.join(meter_dir, range_label(start, end)), meter, [channel]):
+        # Already present
+        return True
+    # Single-channel folder for this exact date range
+    if channel in present_channels(os.path.join(meter_dir, range_label(start, end, channel)), meter, [channel]):
+        # Already present
+        return True
+    # One-day ranges cannot split further
+    if (end - start).days < 1:
+        # Not on disk
+        return False
+    # Same split the downloader uses, so nested fallbacks count
+    (a_start, a_end), (b_start, b_end) = split_range(start, end)
+    # Complete only when both halves are complete
+    return (
+        channel_range_complete(meter_dir, meter, channel, a_start, a_end)
+        and channel_range_complete(meter_dir, meter, channel, b_start, b_end)
+    )
+
+
 def request_range(client, data_type, meter, channels, start, end, folder, retries, retry_wait):
     """
     Make one request for the given channels and date range, with retries.
 
-    The folder must not exist yet; the caller checks that. Writes
-    request.json first, then downloads into a local staging directory.
-    Returns (status, attempts) where status is:
+    Reuses a leftover folder that has no validated CSVs. Never deletes a
+    folder that already holds validated data, and never overwrites those
+    files. Writes request.json, then downloads into a unique local staging
+    path that does not exist yet (avoids the Caltech "already exists"
+    warning). Returns (status, attempts) where status is:
       ok        every requested channel has a validated CSV; DONE written
       partial   some channels recovered; folder kept; no DONE
       missing   empty/tiny ZIP, no validated CSVs; folder removed
@@ -603,6 +640,8 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
     kwarg_name = CLIENT_KWARG[data_type]
     # The server's end bound is exclusive, so request through the end of the last day
     time_range = (datetime.combine(start, datetime.min.time()), datetime.combine(end + timedelta(days=1), datetime.min.time()))
+    # Validated channels already in this folder; never delete them
+    keep = present_channels(folder, meter, channels) if os.path.isdir(folder) else set()
     # Record what we are asking for; this also creates the folder
     write_request(folder, {
         # Meter name
@@ -624,8 +663,9 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
     for attempt in range(1, retries + 2):
         # Record which attempt this is
         attempts = attempt
-        # Unzip to local disk, then copy complete files to the destination
+        # Unique empty path; rmdir so the Caltech client does not warn that it exists
         staging = tempfile.mkdtemp(prefix="socal_dl_")
+        os.rmdir(staging)
         # Error from this attempt, or None on a clean unzip
         download_error = None
         try:
@@ -671,7 +711,8 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
                     # Caller will retry the rest one channel at a time
                     return "partial", attempt
                 # Nothing came back; do not call this verified success
-                shutil.rmtree(folder, ignore_errors=True)
+                if not keep:
+                    shutil.rmtree(folder, ignore_errors=True)
                 # Suspected missing data
                 return "missing", attempt
             # Transient network / HTTP / Drive: bounded exponential backoff
@@ -683,7 +724,8 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
             # Tiny truncated ZIP: empty range, not a flaky download
             if is_unzip_error(download_error) and payload <= EMPTY_RESPONSE_MAX_BYTES and not have:
                 # Remove the empty request folder
-                shutil.rmtree(folder, ignore_errors=True)
+                if not keep:
+                    shutil.rmtree(folder, ignore_errors=True)
                 # Record as missing; caller must not split
                 return "missing", attempt
             # Substantial ZIP corruption, with or without recovered files
@@ -693,7 +735,8 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
                     # Keep them; caller retries the rest
                     return "partial", attempt
                 # Nothing valid; remove the folder and let the caller split
-                shutil.rmtree(folder, ignore_errors=True)
+                if not keep:
+                    shutil.rmtree(folder, ignore_errors=True)
                 # Split may recover a shorter range
                 return "truncated", attempt
             # Retries exhausted, or an unknown error
@@ -701,14 +744,16 @@ def request_range(client, data_type, meter, channels, start, end, folder, retrie
                 # Keep recovered files
                 return "partial", attempt
             # Nothing to keep
-            shutil.rmtree(folder, ignore_errors=True)
+            if not keep:
+                shutil.rmtree(folder, ignore_errors=True)
             # Caller may still split
             return "failed", attempt
         finally:
             # Always drop staging, including on return
             shutil.rmtree(staging, ignore_errors=True)
     # Loop ended without a return (retries of a retryable error)
-    shutil.rmtree(folder, ignore_errors=True)
+    if not keep:
+        shutil.rmtree(folder, ignore_errors=True)
     # Transient failure
     return "failed", attempts
 
@@ -725,41 +770,23 @@ def download_channel_range(client, output_dir, meter, data_type, channel, start,
     label = range_label(start, end, channel)
     # Full folder path
     folder = os.path.join(meter_dir, label)
-    # Skip if already complete
-    if is_done(folder):
-        # Nothing to do
+    # Skip if this range is already on disk, including split fallbacks
+    if channel_range_complete(meter_dir, meter, channel, start, end):
+        # Finish DONE on this folder when it holds the validated CSV
+        if os.path.isdir(folder) and channel in present_channels(folder, meter, [channel]):
+            # Marker so later reruns skip the scan
+            mark_done(folder)
+        # Nothing to fetch
         return
-    # Skip if a previous run already failed this exact request
+    # Empty ZIP from a previous run; delete _failed/<label> to retry if data appears
     if is_failed(meter_dir, label):
         # Say so
         _say(f"  skip {meter} {label} (_failed)")
         # Do not retry or split again
         return
-    # Never write into a folder that exists without a DONE marker
-    if os.path.exists(folder):
-        # Already has a validated CSV for this channel
-        if channel in present_channels(folder, meter, [channel]):
-            # Nothing more
-            return
-        # Report and leave the folder alone
-        _say(f"  {meter} {label} exists without DONE, skipped")
-        # Record in the log
-        append_log(output_dir, [meter, data_type, label, "skipped_existing", 0, datetime.now().isoformat(timespec="seconds")])
-        # Stop if the range is too short to split
-        if (end - start).days + 1 <= min_days:
-            # Give up on this piece
-            return
-        # Shorter folders have different names, so they can still recover
-        (a_start, a_end), (b_start, b_end) = split_range(start, end)
-        # First half
-        download_channel_range(client, output_dir, meter, data_type, channel, a_start, a_end, retries, retry_wait, min_days)
-        # Second half
-        download_channel_range(client, output_dir, meter, data_type, channel, b_start, b_end, retries, retry_wait, min_days)
-        # Do not request this exact folder
-        return
     # Progress line
     _say(f"  {meter} {label}")
-    # Make the request
+    # Make the request; leftover empty folders are reused in place
     status, attempts = request_range(client, data_type, meter, [channel], start, end, folder, retries, retry_wait)
     # Log the attempt
     append_log(output_dir, [meter, data_type, label, status, attempts, datetime.now().isoformat(timespec="seconds")])
@@ -769,7 +796,7 @@ def download_channel_range(client, output_dir, meter, data_type, channel, start,
         return
     # Empty ZIP: suspected missing data; skip this exact request on rerun
     if status == "missing":
-        # Permanent skip for this label only
+        # Skip for this label only; delete the marker to retry later
         mark_failed(meter_dir, label)
         # Do not split
         return
@@ -803,21 +830,21 @@ def download_meter_month(client, output_dir, meter, data_type, channels, start, 
         _say(f"  skip {meter} {label} (DONE)")
         # Nothing to do
         return
-    # Channels already on disk with a complete CSV
-    have = present_channels(folder, meter, channels)
-    # Channels still needed
-    need = [channel for channel in channels if channel not in have]
-    # Folder already has every channel: finish the DONE marker and stop
+    # Channels still needed, counting sibling and split fallback folders
+    need = [channel for channel in channels if not channel_range_complete(meter_dir, meter, channel, start, end)]
+    # Everything is already on disk
     if not need:
-        # Complete
-        mark_done(folder)
+        # Only mark DONE when this folder itself has every channel
+        if set(channels) <= present_channels(folder, meter, channels):
+            # Combined folder is complete
+            mark_done(folder)
         # Nothing more
         return
-    # Try all channels together unless the folder already exists or failed
-    if not os.path.exists(folder) and not is_failed(meter_dir, label):
+    # Combined request when there is no validated CSV here and no empty-ZIP marker
+    if not is_failed(meter_dir, label) and not present_channels(folder, meter, channels):
         # Progress line
         _say(f"  {meter} {label} ({len(channels)} channels)")
-        # Make the request for all channels
+        # Make the request for all channels; leftover empty folders are reused
         status, attempts = request_range(client, data_type, meter, channels, start, end, folder, retries, retry_wait)
         # Log the attempt
         append_log(output_dir, [meter, data_type, label, status, attempts, datetime.now().isoformat(timespec="seconds")])
@@ -831,24 +858,19 @@ def download_meter_month(client, output_dir, meter, data_type, channels, start, 
         if status != "failed":
             # missing, partial, or truncated
             mark_failed(meter_dir, label)
-        # Recompute from whatever the ZIP left behind
-        have = present_channels(folder, meter, channels)
-        # Channels still missing
-        need = [channel for channel in channels if channel not in have]
+        # Recompute, including fallbacks written by this attempt
+        need = [channel for channel in channels if not channel_range_complete(meter_dir, meter, channel, start, end)]
         # Truncated ZIP that still yielded every channel
         if not need:
-            # Treat as complete
-            mark_done(folder)
+            # Treat as complete only when the files live in this folder
+            if set(channels) <= present_channels(folder, meter, channels):
+                # Combined folder is complete
+                mark_done(folder)
             # Nothing more
             return
     elif is_failed(meter_dir, label):
-        # Say so
+        # Say so; channel fallbacks still run for whatever is missing
         _say(f"  skip {meter} {label} (_failed)")
-    else:
-        # Pre-existing folder: never write into it; still fetch missing channels
-        _say(f"  {meter} {label} exists without DONE, skipped")
-        # Record in the log
-        append_log(output_dir, [meter, data_type, label, "skipped_existing", 0, datetime.now().isoformat(timespec="seconds")])
     # Fall back to one channel at a time for whatever is still missing
     for channel in need:
         # Each channel gets its own folder and its own splitting
