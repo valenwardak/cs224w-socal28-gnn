@@ -101,6 +101,10 @@
 #              for magnitude and angle separately, then combined with the
 #              angle weight. An empty validation set raises.
 #
+# Progress:    a tqdm bar per epoch over the train pieces (one block-month
+#              each) and one over the validation pieces, on the terminal
+#              only; the log file keeps just the epoch lines.
+#
 # Functions and classes:
 #   Datasets
 #     GraphWindowDataset              synchronized windows over all meters, for the GNNs
@@ -147,6 +151,8 @@ import pandas as pd
 import torch
 # Third party: layers
 import torch.nn as nn
+# Third party: progress bars on the terminal, one per epoch over the month pieces
+from tqdm import tqdm
 # Project: data side
 import socal_modeldata as sd
 
@@ -796,10 +802,12 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
     subset = {split_name: chosen}
     # Generator, unused since evaluation does not shuffle
     rng = np.random.default_rng(0)
+    # Number of pieces, for the bar
+    n_pieces = sum(len(sd.months_in_block(b)) for b in chosen)
     # No gradient
     with torch.no_grad():
-        # Loop over pieces
-        for piece in sd.iter_blocks(features_dir, subset, split_name, scale, manifest=manifest):
+        # Loop over pieces, with a progress bar that clears when done
+        for piece in tqdm(sd.iter_blocks(features_dir, subset, split_name, scale, manifest=manifest), total=n_pieces, desc=f"{split_name} pieces", leave=False):
             # Dataset
             ds = make_dataset(piece, graph_mode, history, horizon, max_gap)
             # Skip empty
@@ -927,8 +935,8 @@ def train(model, features_dir, splits, scale, manifest, device, options, checkpo
         rng.shuffle(order)
         # Accumulator for the epoch's training loss
         sums = new_sums()
-        # Loop over pieces
-        for bi, month in order:
+        # Loop over pieces, with a progress bar that clears when the epoch line prints
+        for bi, month in tqdm(order, desc=f"epoch {epoch + 1} train pieces", leave=False):
             # Load exactly this block-month
             piece = sd.load_piece(features_dir, splits["train"][bi], month, scale, manifest=manifest)
             # Skip empty
