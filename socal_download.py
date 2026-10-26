@@ -4,6 +4,7 @@
 #              GNN event detection on the SoCal 28-Bus dataset
 # Authors:     Valen Wardak and Landon Choy, Stanford University
 # Created:     2026-10-16
+# Revised:     2026-10-25  optional thread pool for meter-month downloads
 # Revised:     2026-10-25  skip ranges that already have a _failed marker
 # Revised:     2026-10-18  never write into or delete a pre-existing folder;
 #                          print error types; tolerate existing _failed entries
@@ -55,6 +56,10 @@ import os
 import shutil
 # Standard library: pausing between retries
 import time
+# Standard library: overlapping network waits without extra processes
+from concurrent.futures import ThreadPoolExecutor, as_completed
+# Standard library: lock for the shared download log
+import threading
 # Standard library: dates for building ranges
 from datetime import date, datetime, timedelta
 # Caltech client that talks to the SoCal 28-Bus API
@@ -79,6 +84,8 @@ FAILED_DIR = "_failed"
 MISSING_FILE = "missing_channels.json"
 # Log file at the root, one row per attempt
 LOG_FILE = "download_log.csv"
+# One lock for download_log.csv so parallel threads do not interleave rows
+_LOG_LOCK = threading.Lock()
 
 
 def read_meters(meters_file):
@@ -222,20 +229,22 @@ def append_log(output_dir, row):
 
     Columns: meter, data_type, label, status, attempts, finished_at
     """
-    # Full path to the log
-    log_path = os.path.join(output_dir, LOG_FILE)
-    # Header needed only when the file does not exist yet
-    write_header = not os.path.exists(log_path)
-    # Open in append mode
-    with open(log_path, "a", newline="") as f:
-        # CSV writer
-        writer = csv.writer(f)
-        # Header on first write only
-        if write_header:
-            # Column names
-            writer.writerow(["meter", "data_type", "label", "status", "attempts", "finished_at"])
-        # The data row
-        writer.writerow(row)
+    # Serialize writers so parallel jobs cannot split a row
+    with _LOG_LOCK:
+        # Full path to the log
+        log_path = os.path.join(output_dir, LOG_FILE)
+        # Header needed only when the file does not exist yet
+        write_header = not os.path.exists(log_path)
+        # Open in append mode
+        with open(log_path, "a", newline="") as f:
+            # CSV writer
+            writer = csv.writer(f)
+            # Header on first write only
+            if write_header:
+                # Column names
+                writer.writerow(["meter", "data_type", "label", "status", "attempts", "finished_at"])
+            # The data row
+            writer.writerow(row)
 
 
 def make_client(credentials_file):
@@ -473,22 +482,75 @@ def write_missing_channels(output_dir, meters):
     return missing
 
 
-def download_all(client, output_dir, meters, data_type, channels, start_date, end_date, retries, retry_wait, min_days):
+def download_all(client, output_dir, meters, data_type, channels, start_date, end_date, retries, retry_wait, min_days, workers=4):
     """
     Download every meter for every month in the date range, then write
     missing_channels.json. Returns the missing-channel map.
+
+    workers is how many meter-month requests may run at once. Each worker
+    is a thread, so this overlaps waiting on the Caltech API without extra
+    processes or many CPUs. 1 keeps the original sequential order. Fallback
+    splitting inside a meter-month still runs on that same thread.
     """
     # Make the root output folder
     os.makedirs(output_dir, exist_ok=True)
-    # Loop over meters
-    for meter in meters:
-        # Progress line
-        print(f"meter {meter}")
-        # Loop over months
-        for start, end in month_chunks(start_date, end_date):
-            # Download this meter and month
-            download_meter_month(client, output_dir, meter, data_type, channels, start, end, retries, retry_wait, min_days)
-        # Update the missing-channel file after each meter so it is always current
-        write_missing_channels(output_dir, meters)
-    # Final pass
+    # Treat a missing or non-positive value as sequential
+    workers = 1 if workers is None else max(1, int(workers))
+    # Sequential path: same meter-then-month order as before
+    if workers == 1:
+        # Loop over meters
+        for meter in meters:
+            # Progress line
+            print(f"meter {meter}")
+            # Loop over months
+            for start, end in month_chunks(start_date, end_date):
+                # Download this meter and month
+                download_meter_month(client, output_dir, meter, data_type, channels, start, end, retries, retry_wait, min_days)
+            # Update the missing-channel file after each meter so it is always current
+            write_missing_channels(output_dir, meters)
+        # Final pass
+        return write_missing_channels(output_dir, meters)
+    # One job per meter and month; folders do not overlap, so threads stay independent
+    jobs = [(meter, start, end) for meter in meters for start, end in month_chunks(start_date, end_date)]
+    # Say how much work is queued
+    print(f"{len(jobs)} meter-month jobs, {workers} threads")
+    # Keep Caltech's per-download tqdm bars from tearing each other
+    try:
+        # Imported here so sequential runs do not need it
+        from tqdm import tqdm
+        # One lock for all bars
+        tqdm.set_lock(threading.RLock())
+    # tqdm is a dependency, but a missing install should not block downloads
+    except ImportError:
+        # Continue without a tqdm lock
+        pass
+    # Run one meter-month on this thread, including any channel fallback
+    def run_job(job):
+        # Unpack the job
+        meter, start, end = job
+        # Same helper as the sequential path
+        download_meter_month(client, output_dir, meter, data_type, channels, start, end, retries, retry_wait, min_days)
+    # Collect unexpected errors so every job still gets a chance to finish
+    errors = []
+    # Small pool: threads release the GIL while waiting on the network
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # Submit every meter-month
+        futures = [pool.submit(run_job, job) for job in jobs]
+        # Harvest them as they finish
+        for future in as_completed(futures):
+            # Catch so one bad job does not discard the rest
+            try:
+                # Re-raise into this thread
+                future.result()
+            # download_meter_month already catches request errors; this is extra safety
+            except Exception as error:
+                # Report the failure with its type
+                print(f"  job failed: {type(error).__name__}: {error!r}")
+                # Keep it to raise after the pool drains
+                errors.append(error)
+    # Surface the first unexpected error after the other jobs have finished
+    if errors:
+        # Raise so the caller sees that something besides a request failure happened
+        raise errors[0]
+    # Scan once at the end; DONE markers already make a crash restartable
     return write_missing_channels(output_dir, meters)
