@@ -571,12 +571,10 @@ def window_starts(present_any, history, horizon, max_gap, target_valid):
         return np.zeros(0, dtype=np.int64)
     # Absent slots as 1
     absent = (~present_any).astype(np.int32)
-    # Running length of the absent run ending at each slot
-    run = np.zeros(T, dtype=np.int32)
-    # Loop once
-    for i in range(T):
-        # Extend or reset
-        run[i] = run[i - 1] + 1 if (i > 0 and absent[i]) else absent[i]
+    # Running length of the absent run ending at each slot, vectorized:
+    # cumsum grows through absents and is reset after each present slot
+    c = np.cumsum(absent)
+    run = c - np.maximum.accumulate(np.where(absent == 0, c, 0))
     # Slot i closes a run of max_gap absent slots that ends at i
     closes = run >= max_gap
     # Such a run lies inside the window [s, s + history) exactly when

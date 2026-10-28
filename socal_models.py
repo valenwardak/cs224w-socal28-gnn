@@ -522,6 +522,18 @@ class GraphForecaster(nn.Module):
         # Keep
         self.register_buffer("node_count", counts)
 
+    def _batched_edges(self, B):
+        """
+        Stack B copies of the graph's edges by broadcasting node offsets.
+        Returns edge_index (2, B * E), edge_weight (B * E,), edge_type (B * E,).
+        """
+        # Node id shift per copy: 0, n_nodes, 2 * n_nodes, ...
+        offsets = torch.arange(B, device=self.edge_index.device) * self.n_nodes
+        # (2, E) + (B,) -> (2, B, E) -> (2, B * E), copies laid out in order
+        ei = (self.edge_index.unsqueeze(1) + offsets.view(1, -1, 1)).reshape(2, -1)
+        # Weights and types repeated in the same copy order
+        return ei, self.edge_weight.repeat(B), self.edge_type.repeat(B)
+
     def forward(self, x):
         """
         x (B, H, M, C * F) -> forecast (B, M, C, 3).
@@ -541,13 +553,7 @@ class GraphForecaster(nn.Module):
         # Average nodes with more than one meter
         nodes = nodes / self.node_count.clamp(min=1)[None, :, None]
         # Message passing per example: PyG works on one graph at a time, so batch by stacking graphs
-        offsets = torch.arange(B, device=x.device) * self.n_nodes
-        # Edge index for the stacked graphs
-        ei = torch.cat([self.edge_index + o for o in offsets], dim=1)
-        # Weights repeated
-        ew = self.edge_weight.repeat(B)
-        # Types repeated
-        et = self.edge_type.repeat(B)
+        ei, ew, et = self._batched_edges(B)
         # Stacked node features
         mixed = nodes.reshape(B * self.n_nodes, self.hidden)
         # Each layer is one hop, with a residual connection
@@ -731,10 +737,16 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None):
     One pass over an iterable of tensor batches already on the device.
     With an optimizer, trains; without, evaluates. Adds squared-error sums
     and valid counts into `sums` (see new_sums), so the caller can pool
-    over any number of pieces without batch-size bias.
+    over any number of pieces without batch-size bias. Accumulators stay on
+    the device until the pass ends; per-meter stats are evaluation-only.
     """
     # Mode
-    model.train(optimizer is not None)
+    train = optimizer is not None
+    model.train(train)
+    # Device-side pooled sums, created on the first batch
+    mag_se_t = mag_n_t = ang_se_t = ang_n_t = None
+    # Per-meter sums, evaluation only
+    per_se_t = per_n_t = seen = None
     # Loop
     for x, y, y_valid, extra in batches:
         # Forward
@@ -742,7 +754,7 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None):
         # Loss for the gradient step, batch-level means are fine for optimization
         loss, _, _ = masked_loss(y_hat, y, y_valid, angle_weight)
         # Train step
-        if optimizer is not None:
+        if train:
             # Clear
             optimizer.zero_grad()
             # Backward
@@ -751,7 +763,7 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             # Step
             optimizer.step()
-        # Bookkeeping without gradient
+        # Bookkeeping without gradient; stay on the device until the pass ends
         with torch.no_grad():
             # Validity as floats
             mv = y_valid[..., 0].float()
@@ -761,31 +773,60 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None):
             mag_se = ((y_hat[..., 0] - y[..., 0]) ** 2) * mv
             # Angle
             ang_se = ((y_hat[..., 1:3] - y[..., 1:3]) ** 2).sum(dim=-1) * av
-            # Pooled sums
-            sums["mag_se"] += float(mag_se.sum()); sums["mag_n"] += float(mv.sum())
-            # Angle
-            sums["ang_se"] += float(ang_se.sum()); sums["ang_n"] += float(av.sum())
-            # Per meter, magnitude only
-            if graph_mode:
-                # Every meter in every example
-                per_se = mag_se.sum(dim=(0, 2)).cpu().numpy()
-                # Counts
-                per_n = mv.sum(dim=(0, 2)).cpu().numpy()
-                # Meter ids are positions
-                ids = range(len(per_se))
+            # First batch starts the device accumulators as float64, matching
+            # the original per-batch float() promotion before adding
+            if mag_se_t is None:
+                mag_se_t = mag_se.sum().double()
+                mag_n_t = mv.sum().double()
+                ang_se_t = ang_se.sum().double()
+                ang_n_t = av.sum().double()
             else:
-                # One meter per example
-                per_se = mag_se.sum(dim=1).cpu().numpy()
-                # Counts
-                per_n = mv.sum(dim=1).cpu().numpy()
-                # Meter ids from the batch
-                ids = extra.cpu().numpy()
-            # Add
-            for mi, se, n in zip(ids, per_se, per_n):
-                # Error
-                sums["per_meter_se"][int(mi)] = sums["per_meter_se"].get(int(mi), 0.0) + float(se)
-                # Count
-                sums["per_meter_n"][int(mi)] = sums["per_meter_n"].get(int(mi), 0.0) + float(n)
+                mag_se_t += mag_se.sum().double()
+                mag_n_t += mv.sum().double()
+                ang_se_t += ang_se.sum().double()
+                ang_n_t += av.sum().double()
+            # Per meter only when reporting, not when training
+            if not train:
+                if graph_mode:
+                    # Every meter in every example
+                    se = mag_se.sum(dim=(0, 2)).double()
+                    n = mv.sum(dim=(0, 2)).double()
+                    if per_se_t is None:
+                        per_se_t, per_n_t = se, n
+                    else:
+                        per_se_t += se
+                        per_n_t += n
+                else:
+                    # One meter per example
+                    if per_se_t is None:
+                        n_meters = model.meter_embed.num_embeddings
+                        per_se_t = torch.zeros(n_meters, dtype=torch.float64, device=x.device)
+                        per_n_t = torch.zeros(n_meters, dtype=torch.float64, device=x.device)
+                        seen = torch.zeros(n_meters, dtype=torch.bool, device=x.device)
+                    ids = extra.long()
+                    per_se_t.index_add_(0, ids, mag_se.sum(dim=1).double())
+                    per_n_t.index_add_(0, ids, mv.sum(dim=1).double())
+                    seen[ids] = True
+    # Transfer pooled sums once per pass
+    if mag_se_t is not None:
+        sums["mag_se"] += float(mag_se_t)
+        sums["mag_n"] += float(mag_n_t)
+        sums["ang_se"] += float(ang_se_t)
+        sums["ang_n"] += float(ang_n_t)
+    # Per-meter dict, same keys as the original per-batch loop
+    if per_se_t is not None:
+        if graph_mode:
+            ids = range(per_se_t.shape[0])
+            se_np = per_se_t.cpu().numpy()
+            n_np = per_n_t.cpu().numpy()
+        else:
+            idx = seen.nonzero(as_tuple=False).view(-1)
+            ids = idx.cpu().numpy()
+            se_np = per_se_t[idx].cpu().numpy()
+            n_np = per_n_t[idx].cpu().numpy()
+        for mi, se, n in zip(ids, se_np, n_np):
+            sums["per_meter_se"][int(mi)] = sums["per_meter_se"].get(int(mi), 0.0) + float(se)
+            sums["per_meter_n"][int(mi)] = sums["per_meter_n"].get(int(mi), 0.0) + float(n)
 
 
 def make_dataset(piece, graph_mode, history, horizon, max_gap, min_meters=1):
