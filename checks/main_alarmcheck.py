@@ -19,11 +19,13 @@
 #                   residual per slot, by month (mean and minimum)
 #                4. alarm structure: how many meters fire together in alarm
 #                   slots, alarm episode durations, alarm-slot fraction
-#                5. alarms per day (busiest days) and by local hour of day
-#                   (America/Los_Angeles)
-#                6. a few alarm traces: the first alarm episodes printed
-#                   slot by slot with the firing meters and channels and
-#                   their residual-to-threshold ratios
+#                5. alarms per day (busiest days), by local hour of day
+#                   (America/Los_Angeles), and by minute of the hour, to
+#                   see whether alarms cluster on a schedule
+#                6. a few alarm traces: the first alarm episodes and the
+#                   longest one, printed slot by slot with the firing
+#                   meters and channels and their residual-to-threshold
+#                   ratios; the longest is capped at --max-trace-slots
 #
 #              Single file on purpose: it is a check, not pipeline code.
 #              Lives in checks/ and is run from the repo root. It reuses the
@@ -94,6 +96,8 @@ def parse_args():
     parser.add_argument("--traces", type=int, default=3, help="How many alarm episodes to print slot by slot")
     # Context slots around a trace
     parser.add_argument("--context", type=int, default=2, help="Slots before and after an episode to include in its trace")
+    # Cap on the longest-episode trace
+    parser.add_argument("--max-trace-slots", type=int, default=30, help="At most this many slots printed for the longest episode (its start)")
     # Worst channels to list
     parser.add_argument("--top", type=int, default=15, help="How many channels to list in the worst-first tables")
     # Local time zone for the hour-of-day table
@@ -339,17 +343,35 @@ def main():
     by_hour = pd.Series(1, index=starts).groupby(starts.tz_convert(args.tz).hour).sum() if len(eps) else pd.Series(dtype=int)
     # Print
     print("by local hour: " + ", ".join(f"{h:02d}h {int(by_hour.get(h, 0))}" for h in range(24)))
+    # By minute of the hour, in 5-minute bins, to see a schedule such as on-the-hour or half-hour operations
+    by_min = pd.Series(1, index=starts).groupby(starts.minute // 5 * 5).sum() if len(eps) else pd.Series(dtype=int)
+    # Print
+    print("by minute of hour (5-minute bins): " + ", ".join(f":{m:02d} {int(by_min.get(m, 0))}" for m in range(0, 60, 5)))
+    # Exactly on the hour or half hour, within one slot
+    on_mark = int(((starts.minute % 30 == 0) & (starts.second < 2 * ss.SLOT_SECONDS)).sum()) if len(eps) else 0
+    # Print, against the share expected by chance (two slots per half hour)
+    print(f"starting within 2 slots after :00 or :30: {on_mark} of {len(eps)} ({on_mark / max(len(eps), 1):.3f}; chance {2 * ss.SLOT_SECONDS / 1800:.3f})")
 
-    # 6. Traces
-    section(f"6. first {args.traces} alarm episodes, slot by slot")
-    # Loop over the first episodes
-    for s, e in eps[:args.traces]:
+    # 6. Traces: the first episodes, then the longest one
+    section(f"6. first {args.traces} alarm episodes and the longest one, slot by slot")
+    # Longest episode by duration
+    longest = max(eps, key=lambda se: se[1] - se[0]) if eps else None
+    # Episodes to trace, longest last and once
+    chosen = list(eps[:args.traces]) + ([longest] if longest is not None and longest not in eps[:args.traces] else [])
+    # Loop over them
+    for s, e in chosen:
         # Slot index range with context
         i0 = max(int(np.searchsorted(t, s)) - args.context, 0)
         # End
         i1 = min(int(np.searchsorted(t, e)) + args.context + 1, len(t))
+        # Cap the longest
+        capped = (s, e) == longest and (i1 - i0) > args.max_trace_slots
+        # Apply
+        if capped:
+            # Start only
+            i1 = i0 + args.max_trace_slots
         # Header
-        print(f"\nepisode {s} to {e} ({t[i0:i1].tz_convert(args.tz)[0].strftime('%Y-%m-%d %H:%M')} local)")
+        print(f"\nepisode {s} to {e} ({t[i0:i1].tz_convert(args.tz)[0].strftime('%Y-%m-%d %H:%M')} local)" + (f", longest, {(e - s).total_seconds() + ss.SLOT_SECONDS:.0f} s, first {args.max_trace_slots} slots" if capped else (", longest" if (s, e) == longest else "")))
         # Loop over slots
         for i in range(i0, i1):
             # Firing channels in this slot with their ratios
