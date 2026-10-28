@@ -42,7 +42,9 @@
 #      Only event episodes whose window lies inside a scored test block
 #      are in scope.
 #   6. Count. Unmatched alarm episodes are false alarms. The false-alarm
-#      rate is per monitored day, where monitored slots are the scored
+#      rate is per monitored day, pooled over every test table and also
+#      per split (the event blocks and the quiet block separately, since
+#      the quiet block is the clean false-alarm measure). Monitored slots are the scored
 #      slots with at least min_meters meters holding a valid residual on a
 #      channel that has a threshold (a channel without one cannot fire, so
 #      it does not count as watched). Slots inside the window of an event
@@ -583,6 +585,18 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
     results, unmatched = match(alarms, scoped, before, after)
     # Counts
     n_ep, n_det, n_false = len(results), sum(r["detected"] for r in results), len(unmatched)
+    # False alarms and monitored time per split prefix, so the quiet block's rate is reported on its own
+    per_split = {}
+    # Loop over prefixes
+    for p in settings["test_prefixes"]:
+        # Blocks of this split, with their spans
+        spans = [(b, blocks[i]) for i, b in enumerate(per_block) if b["label"].startswith(p)]
+        # Monitored seconds of this split
+        sec = sum(b["monitored_slots"] for b, _ in spans) * SLOT_SECONDS
+        # Unmatched alarms whose start lies in one of this split's blocks
+        n_unm = sum(1 for a0, _ in unmatched if any(b0 <= a0 <= b1 for _, (b0, b1) in spans))
+        # Record
+        per_split[p] = {"false_alarm_episodes": n_unm, "monitored_days": sec / 86400.0, "false_alarms_per_day": (n_unm / (sec / 86400.0)) if sec > 0 else None}
     # Monitored days
     days = monitored_s / 86400.0
     # Rates
@@ -616,8 +630,10 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         "episodes_partial_excluded": [{"episode": int(e["episode"]), "first": e["first"].isoformat()} for _, e in partial.iterrows()],
         # Per-episode detail
         "episode_results": [{"episode": r["episode"], "first": r["first"].isoformat(), "detected": r["detected"], "delay_s": r["delay_s"], "alarm_start": r["alarm_start"].isoformat() if r["alarm_start"] is not None else None} for r in results],
-        # False alarms
+        # False alarms, pooled over every test table
         "false_alarm_episodes": n_false, "monitored_days": days, "false_alarms_per_day": (n_false / days) if days > 0 else None,
+        # The same per split prefix
+        "per_split": per_split,
         # Unmatched alarm list, for inspection
         "false_alarm_list": [(s.isoformat(), e.isoformat()) for s, e in unmatched],
         # Scores

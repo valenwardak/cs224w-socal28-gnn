@@ -171,6 +171,12 @@ def main():
         print(line(f"model / {mode}", model))
         # Print
         print(line(f"persistence / {mode}", pers))
+        # False alarms per day on each split, model and persistence
+        for name, r in (("model", model), ("persistence", pers)):
+            # Pieces
+            parts = [f"{p.rstrip('_')} {v['false_alarms_per_day']:.2f}/day over {v['monitored_days']:.1f} days" for p, v in r["per_split"].items() if v["false_alarms_per_day"] is not None]
+            # Print
+            print(f"  {name} false alarms by split: " + "; ".join(parts))
         # Channels without thresholds, once per mode
         miss = model["calibration"]["channels_without_threshold"]
         # Report if any
