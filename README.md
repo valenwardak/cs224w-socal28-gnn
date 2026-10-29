@@ -24,7 +24,8 @@ The data is not stored in this repo. Each team member downloads it with the scri
 4. Physics baseline: `main_physics.py` runs a least-squares state estimator with no learning over any window or split and writes a residual per ten-second slot to `data/processed/physics/`.
 5. Feature tables: `main_features.py` exports the processed tables as compact monthly files in `data/features/` for training on Colab.
 6. Graph: `main_graph.py` writes the grid's electrical graph to `graph.json`, which every GNN loads.
-7. Learned models: GRU baseline and the GNNs, trained on Colab from `data/features/`, `graph.json`, and `splits.json` (next stage).
+7. Learned models: `main_gru.py` (no graph) and `main_gcn.py` (graph) train on Colab from `data/features/`, `graph.json`, and `splits.json`, and write a residual per slot, meter, and channel.
+8. Scoring: `main_score.py` turns any run's residuals into event-detection scores with one fixed procedure, for the model and for the persistence baseline alike.
 
 ## Step 1: get access (once per person)
 
@@ -208,6 +209,59 @@ What is in it: 43 nodes, 33 edges (15 lines, 18 transformers), 22 meters all pla
 
 The GRU baseline does not use the graph. Each meter forecasts from its own history, which is what makes it the no-graph comparison.
 
+## Step 9: learned models
+
+Two helper modules and two thin main scripts. `socal_modeldata.py` is the data side: it reads the monthly feature files, checks them against `manifest.json`, cuts them to the blocks in `splits.json`, computes the per-channel scale from the train blocks (95th percentile of valid magnitudes, with a floor from the clamp ratings in `graph.json`, and the bus nominal voltage or a tenth of the clamp rating for a channel with no train readings), builds the model input (scaled magnitude, cos and sin of the angle, two validity flags per channel), and makes training windows. `socal_models.py` is the model side: the models, the persistence baseline, the loss, the training loop with checkpoints, and the scoring output.
+
+Models:
+
+- Persistence: the forecast is the last valid reading. No parameters. Every learned model is compared with it.
+- GRU (`main_gru.py`): one GRU shared by all meters with a learned meter embedding. Each meter forecasts its next reading from its own ten-minute history. No graph.
+- GCN (`main_gcn.py`): the same GRU encodes every meter's history, the states are placed on the nodes of `graph.json` (meters sharing a node are averaged, nodes without a meter get one learned vector), GCN layers pass messages along the lines and transformers with `admittance_abs` as the edge weight, and a head reads each meter's own state together with its node's state. `--edges true|random|none` and `--edge-weights admittance|binary` are the topology ablation. GAT and GraphSAGE use the same class with the kind changed.
+
+Every learned model forecasts the change from the last valid reading (`--predict-delta`, default on): the head's output is added to the persistence forecast, and the head starts at zero weights so the first forecast is persistence itself. The loss is squared error on the scaled magnitude plus `--angle-weight` times squared error on (cos, sin), each over its own valid targets. A window is dropped when its history holds a run of `--max-gap` absent slots (default 12, two minutes). Validation block 0 (January 2024) is for early stopping and design choices; block 1 (February 2025) is reserved for calibration and never chooses a model.
+
+```bash
+python main_gru.py --run-name gru_full_aw001 --angle-weight 0.01 --score-splits validation
+python main_gcn.py --run-name gcn_full_aw001 --angle-weight 0.01 --score-splits validation
+python main_gcn.py --run-name gcn_full_none --angle-weight 0.01 --edges none --score-splits validation
+python main_gcn.py --run-name gcn_full_aw001 --angle-weight 0.01 --score-only --score-splits test_events test_normal
+```
+
+Smoke test on one month: add `--train-months 2024-10 --epochs 2 --hidden 16`. Options: `--help`. Needs `torch`, and `torch_geometric` for the GCN.
+
+Output under `data/processed/models/<run_name>/`:
+
+| File | Content |
+|------|---------|
+| `scale.json` | The per-channel scale, the train counts behind it, and which channels used the nominal fallback. |
+| `checkpoint.pt` | Last epoch: weights, optimizer, options, progress, random states. A rerun with the same options resumes from it; with different options it refuses. |
+| `checkpoint_best.pt` | Weights of the best validation epoch. |
+| `train_log.txt` | One line per epoch and everything printed. |
+| `<split>_<label>.parquet` | Residuals per slot: columns `<meter>\|<channel>\|<name>` for `mag_res` (scaled units), `ang_res` (degrees, 0 to 180), `mag_valid`, `ang_valid`, and the same four with the prefix `pers_` for persistence. Index `t_utc`. Slots without a usable window are absent, never zero. |
+| `<split>_<label>.json` | Summary: slots, median and 99th percentile residuals, persistence median, options. |
+
+Training runs on Google Colab with a GPU: download the shared features folder, clone the repo, `pip install torch_geometric`, and run the commands above with `--features-dir /content/features --out-dir <a Drive folder>` so checkpoints survive a disconnect. The GCN batches time slots (every meter at once) and the GRU batches meters, so the same `--batch-size` means different work; the defaults (64 and 512) are set accordingly.
+
+## Step 10: scoring
+
+```bash
+python main_score.py --run-dir data/processed/models/gcn_full_aw001
+```
+
+One fixed procedure for every run, model and persistence alike, in `socal_score.py`:
+
+1. Calibrate on validation block 1: per meter and channel, the conformal threshold at level `--alpha` (default 1e-4) is the rank `k = ceil((n+1)(1-alpha))` among the block's valid residuals, magnitude and angle separately. A channel with no residuals, or too few for the level, gets no threshold and never fires; those channels are listed.
+2. Detect on the test blocks: a channel fires when its residual exceeds its threshold (`--modes mag`, `ang`, or `both`, where `both` fires on either). A slot's score is the number of distinct meters with a firing channel, and the slot is an alarm when at least `--min-meters` (default 2) fire and the slot is monitored (at least that many meters with a thresholded valid residual).
+3. Merge alarm slots within `--merge-slots` (default 6, one minute) into alarm episodes.
+4. Match against the logged episodes in `events.csv`: an episode is detected when an alarm episode starts between `--before-minutes` (1) before its first scored change and `--after-minutes` (10) after its last; matching is one to one; delay is alarm start minus first change. Only episodes whose window lies inside a scored block count; episodes only partly covered are excluded from alarms and monitored time and listed.
+5. Count: unmatched alarm episodes are false alarms, per monitored day, pooled and per split (the quiet block is the clean measure). Precision, recall, F1 over episodes, delay among detected, a bootstrap interval for recall (precision and F1 intervals are conditional on the false-alarm count and labeled so), alarm-slot fraction and merged-span summaries per split.
+6. Persistence is calibrated and scored from its own columns by the same steps, on the slots where both it and the model are valid (`--common`, default on).
+
+Output: `score.json` in the run folder with every setting, threshold, coverage, per-block count, per-episode result, and the unmatched alarms. These are residual-only detections: a silent meter produces no residual and no alarm here.
+
+Two exploratory options exist alongside the primary procedure and write to separate files. `--statistic grid` replaces the per-channel thresholds with one threshold on a grid-level number per slot: each channel's residual divided by a reference scale from validation block 0 (its 99th percentile there, with a floor), the maximum over a meter's channels, then the second-largest meter score among available meters, calibrated on block 1. It calibrates the quantity that raises the alarm rather than each channel. `--restrict-common` limits both statistics to the channels that have both a threshold and a reference, so they watch the same sensors and the comparison isolates aggregation from coverage. Both were motivated by test findings and are labeled exploratory in their output.
+
 ## Data facts the code relies on
 
 Established by the scripts in `checks/`, which can be rerun with `--data-dir ../data`, and by the coverage report:
@@ -223,6 +277,9 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 - Site-wide outages: September 28 to October 27, 2023; July 18 to September 4, 2024; October 30 to November 6 and December 12 to 22, 2024. August 2025 has meter-specific gaps on egauge_4, 10, 11, 12, 14, 16.
 - Captures land about 36 milliseconds after each ten-second boundary on a typical meter (median `toff`), with rare captures up to a full slot late.
 - Voltage channels always agree on frequency within a meter. Current channels carrying a few amps (egauge_6 at 4.5 A on 55 to 71 percent of slots, egauge_18 and egauge_20 on 2 to 10 percent, egauge_16 rarely) report a frequency 1 to 4 Hz off, a wrong FFT bin, and their angles on those slots are not usable (`main_freqcheck.py`, September 2024).
+- Float16 magnitudes in the feature files have a spacing of 0.25 V near 277 V, so a rounding error of up to about 0.125 V there; voltage readings are often identical from one slot to the next, and persistence's median voltage residual is exactly zero.
+- The angle from one slot to the next rotates by tens of degrees, since the grid frequency is never exactly 60 Hz and ten seconds of a small offset is a large angle. Persistence's median angle residual is about 47 degrees; the learned models' is about 11.
+- From July 29 to about August 10, 2025, egauge_3's current ran at 115 to 135 A against a usual 45 A and egauge_20's at 42 A against a usual 4 to 7 A, both at once, with readings present, angles accepted, and frequency normal (`main_channelcheck.py`). The cause is not logged. The learned models' residuals on those meters are twenty times persistence's for the whole period (`main_forecastcheck.py`), since the models forecast a return toward the usual level and persistence does not.
 
 ## Files
 
@@ -244,9 +301,15 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `main_graph.py` | Writes `graph.json` |
 | `graph.json` | The grid's electrical graph: nodes, edges with admittance, meter placement |
 | `graph.png` | Drawing of `graph.json` from the check script |
+| `socal_modeldata.py` | Model data side: feature loading, scale, inputs, windows |
+| `socal_models.py` | Models, persistence, loss, training loop, residual output |
+| `main_gru.py` | Train and score the no-graph GRU baseline |
+| `main_gcn.py` | Train and score the GCN, with the topology ablation options |
+| `socal_score.py` | Event-detection scoring method |
+| `main_score.py` | Score one run: model and persistence, primary and exploratory statistics |
 | `merge_years.sh` | Merges two per-year download folders into one |
 | `meters.txt` | The 22 meters, one per line |
 | `requirements.txt` | Python packages |
 | `topology/` | Caltech's network description, breaker status files, change logs |
-| `checks/` | One-off scripts that established the data facts above, plus `main_physics_events.py`, `main_freqcheck.py`, and `main_graphcheck.py` |
+| `checks/` | One-off scripts, each a single file run from the repo root: the data-fact checks above; `main_physics_events.py` (physics residual against the events); `main_freqcheck.py` (channel frequency against the voltage); `main_graphcheck.py` (graph consistency and drawing); `main_residualcheck.py` (model residual distributions against persistence per channel); `main_alarmcheck.py` (where a run's alarms come from on a block); `main_channelcheck.py` (one meter day by day: current level, data quality, residuals); `main_forecastcheck.py` (what the model forecast, in physical units, over chosen windows); `main_scoreview.py` (the primary and grid score files side by side) |
 | `notes/` | Data notes: gaps, outages, known issues. Read before analysis. |
