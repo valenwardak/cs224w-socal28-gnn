@@ -94,6 +94,8 @@ def parse_args():
     parser.add_argument("--ref-floor-mag", type=float, default=1e-3, help="Floor for magnitude references, scaled units")
     # Angle floor
     parser.add_argument("--ref-floor-ang", type=float, default=1.0, help="Floor for angle references, degrees")
+    # Common-channel restriction
+    parser.add_argument("--restrict-common", action="store_true", help="Sensitivity analysis: limit both statistics to channels with both a threshold and a grid reference (needs the design block)")
     # Output name
     parser.add_argument("--out", default="score.json", help="JSON file name written into the run folder")
     # Parse
@@ -114,12 +116,13 @@ def parse_args():
     if args.merge_slots < 0 or args.before_minutes < 0 or args.after_minutes < 0:
         # Reject
         parser.error("--merge-slots, --before-minutes, and --after-minutes must not be negative")
-    # Grid statistic needs two meters, positive floors, a proper percentile, and a design block different from the calibration block
-    if args.statistic == "grid":
+    # The grid statistic and the restriction both compute references, so both need the reference settings checked,
+    # two meters (the second-largest meter score, and the same monitoring rule for both statistics), and separate blocks
+    if args.statistic == "grid" or args.restrict_common:
         # Two meters
         if args.min_meters < 2:
             # Reject
-            parser.error("--statistic grid needs --min-meters of at least 2 (the second-largest meter score)")
+            parser.error("--statistic grid and --restrict-common need --min-meters of at least 2")
         # Floors, positive and finite
         if not (0 < args.ref_floor_mag < float("inf")) or not (0 < args.ref_floor_ang < float("inf")):
             # Reject
@@ -188,11 +191,13 @@ def main():
         "n_boot": args.n_boot, "seed": args.seed,
         # Statistic and the grid settings
         "statistic": args.statistic, "design_label": args.design_label, "ref_percentile": args.ref_percentile, "ref_min_count": args.ref_min_count, "ref_floor_mag": args.ref_floor_mag, "ref_floor_ang": args.ref_floor_ang,
+        # Restriction
+        "restrict_common": args.restrict_common,
     }
     # Results per mode
     out = {"run_dir": os.path.abspath(args.run_dir), "settings": settings, "modes": {}}
     # Statistic line
-    print(f"statistic: {args.statistic}" + (" (exploratory; references from the design block, one threshold from the calibration block)" if args.statistic == "grid" else " (primary)"))
+    print(f"statistic: {args.statistic}" + (" (exploratory; references from the design block, one threshold from the calibration block)" if args.statistic == "grid" else " (primary)") + ("; restricted to channels with both a threshold and a reference (sensitivity analysis)" if args.restrict_common else ""))
     # Header
     print(f"{'source / mode':<22} {'det':>7} {'FA/day':>8} {'prec':>7} {'recall':>7}{'':<14} {'F1':>7} {'delay s':>8}")
     # Loop over modes
@@ -233,6 +238,10 @@ def main():
                 g = r["grid"]
                 # Print
                 print(f"  {name} grid: threshold {g['threshold']:.3f} on {g['n_calibration']} calibration slots, calibration coverage {g['calibration_coverage']:.5f}; {len(g['channels_without_reference']['mag'])} mag / {len(g['channels_without_reference']['ang'])} ang channels without reference, {len(g['channels_at_floor']['mag'])} mag / {len(g['channels_at_floor']['ang'])} ang at the floor; alarm-slot rate by available meters: " + ", ".join(f"{k}: {v['rate']:.2e}" for k, v in g['alarm_slots_by_available_meters'].items() if v['rate'] is not None))
+        # Restriction, once per mode
+        if model["restriction"] is not None:
+            # Print
+            print("  restriction: " + "; ".join(f"{k}: {v['channels_kept']} channels kept, dropped {v['channels_dropped']}" for k, v in model["restriction"].items() if k in ("mag", "ang")))
         # Channels without thresholds, once per mode
         miss = model["calibration"]["channels_without_threshold"]
         # Report if any

@@ -93,6 +93,18 @@
 #   is largely fixed by the fitted rank; the alarm-slot fraction and
 #   episode rates on the test blocks are the generalization checks.
 #
+# Common-channel restriction (restrict_common=True, a sensitivity analysis).
+#   The two statistics watch different channel sets by accident of which
+#   meters are present in the design block and in the calibration block.
+#   With the restriction, both statistics are limited, per residual kind,
+#   to the channels that have both a channel threshold and a grid
+#   reference; the grid threshold is then recalibrated on block 1 from the
+#   restricted statistic, and the per-channel thresholds keep their own
+#   calibration (dropping other channels does not change them). With the
+#   same channel sets and min_meters, both statistics monitor the same
+#   slots, so the comparison isolates aggregation and calibration from
+#   sensor coverage. The channels dropped by the restriction are listed.
+#
 # These are residual-only detections: a meter that goes silent produces no
 # residual and no alarm here. A silence detector from the feature mask is a
 # separate component.
@@ -658,14 +670,14 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         common_mask(arrays, residual_arrays(cal, meters, channels, other_prefix))
     # Thresholds, per channel
     thr = calibrate(arrays, settings["alpha"])
-    # Channels without a threshold, by kind
-    missing = {kind: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(~np.isfinite(thr[f"thr_{kind}"])))] for kind in ("mag", "ang")}
-    # Grid statistic: references from the design block, one threshold from the calibration block
-    grid = None
-    # Asked for
-    if settings.get("statistic", "channel") == "grid":
-        # Meters needed
-        need = max(2, settings["min_meters"])
+    # Grid statistic asked for, or the common-channel restriction, which needs the references too
+    use_grid = settings.get("statistic", "channel") == "grid"
+    # Restriction flag
+    restrict = bool(settings.get("restrict_common", False))
+    # References from the design block when either needs them
+    refs = None
+    # Build
+    if use_grid or restrict:
         # Design table
         des = load_table(run_dir, settings["design_label"])
         # Design residuals
@@ -676,6 +688,34 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
             common_mask(darr, residual_arrays(des, meters, channels, other_prefix))
         # References
         refs = references(darr, settings["ref_percentile"], settings["ref_min_count"], settings["ref_floor_mag"], settings["ref_floor_ang"])
+    # Restriction: keep only channels with both a threshold and a reference, per kind, for both statistics
+    restriction = None
+    # Apply
+    if restrict:
+        # Record
+        restriction = {}
+        # Per kind
+        for kind in ("mag", "ang"):
+            # Channels with both
+            keep = np.isfinite(thr[f"thr_{kind}"]) & np.isfinite(refs[f"ref_{kind}"])
+            # Dropped by the restriction: had one but not the other
+            dropped = (np.isfinite(thr[f"thr_{kind}"]) | np.isfinite(refs[f"ref_{kind}"])) & ~keep
+            # Apply to the thresholds
+            thr[f"thr_{kind}"] = np.where(keep, thr[f"thr_{kind}"], np.nan).astype(np.float32)
+            # Apply to the references
+            refs[f"ref_{kind}"] = np.where(keep, refs[f"ref_{kind}"], np.nan).astype(np.float32)
+            # A dropped channel is no longer "at the floor, still included"
+            refs[f"floored_{kind}"] = refs[f"floored_{kind}"] & keep
+            # Record
+            restriction[kind] = {"channels_kept": int(keep.sum()), "channels_dropped": [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(dropped))]}
+    # Channels without a threshold, by kind, after any restriction
+    missing = {kind: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(~np.isfinite(thr[f"thr_{kind}"])))] for kind in ("mag", "ang")}
+    # Grid statistic: one threshold from the calibration block
+    grid = None
+    # Asked for
+    if use_grid:
+        # Meters needed
+        need = max(2, settings["min_meters"])
         # Grid scores on the calibration block
         gscore, gavail = grid_scores(arrays, refs, settings["mode"], need)
         # One threshold
@@ -796,6 +836,8 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         "source": "persistence" if prefix == "pers_" else "model",
         # Which statistic raised the alarms
         "statistic": settings.get("statistic", "channel"),
+        # Common-channel restriction, when applied
+        "restriction": None if restriction is None else dict(restriction, note="sensitivity analysis: both statistics limited to channels with both a threshold and a reference"),
         # Grid statistic details, exploratory
         "grid": None if grid is None else {
             # Label
