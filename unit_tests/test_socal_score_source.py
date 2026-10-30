@@ -109,9 +109,22 @@ def score_source_all_in_memory(run_dir, prefix, settings, other_prefix=None):
         eps = ss.alarm_episodes(arr["t"], alarm, settings["merge_slots"])
         alarms.extend(eps)
         monitored_s += float(mon.sum()) * ss.SLOT_SECONDS
-        per_block.append({"label": label, "slots": int(len(arr["t"])), "monitored_slots": int(mon.sum()), "alarm_slots": int(alarm.sum()), "alarm_episodes": len(eps)})
+        spans = [float((e - s0).total_seconds()) + ss.SLOT_SECONDS for s0, e in eps]
+        per_block.append({"label": label, "slots": int(len(arr["t"])), "monitored_slots": int(mon.sum()), "alarm_slots": int(alarm.sum()),
+                          "alarm_slot_fraction": (float(alarm.sum()) / float(mon.sum())) if mon.sum() else None,
+                          "alarm_episodes": len(eps), "merged_span_median_s": float(np.median(spans)) if spans else None, "merged_span_max_s": float(max(spans)) if spans else None})
     results, unmatched = ss.match(alarms, scoped, before, after)
     n_ep, n_det, n_false = len(results), sum(r["detected"] for r in results), len(unmatched)
+    per_split = {}
+    for p in settings["test_prefixes"]:
+        spans = [(b, blocks[i]) for i, b in enumerate(per_block) if b["label"].startswith(p)]
+        sec = sum(b["monitored_slots"] for b, _ in spans) * ss.SLOT_SECONDS
+        a_slots = sum(b["alarm_slots"] for b, _ in spans)
+        n_unm = sum(1 for a0, _ in unmatched if any(b0 <= a0 <= b1 for _, (b0, b1) in spans))
+        split_spans = [float((e - a0).total_seconds()) + ss.SLOT_SECONDS for a0, e in alarms if any(b0 <= a0 <= b1 for _, (b0, b1) in spans)]
+        per_split[p] = {"false_alarm_episodes": n_unm, "monitored_days": sec / 86400.0, "false_alarms_per_day": (n_unm / (sec / 86400.0)) if sec > 0 else None,
+                        "alarm_slot_fraction": (a_slots / (sec / ss.SLOT_SECONDS)) if sec > 0 else None,
+                        "alarm_episodes": len(split_spans), "merged_span_median_s": float(np.median(split_spans)) if split_spans else None, "merged_span_max_s": float(max(split_spans)) if split_spans else None}
     days = monitored_s / 86400.0
     recall = n_det / n_ep if n_ep else None
     precision = n_det / (n_det + n_false) if (n_det + n_false) else None
@@ -120,6 +133,9 @@ def score_source_all_in_memory(run_dir, prefix, settings, other_prefix=None):
     boot = ss.bootstrap([r["detected"] for r in results], n_false, settings["n_boot"], settings["seed"])
     return {
         "source": "persistence" if prefix == "pers_" else "model",
+        "statistic": settings.get("statistic", "channel"),
+        "restriction": None,
+        "grid": None,
         "calibration": {"label": settings["calib_label"], "alpha": settings["alpha"],
                         "coverage_mag_mean": float(np.nanmean(thr["cov_mag"])) if np.isfinite(thr["cov_mag"]).any() else None,
                         "coverage_ang_mean": float(np.nanmean(thr["cov_ang"])) if np.isfinite(thr["cov_ang"]).any() else None,
@@ -132,6 +148,7 @@ def score_source_all_in_memory(run_dir, prefix, settings, other_prefix=None):
         "episodes_partial_excluded": [{"episode": int(e["episode"]), "first": e["first"].isoformat()} for _, e in partial.iterrows()],
         "episode_results": [{"episode": r["episode"], "first": r["first"].isoformat(), "detected": r["detected"], "delay_s": r["delay_s"], "alarm_start": r["alarm_start"].isoformat() if r["alarm_start"] is not None else None} for r in results],
         "false_alarm_episodes": n_false, "monitored_days": days, "false_alarms_per_day": (n_false / days) if days > 0 else None,
+        "per_split": per_split,
         "false_alarm_list": [(s.isoformat(), e.isoformat()) for s, e in unmatched],
         "recall": recall, "precision": precision, "f1": f1,
         "delay_median_s": float(np.median(delays)) if delays else None, "delay_max_s": float(np.max(delays)) if delays else None,

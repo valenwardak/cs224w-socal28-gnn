@@ -42,7 +42,9 @@
 #      Only event episodes whose window lies inside a scored test block
 #      are in scope.
 #   6. Count. Unmatched alarm episodes are false alarms. The false-alarm
-#      rate is per monitored day, where monitored slots are the scored
+#      rate is per monitored day, pooled over every test table and also
+#      per split (the event blocks and the quiet block separately, since
+#      the quiet block is the clean false-alarm measure). Monitored slots are the scored
 #      slots with at least min_meters meters holding a valid residual on a
 #      channel that has a threshold (a channel without one cannot fire, so
 #      it does not count as watched). Slots inside the window of an event
@@ -57,6 +59,51 @@
 #      by the same steps. With common=True, every residual is first masked
 #      to the slots where both the model and persistence are valid for that
 #      channel, in calibration and in test, so the two see the same slots.
+#
+# Grid statistic (statistic="grid", exploratory; "channel" above is the
+# default and the primary result). Per-channel thresholds calibrate each
+# channel, not the alarm: with 132 channels at alpha 1e-4, chance pairs of
+# exceeding meters appear many times a day. The grid statistic calibrates
+# the one number that raises the alarm:
+#   a. Reference scales. On the design block (validation block 0, January
+#      2024, never used for the final threshold), each channel's reference
+#      is the ref_percentile (99th) of its valid residuals, raised to a
+#      positive floor (ref_floor_mag in scaled units, ref_floor_ang in
+#      degrees) so a quantized channel whose residuals are mostly zero
+#      cannot divide by zero. A channel with fewer than ref_min_count
+#      residuals on the design block has no reference and is left out.
+#      Channels at the floor and channels left out are reported.
+#   b. Channel score = residual / reference, magnitude and angle each
+#      against their own reference; in mode "both" a channel's score is the
+#      larger of the two.
+#   c. Meter score = the maximum over the meter's available channels, so
+#      the three phases count once. A meter is available in a slot when at
+#      least one channel of the mode has a valid residual and a reference.
+#   d. Grid score = the second-largest meter score among available meters.
+#      Two meters must be elevated for it to be high. With fixed references
+#      removing meters cannot raise it for that slot; different meter sets
+#      between calibration and test can still shift its distribution, so
+#      exceedance rates by available-meter count are reported.
+#   e. Threshold. One conformal threshold on the grid score from the
+#      calibration block (block 1) at alpha, the same rank rule as above. A
+#      slot is monitored when at least max(2, min_meters) meters are
+#      available, and is an alarm slot when its grid score exceeds the
+#      threshold. Episodes, matching, and reporting are unchanged.
+#   The coverage reported on block 1 is empirical calibration coverage and
+#   is largely fixed by the fitted rank; the alarm-slot fraction and
+#   episode rates on the test blocks are the generalization checks.
+#
+# Common-channel restriction (restrict_common=True, a sensitivity analysis).
+#   The two statistics watch different channel sets by accident of which
+#   meters are present in the design block and in the calibration block.
+#   With the restriction, both statistics are limited, per residual kind,
+#   to the channels that have both a channel threshold and a grid
+#   reference; the grid threshold is then recalibrated on block 1 from the
+#   restricted statistic, and the per-channel thresholds keep their own
+#   calibration (dropping other channels does not change them). With the
+#   same channel sets and min_meters, both statistics monitor the same
+#   slots, so the comparison isolates aggregation and calibration from
+#   sensor coverage. The channels dropped by the restriction are listed.
 #
 # These are residual-only detections: a meter that goes silent produces no
 # residual and no alarm here. A silence detector from the feature mask is a
@@ -77,6 +124,11 @@
 #   Calibration
 #     conformal_threshold(values, alpha)  one threshold from a 1-D array of residuals, or NaN
 #     calibrate(arrays, alpha)            (M, C) thresholds and coverage for mag and ang
+#   Grid statistic
+#     references(arrays, percentile, min_count, floor_mag, floor_ang)
+#                                         (M, C) reference scales for mag and ang from the design block
+#     grid_scores(arrays, refs, mode, need)
+#                                         (T,) second-largest meter score and (T,) available-meter count
 #   Detection
 #     exceedances(arrays, thresholds, mode)
 #                                         (T, M, C) bool, a channel fires or not
@@ -104,6 +156,8 @@
 import math
 # Standard library: drop a block's arrays before the next one loads
 import gc
+# Standard library: to silence numpy's all-NaN warnings where NaN means "no score"
+import warnings
 # Standard library: paths
 import os
 # Standard library: RSS units on Linux vs macOS
@@ -435,6 +489,89 @@ def calibrate(arrays, alpha):
 
 
 # -----------------------------------------------------------------------------
+# Grid statistic
+# -----------------------------------------------------------------------------
+
+def references(arrays, percentile, min_count, floor_mag, floor_ang):
+    """
+    Reference scale per meter and channel for magnitude and angle, from
+    the design block's valid residuals: the given percentile, raised to
+    the floor. NaN where fewer than min_count residuals exist. Returns
+    dict ref_mag, ref_ang (M, C), n_mag, n_ang counts, and floored_mag,
+    floored_ang bool (M, C) marking channels whose percentile sat below
+    the floor.
+    """
+    # Sizes
+    _, M, C = arrays["mag"].shape
+    # Output
+    out = {}
+    # Loop over kinds
+    for kind, floor in (("mag", floor_mag), ("ang", floor_ang)):
+        # Reference
+        ref = np.full((M, C), np.nan, dtype=np.float32)
+        # Floored flags
+        floored = np.zeros((M, C), dtype=bool)
+        # Counts
+        n = np.zeros((M, C), dtype=np.int64)
+        # Loop over channels
+        for mi in range(M):
+            # Loop
+            for ci in range(C):
+                # Valid residuals
+                v = arrays[kind][:, mi, ci][arrays[f"{kind}_valid"][:, mi, ci]]
+                # Count
+                n[mi, ci] = len(v)
+                # Enough
+                if len(v) >= min_count:
+                    # Percentile
+                    q = float(np.percentile(v, percentile))
+                    # Below the floor
+                    floored[mi, ci] = q < floor
+                    # Raised to the floor
+                    ref[mi, ci] = max(q, floor)
+        # Keep
+        out[f"ref_{kind}"], out[f"n_{kind}"], out[f"floored_{kind}"] = ref, n, floored
+    # Return
+    return out
+
+
+def grid_scores(arrays, refs, mode, need):
+    """
+    Grid score per slot: the second-largest meter score among available
+    meters, where a meter score is the maximum over its channels of
+    residual / reference (mode "mag", "ang", or "both" = the larger of the
+    two per channel). Returns (score (T,), available (T,)): score is NaN
+    where fewer than `need` meters are available.
+    """
+    # Channel scores per kind, NaN where no valid residual or no reference
+    parts = []
+    # Kinds in the mode
+    for kind in (["mag", "ang"] if mode == "both" else [mode]):
+        # Residuals where valid, NaN elsewhere
+        r = np.where(arrays[f"{kind}_valid"], arrays[kind], np.nan)
+        # Divided by the reference, NaN where none
+        parts.append(r / refs[f"ref_{kind}"][None, :, :])
+    # All-NaN slices mean "no score" here, so numpy's warning about them is noise
+    with warnings.catch_warnings():
+        # Silence
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        # Larger of the kinds per channel, NaN only where every kind is NaN
+        chan = np.nanmax(np.stack(parts), axis=0) if len(parts) > 1 else parts[0]
+        # Meter score: maximum over channels, NaN where no channel has a score
+        meter = np.nanmax(chan, axis=2)
+    # Available meters per slot
+    available = np.isfinite(meter).sum(axis=1)
+    # Second largest among available: sort with NaN last, take position 1 from the end of the finite part
+    ordered = np.sort(np.where(np.isfinite(meter), meter, -np.inf), axis=1)
+    # Second largest
+    second = ordered[:, -2]
+    # NaN where too few meters
+    score = np.where(available >= max(2, need), second, np.nan)
+    # Return
+    return score.astype(np.float32), available
+
+
+# -----------------------------------------------------------------------------
 # Detection
 # -----------------------------------------------------------------------------
 
@@ -694,7 +831,8 @@ def score_source(run_dir, prefix, settings, other_prefix=None, log=None):
     masked to the slots where both sources are valid. settings is a dict
     with alpha, mode, min_meters, merge_slots, before_minutes,
     after_minutes, calib_label, test_prefixes, events, n_boot, seed,
-    common. Returns a dict of results.
+    common, and optionally statistic, design_label, the grid reference
+    settings, and restrict_common. Returns a dict of results.
 
     Test blocks are loaded one at a time. Block spans are read from t_utc
     only, so episodes_in_scope does not need residual arrays of every
@@ -714,14 +852,70 @@ def score_source(run_dir, prefix, settings, other_prefix=None, log=None):
     log(f"calibrating {settings['calib_label']} prefix={prefix!r} common={bool(other_prefix is not None and settings['common'])} rss {rss_mb():.0f} MB")
     # Calibration residuals, one prefix (and the other only if common)
     arrays = load_source_arrays(run_dir, settings["calib_label"], meters, channels, prefix, other_prefix, settings["common"])
-    # Thresholds
+    # Thresholds, per channel
     thr = calibrate(arrays, settings["alpha"])
-    # Drop calibration arrays
+    # Grid statistic asked for, or the common-channel restriction, which needs the references too
+    use_grid = settings.get("statistic", "channel") == "grid"
+    # Restriction flag
+    restrict = bool(settings.get("restrict_common", False))
+    # References from the design block when either needs them
+    refs = None
+    # Build
+    if use_grid or restrict:
+        # Design residuals, one prefix, then dropped so they do not sit beside calibration
+        log(f"design references {settings['design_label']} prefix={prefix!r} rss {rss_mb():.0f} MB")
+        # Load
+        darr = load_source_arrays(run_dir, settings["design_label"], meters, channels, prefix, other_prefix, settings["common"])
+        # References
+        refs = references(darr, settings["ref_percentile"], settings["ref_min_count"], settings["ref_floor_mag"], settings["ref_floor_ang"])
+        # Drop the design arrays
+        del darr
+        # Collect
+        gc.collect()
+    # Restriction: keep only channels with both a threshold and a reference, per kind, for both statistics
+    restriction = None
+    # Apply
+    if restrict:
+        # Record
+        restriction = {}
+        # Per kind
+        for kind in ("mag", "ang"):
+            # Channels with both
+            keep = np.isfinite(thr[f"thr_{kind}"]) & np.isfinite(refs[f"ref_{kind}"])
+            # Dropped by the restriction: had one but not the other
+            dropped = (np.isfinite(thr[f"thr_{kind}"]) | np.isfinite(refs[f"ref_{kind}"])) & ~keep
+            # Apply to the thresholds
+            thr[f"thr_{kind}"] = np.where(keep, thr[f"thr_{kind}"], np.nan).astype(np.float32)
+            # Apply to the references
+            refs[f"ref_{kind}"] = np.where(keep, refs[f"ref_{kind}"], np.nan).astype(np.float32)
+            # A dropped channel is no longer "at the floor, still included"
+            refs[f"floored_{kind}"] = refs[f"floored_{kind}"] & keep
+            # Record
+            restriction[kind] = {"channels_kept": int(keep.sum()), "channels_dropped": [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(dropped))]}
+    # Channels without a threshold, by kind, after any restriction
+    missing = {kind: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(~np.isfinite(thr[f"thr_{kind}"])))] for kind in ("mag", "ang")}
+    # Grid statistic: one threshold from the calibration block
+    grid = None
+    # Asked for
+    if use_grid:
+        # Meters needed
+        need = max(2, settings["min_meters"])
+        # Grid scores on the calibration block
+        gscore, gavail = grid_scores(arrays, refs, settings["mode"], need)
+        # One threshold
+        gthr = conformal_threshold(gscore, settings["alpha"])
+        # Without a threshold the grid statistic cannot alarm; a silent zero-alarm result would mislead, so it raises
+        if not np.isfinite(gthr):
+            # Raise with the numbers
+            raise ValueError(f"grid threshold cannot be calibrated: {int(np.isfinite(gscore).sum())} valid calibration slots on {settings['calib_label']} at alpha {settings['alpha']} (need at least {math.ceil(1.0 / settings['alpha']) - 1})")
+        # Empirical calibration coverage
+        gcov = float(np.mean(gscore[np.isfinite(gscore)] <= gthr))
+        # Record
+        grid = {"refs": refs, "threshold": gthr, "coverage": gcov, "n_calibration": int(np.isfinite(gscore).sum()), "need": need}
+    # Drop calibration arrays; thresholds, refs, and the grid record remain
     del arrays
     # Collect
     gc.collect()
-    # Channels without a threshold, by kind
-    missing = {kind: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(~np.isfinite(thr[f"thr_{kind}"])))] for kind in ("mag", "ang")}
     # Events
     episodes = load_episodes(settings["events"])
     # Test tables, every requested prefix must have at least one
@@ -742,40 +936,87 @@ def score_source(run_dir, prefix, settings, other_prefix=None, log=None):
     scoped, partial = episodes_in_scope(episodes, blocks, before, after)
     # Alarms, monitored time, per-block records over all test tables
     alarms, monitored_s, per_block = [], 0.0, []
+    # Exceedance counts by available-meter count, grid statistic only
+    by_avail = {}
     # One test table at a time
     for label in labels:
         # Load
         log(f"scoring {label} prefix={prefix!r} mode={settings['mode']} rss {rss_mb():.0f} MB")
         # Residuals
         arr = load_source_arrays(run_dir, label, meters, channels, prefix, other_prefix, settings["common"])
-        # Firing channels
-        fires = exceedances(arr, thr, settings["mode"])
-        # Meters firing per slot
-        score = slot_scores(fires)
-        # Monitored slots: enough meters with a residual on a thresholded channel
-        mon = monitored_slots(arr, thr, settings["mode"], settings["min_meters"])
-        # Slots inside a partly covered event window are neither alarms nor monitored
-        mon &= ~window_mask(arr["t"], partial, before, after)
-        # Alarm slots: enough meters firing, and the slot is monitored
-        alarm = (score >= settings["min_meters"]) & mon
+        # Per-channel statistic
+        if grid is None:
+            # Firing channels
+            fires = exceedances(arr, thr, settings["mode"])
+            # Meters firing per slot
+            score = slot_scores(fires)
+            # Monitored slots: enough meters with a residual on a thresholded channel
+            mon = monitored_slots(arr, thr, settings["mode"], settings["min_meters"])
+            # Slots inside a partly covered event window are neither alarms nor monitored
+            mon &= ~window_mask(arr["t"], partial, before, after)
+            # Alarm slots: enough meters firing, and the slot is monitored
+            alarm = (score >= settings["min_meters"]) & mon
+        # Grid statistic
+        else:
+            # Scores and availability
+            gscore, gavail = grid_scores(arr, grid["refs"], settings["mode"], grid["need"])
+            # Monitored: enough available meters, outside partial windows
+            mon = np.isfinite(gscore) & ~window_mask(arr["t"], partial, before, after)
+            # Alarm: score above the one threshold
+            alarm = mon & (np.nan_to_num(gscore, nan=-np.inf) > grid["threshold"])
+            # Exceedance by available-meter count
+            for a in np.unique(gavail[mon]):
+                # Slots with this count
+                sel = mon & (gavail == a)
+                # Tally
+                rec = by_avail.setdefault(int(a), {"slots": 0, "alarm_slots": 0})
+                # Add
+                rec["slots"] += int(sel.sum()); rec["alarm_slots"] += int((alarm & sel).sum())
         # Episodes
         eps = alarm_episodes(arr["t"], alarm, settings["merge_slots"])
         # Keep
         alarms.extend(eps)
         # Monitored seconds
         monitored_s += float(mon.sum()) * SLOT_SECONDS
-        # Per-block record
-        per_block.append({"label": label, "slots": int(len(arr["t"])), "monitored_slots": int(mon.sum()), "alarm_slots": int(alarm.sum()), "alarm_episodes": len(eps)})
+        # Merged episode spans in seconds, slot-inclusive
+        spans = [float((e - s0).total_seconds()) + SLOT_SECONDS for s0, e in eps]
+        # Per-block record, with the alarm-slot fraction and the merged-span summary
+        per_block.append({"label": label, "slots": int(len(arr["t"])), "monitored_slots": int(mon.sum()), "alarm_slots": int(alarm.sum()),
+                          "alarm_slot_fraction": (float(alarm.sum()) / float(mon.sum())) if mon.sum() else None,
+                          "alarm_episodes": len(eps), "merged_span_median_s": float(np.median(spans)) if spans else None, "merged_span_max_s": float(max(spans)) if spans else None})
         # Progress
         log(f"  {label}: {int(len(arr['t']))} slots, {int(alarm.sum())} alarm slots, {len(eps)} episodes, rss {rss_mb():.0f} MB")
         # Drop this block before the next load
-        del arr, fires, score, mon, alarm
+        if grid is None:
+            # Channel-path temps
+            del arr, fires, score, mon, alarm
+        else:
+            # Grid-path temps
+            del arr, gscore, gavail, mon, alarm
         # Collect
         gc.collect()
     # Match
     results, unmatched = match(alarms, scoped, before, after)
     # Counts
     n_ep, n_det, n_false = len(results), sum(r["detected"] for r in results), len(unmatched)
+    # False alarms and monitored time per split prefix, so the quiet block's rate is reported on its own
+    per_split = {}
+    # Loop over prefixes
+    for p in settings["test_prefixes"]:
+        # Blocks of this split, with their spans
+        spans = [(b, blocks[i]) for i, b in enumerate(per_block) if b["label"].startswith(p)]
+        # Monitored seconds of this split
+        sec = sum(b["monitored_slots"] for b, _ in spans) * SLOT_SECONDS
+        # Alarm slots of this split
+        a_slots = sum(b["alarm_slots"] for b, _ in spans)
+        # Unmatched alarms whose start lies in one of this split's blocks
+        n_unm = sum(1 for a0, _ in unmatched if any(b0 <= a0 <= b1 for _, (b0, b1) in spans))
+        # Merged spans of every alarm episode (matched or not) starting in this split, seconds
+        split_spans = [float((e - a0).total_seconds()) + SLOT_SECONDS for a0, e in alarms if any(b0 <= a0 <= b1 for _, (b0, b1) in spans)]
+        # Record
+        per_split[p] = {"false_alarm_episodes": n_unm, "monitored_days": sec / 86400.0, "false_alarms_per_day": (n_unm / (sec / 86400.0)) if sec > 0 else None,
+                        "alarm_slot_fraction": (a_slots / (sec / SLOT_SECONDS)) if sec > 0 else None,
+                        "alarm_episodes": len(split_spans), "merged_span_median_s": float(np.median(split_spans)) if split_spans else None, "merged_span_max_s": float(max(split_spans)) if split_spans else None}
     # Monitored days
     days = monitored_s / 86400.0
     # Rates
@@ -794,6 +1035,28 @@ def score_source(run_dir, prefix, settings, other_prefix=None, log=None):
     return {
         # Source
         "source": "persistence" if prefix == "pers_" else "model",
+        # Which statistic raised the alarms
+        "statistic": settings.get("statistic", "channel"),
+        # Common-channel restriction, when applied
+        "restriction": None if restriction is None else dict(restriction, note="sensitivity analysis: both statistics limited to channels with both a threshold and a reference"),
+        # Grid statistic details, exploratory
+        "grid": None if grid is None else {
+            # Label
+            "note": "exploratory: motivated by test findings; the channel statistic is the primary result",
+            # Design and calibration
+            "design_label": settings["design_label"], "ref_percentile": settings["ref_percentile"], "ref_min_count": settings["ref_min_count"],
+            # Floors
+            "ref_floor_mag": settings["ref_floor_mag"], "ref_floor_ang": settings["ref_floor_ang"],
+            # References in the (meters x channels) layout
+            "ref_mag": grid["refs"]["ref_mag"].tolist(), "ref_ang": grid["refs"]["ref_ang"].tolist(),
+            # Channels left out and channels at the floor
+            "channels_without_reference": {k: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(~np.isfinite(grid["refs"][f"ref_{k}"])))] for k in ("mag", "ang")},
+            "channels_at_floor": {k: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(grid["refs"][f"floored_{k}"]))] for k in ("mag", "ang")},
+            # Threshold and its empirical calibration coverage
+            "threshold": grid["threshold"], "calibration_coverage": grid["coverage"], "n_calibration": grid["n_calibration"], "meters_needed": grid["need"],
+            # Test exceedance by available-meter count
+            "alarm_slots_by_available_meters": {str(k): dict(v, rate=(v["alarm_slots"] / v["slots"]) if v["slots"] else None) for k, v in sorted(by_avail.items())},
+        },
         # Calibration, with the per-channel coverage and counts
         "calibration": {"label": settings["calib_label"], "alpha": settings["alpha"],
                         "coverage_mag_mean": float(np.nanmean(thr["cov_mag"])) if np.isfinite(thr["cov_mag"]).any() else None,
@@ -811,8 +1074,10 @@ def score_source(run_dir, prefix, settings, other_prefix=None, log=None):
         "episodes_partial_excluded": [{"episode": int(e["episode"]), "first": e["first"].isoformat()} for _, e in partial.iterrows()],
         # Per-episode detail
         "episode_results": [{"episode": r["episode"], "first": r["first"].isoformat(), "detected": r["detected"], "delay_s": r["delay_s"], "alarm_start": r["alarm_start"].isoformat() if r["alarm_start"] is not None else None} for r in results],
-        # False alarms
+        # False alarms, pooled over every test table
         "false_alarm_episodes": n_false, "monitored_days": days, "false_alarms_per_day": (n_false / days) if days > 0 else None,
+        # The same per split prefix
+        "per_split": per_split,
         # Unmatched alarm list, for inspection
         "false_alarm_list": [(s.isoformat(), e.isoformat()) for s, e in unmatched],
         # Scores

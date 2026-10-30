@@ -82,6 +82,20 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0, help="Bootstrap seed")
     # Common slots
     parser.add_argument("--common", action=argparse.BooleanOptionalAction, default=True, help="Score model and persistence on the slots where both are valid (default); --no-common uses each source's own slots")
+    # Which statistic raises alarms
+    parser.add_argument("--statistic", choices=["channel", "grid"], default="channel", help="channel = per-channel thresholds and a meter count (default, primary); grid = one threshold on the second-largest meter score (exploratory)")
+    # Design block for the grid references
+    parser.add_argument("--design-label", default="validation_2024-01-08_2024-01-21", help="Validation block 0, used for the grid reference scales, never for the final threshold")
+    # Reference percentile
+    parser.add_argument("--ref-percentile", type=float, default=99.0, help="Percentile of a channel's design-block residuals used as its reference scale")
+    # Reference minimum count
+    parser.add_argument("--ref-min-count", type=int, default=1000, help="Channels with fewer design-block residuals get no reference")
+    # Reference floors
+    parser.add_argument("--ref-floor-mag", type=float, default=1e-3, help="Floor for magnitude references, scaled units")
+    # Angle floor
+    parser.add_argument("--ref-floor-ang", type=float, default=1.0, help="Floor for angle references, degrees")
+    # Common-channel restriction
+    parser.add_argument("--restrict-common", action="store_true", help="Sensitivity analysis: limit both statistics to channels with both a threshold and a grid reference (needs the design block)")
     # Output name
     parser.add_argument("--out", default="score.json", help="JSON file name written into the run folder")
     # Parse
@@ -102,6 +116,29 @@ def parse_args():
     if args.merge_slots < 0 or args.before_minutes < 0 or args.after_minutes < 0:
         # Reject
         parser.error("--merge-slots, --before-minutes, and --after-minutes must not be negative")
+    # The grid statistic and the restriction both compute references, so both need the reference settings checked,
+    # two meters (the second-largest meter score, and the same monitoring rule for both statistics), and separate blocks
+    if args.statistic == "grid" or args.restrict_common:
+        # Two meters
+        if args.min_meters < 2:
+            # Reject
+            parser.error("--statistic grid and --restrict-common need --min-meters of at least 2")
+        # Floors, positive and finite
+        if not (0 < args.ref_floor_mag < float("inf")) or not (0 < args.ref_floor_ang < float("inf")):
+            # Reject
+            parser.error("--ref-floor-mag and --ref-floor-ang must be positive and finite")
+        # Minimum count
+        if args.ref_min_count < 1:
+            # Reject
+            parser.error("--ref-min-count must be at least 1")
+        # Percentile
+        if not 0.0 < args.ref_percentile < 100.0:
+            # Reject
+            parser.error("--ref-percentile must be between 0 and 100")
+        # Separate blocks
+        if args.design_label == args.calib_label:
+            # Reject
+            parser.error("--design-label and --calib-label must be different blocks")
     # Return
     return args
 
@@ -158,9 +195,15 @@ def main():
         "events": args.events, "test_prefixes": args.test_prefixes, "common": args.common,
         # Bootstrap
         "n_boot": args.n_boot, "seed": args.seed,
+        # Statistic and the grid settings
+        "statistic": args.statistic, "design_label": args.design_label, "ref_percentile": args.ref_percentile, "ref_min_count": args.ref_min_count, "ref_floor_mag": args.ref_floor_mag, "ref_floor_ang": args.ref_floor_ang,
+        # Restriction
+        "restrict_common": args.restrict_common,
     }
     # Results per mode
     out = {"run_dir": os.path.abspath(args.run_dir), "settings": settings, "modes": {}}
+    # Statistic line
+    log(f"statistic: {args.statistic}" + (" (exploratory; references from the design block, one threshold from the calibration block)" if args.statistic == "grid" else " (primary)") + ("; restricted to channels with both a threshold and a reference (sensitivity analysis)" if args.restrict_common else ""))
     # Header
     log(f"{'source / mode':<22} {'det':>7} {'FA/day':>8} {'prec':>7} {'recall':>7}{'':<14} {'F1':>7} {'delay s':>8}")
     # Loop over modes
@@ -181,6 +224,34 @@ def main():
         log(line(f"model / {mode}", model))
         # Print
         log(line(f"persistence / {mode}", pers))
+        # Per split, model and persistence: false alarms per day, alarm-slot fraction, merged episode spans
+        for name, r in (("model", model), ("persistence", pers)):
+            # Pieces
+            parts = []
+            # Loop over splits
+            for p, v in r["per_split"].items():
+                # Skip empty
+                if v["false_alarms_per_day"] is None:
+                    # Next
+                    continue
+                # Span text, merged spans are not time in alarm
+                span = f"merged span median {v['merged_span_median_s']:.0f} s, max {v['merged_span_max_s']:.0f} s" if v["merged_span_median_s"] is not None else "no episodes"
+                # Piece
+                parts.append(f"{p.rstrip('_')}: {v['false_alarms_per_day']:.2f} FA/day over {v['monitored_days']:.1f} days, alarm-slot fraction {v['alarm_slot_fraction']:.2e}, {span}")
+            # Print
+            log(f"  {name} by split: " + " | ".join(parts))
+        # Grid details, once per mode
+        if model["grid"] is not None:
+            # Both sources
+            for name, r in (("model", model), ("persistence", pers)):
+                # Line
+                g = r["grid"]
+                # Print
+                log(f"  {name} grid: threshold {g['threshold']:.3f} on {g['n_calibration']} calibration slots, calibration coverage {g['calibration_coverage']:.5f}; {len(g['channels_without_reference']['mag'])} mag / {len(g['channels_without_reference']['ang'])} ang channels without reference, {len(g['channels_at_floor']['mag'])} mag / {len(g['channels_at_floor']['ang'])} ang at the floor; alarm-slot rate by available meters: " + ", ".join(f"{k}: {v['rate']:.2e}" for k, v in g['alarm_slots_by_available_meters'].items() if v['rate'] is not None))
+        # Restriction, once per mode
+        if model["restriction"] is not None:
+            # Print
+            log("  restriction: " + "; ".join(f"{k}: {v['channels_kept']} channels kept, dropped {v['channels_dropped']}" for k, v in model["restriction"].items() if k in ("mag", "ang")))
         # Channels without thresholds, once per mode
         miss = model["calibration"]["channels_without_threshold"]
         # Report if any
