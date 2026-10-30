@@ -135,19 +135,35 @@
 #     train(...)                      epochs over the train split, early stopping, checkpoints
 #     save_checkpoint / load_checkpoint / save_atomic
 #   Scoring
+#     rss_mb()                        resident set size in megabytes, for scoring logs
+#     residual_piece_dir(out_dir, label)
+#                                     folder for one block's per-month parquet files
+#     combine_residual_pieces(...)    stream month files into the combined parquet
+#     summarize_residual_paths(...)   median and p99 from month files, one kind at a time
+#     write_residual_summary(...)     <label>.json next to the combined parquet
 #     score_split(...)                residual tables per block, written to disk
 # =============================================================================
 
 # Standard library: JSON for graph and summaries
 import json
+# Standard library: garbage collection after each scored month, so the next month does not sit on top of the last
+import gc
 # Standard library: paths
 import os
+# Standard library: peak and current RSS for the scoring memory log
+import resource
+# Standard library: platform check for RSS units
+import sys
 # Standard library: timing
 import time
+# Standard library: traceback text in scoring failure logs
+import traceback
 # Third party: numerics
 import numpy as np
 # Third party: tables for the residual output
 import pandas as pd
+# Third party: streaming parquet combine, so the five test_normal months are never all in RAM
+import pyarrow.parquet as pq
 # Third party: deep learning
 import torch
 # Third party: layers
@@ -1054,6 +1070,181 @@ def train(model, features_dir, splits, scale, manifest, device, options, checkpo
 # Scoring
 # -----------------------------------------------------------------------------
 
+def rss_mb():
+    """
+    Resident set size in megabytes. Prefers current RSS from /proc; falls
+    back to getrusage, whose units are bytes on macOS and kilobytes on Linux.
+    """
+    # Linux current RSS
+    try:
+        # Status file
+        with open("/proc/self/status") as f:
+            # Each line
+            for line in f:
+                # Current resident set
+                if line.startswith("VmRSS:"):
+                    # kB -> MB
+                    return float(line.split()[1]) / 1024.0
+    # Missing /proc, including macOS
+    except OSError:
+        # Fall through
+        pass
+    # Peak RSS from the kernel
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports bytes
+    if sys.platform == "darwin":
+        # Bytes -> MB
+        return rss / (1024.0 * 1024.0)
+    # Linux peak is kilobytes
+    return rss / 1024.0
+
+
+def residual_piece_dir(out_dir, label):
+    """Folder for one block's per-month parquet files, not listed by main_score.py."""
+    # Under _pieces so top-level glob of <prefix>*.parquet stays the combined files
+    return os.path.join(out_dir, "_pieces", label)
+
+
+def combine_residual_pieces(piece_paths, dest, log):
+    """
+    Stream month parquet files into dest without concatenating them in pandas.
+    Writes dest via a temp file then os.replace, so a crash never leaves a
+    half combined table that a later run would skip. piece_paths must be
+    non-empty and share a schema. Returns the number of rows written.
+    """
+    # Nothing to combine is a scoring bug, not an empty result
+    if not piece_paths:
+        # Fail
+        raise RuntimeError("no month parquet files to combine")
+    # Temporary next to the destination, same filesystem so replace is atomic
+    tmp = dest + ".tmp"
+    # Row count
+    n_rows = 0
+    # Write, and always drop a leftover temp on failure
+    try:
+        # Disk size, for the log; a missing piece must land in the same FAILED log as a later error
+        nbytes = sum(os.path.getsize(p) for p in piece_paths)
+        # Announce before the write, the step that used to OOM with no message
+        log(f"combining {len(piece_paths)} month files into {dest} ({nbytes / 1e6:.1f} MB on disk, rss {rss_mb():.0f} MB)")
+        # Schema from the first month, including pandas index metadata
+        schema = pq.ParquetFile(piece_paths[0]).schema_arrow
+        # Writer
+        writer = pq.ParquetWriter(tmp, schema)
+        # Each month, one at a time
+        try:
+            # Loop
+            for path in piece_paths:
+                # Open
+                pf = pq.ParquetFile(path)
+                # Batches, not the whole month as a pandas frame
+                for batch in pf.iter_batches(batch_size=65536):
+                    # Count
+                    n_rows += batch.num_rows
+                    # Append
+                    writer.write_batch(batch)
+                # Progress
+                log(f"  appended {path}: {pf.metadata.num_rows} rows, rss {rss_mb():.0f} MB")
+        # Close the writer before replace
+        finally:
+            # Close
+            writer.close()
+        # Empty combined file cannot be scored
+        if n_rows == 0:
+            # Drop the temp
+            os.remove(tmp)
+            # Fail
+            raise RuntimeError(f"combined residual table would be empty: {dest}")
+        # Atomic publish
+        os.replace(tmp, dest)
+        # Done
+        log(f"combined {n_rows} rows into {dest}, rss {rss_mb():.0f} MB")
+        # Count
+        return n_rows
+    # Any failure: say why, drop the temp, re-raise
+    except Exception as exc:
+        # Leftover temp
+        if os.path.exists(tmp):
+            # Remove
+            os.remove(tmp)
+        # Diagnostic, including the exception type Colab used to swallow
+        log(f"FAILED combining into {dest}: {type(exc).__name__}: {exc}; rss {rss_mb():.0f} MB; pieces {piece_paths}")
+        # Stack
+        log(traceback.format_exc())
+        # Re-raise
+        raise
+
+
+def summarize_residual_paths(piece_paths, suffix):
+    """
+    Finite values of every column whose name ends with suffix, from month
+    parquet files, without loading the whole split. One month's matching
+    columns are in RAM at a time, then concatenated for the percentile.
+    """
+    # Pieces
+    chunks = []
+    # Each month file
+    for path in piece_paths:
+        # Names in this file
+        names = pq.ParquetFile(path).schema_arrow.names
+        # Matching columns
+        cols = [n for n in names if n.endswith(suffix)]
+        # None
+        if not cols:
+            # Next
+            continue
+        # Those columns only
+        arr = pq.read_table(path, columns=cols).to_pandas().to_numpy().ravel()
+        # Finite
+        arr = arr[np.isfinite(arr)]
+        # Keep
+        if len(arr):
+            # One 1-D piece
+            chunks.append(arr)
+    # Nothing
+    if not chunks:
+        # Empty
+        return np.array([], dtype=np.float64)
+    # One array for median and percentile
+    return np.concatenate(chunks)
+
+
+def write_residual_summary(piece_paths, label, options, n_rows, out_dir, log):
+    """Write <label>.json from the month files, not from a concatenated frame."""
+    # Magnitude residuals
+    mag_vals = summarize_residual_paths(piece_paths, "|mag_res")
+    # Angle
+    ang_vals = summarize_residual_paths(piece_paths, "|ang_res")
+    # Persistence magnitude
+    pm_vals = summarize_residual_paths(piece_paths, "|pers_mag_res")
+    # Summary, same keys as before
+    summary = {
+        # Label
+        "label": label, "slots": int(n_rows), "model": options["kind"],
+        # Magnitude residual in scaled units
+        "mag_res_median": float(np.median(mag_vals)) if len(mag_vals) else None,
+        # 99th percentile
+        "mag_res_p99": float(np.percentile(mag_vals, 99)) if len(mag_vals) else None,
+        # Angle residual in degrees
+        "ang_res_median": float(np.median(ang_vals)) if len(ang_vals) else None,
+        # 99th percentile
+        "ang_res_p99": float(np.percentile(ang_vals, 99)) if len(ang_vals) else None,
+        # Persistence for comparison
+        "pers_mag_res_median": float(np.median(pm_vals)) if len(pm_vals) else None,
+        # Options
+        "options": options,
+    }
+    # Path
+    path = os.path.join(out_dir, f"{label}.json")
+    # Write
+    with open(path, "w") as f:
+        # Pretty JSON
+        json.dump(summary, f, indent=2, default=str)
+    # Report
+    log(f"wrote {path}: {n_rows} slots, mag_res median {summary['mag_res_median']}, persistence {summary['pers_mag_res_median']}")
+    # Return for tests
+    return summary
+
+
 def score_split(model, features_dir, splits, split_name, scale, manifest, device, options, out_dir, log):
     """
     Write one residual table per block of a split:
@@ -1064,6 +1255,15 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
         percentile of mag_res and ang_res, options used
     Every slot that is the target of a usable window gets a row; other
     slots are absent, never written as zero.
+
+    Each month is written under <out_dir>/_pieces/<label>/<YYYY-MM>.parquet
+    as soon as it finishes, then dropped from RAM. The combined parquet is
+    streamed from those files with pyarrow, never pd.concat of the whole
+    split. Re-running skips months that already have a piece and blocks that
+    already have a combined parquet. Progress and RSS are logged at the
+    start of each month, every 100 batches, and around the combine. A block
+    that still lacks month files after scoring raises instead of writing a
+    partial combined table.
     """
     # Graph models take synchronized batches
     graph_mode = options["kind"] != "gru"
@@ -1075,18 +1275,50 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
     os.makedirs(out_dir, exist_ok=True)
     # Eval mode
     model.eval()
-    # Collect per block label
-    tables = {}
+    # Blocks of this split, label -> block
+    blocks = {f"{split_name}_{b['start']}_{b['end']}": b for b in splits[split_name]}
+    # Combined parquet already on disk, skip the whole block
+    done = {label for label in blocks if os.path.exists(os.path.join(out_dir, f"{label}.parquet"))}
+    # Report skips
+    for label in sorted(done):
+        # Already written
+        log(f"skip {label}: {os.path.join(out_dir, label + '.parquet')} already exists")
     # No gradient
     with torch.no_grad():
         # Loop over pieces
         for label, month, t, X, mag_valid, ang_valid in sd.iter_blocks(features_dir, splits, split_name, scale, manifest=manifest):
+            # Combined file already written
+            if label in done:
+                # Next
+                continue
+            # Piece folder
+            piece_dir = residual_piece_dir(out_dir, label)
+            # Make it
+            os.makedirs(piece_dir, exist_ok=True)
+            # This month
+            piece_path = os.path.join(piece_dir, f"{month}.parquet")
+            # Marker for a month with no usable window
+            skip_path = os.path.join(piece_dir, f"{month}.skip")
+            # Resume: month already scored
+            if os.path.exists(piece_path) or os.path.exists(skip_path):
+                # Say so
+                log(f"  resume {label} {month}: already on disk, rss {rss_mb():.0f} MB")
+                # Next
+                continue
             # Dataset, every meter kept so residuals exist wherever a meter is usable
             ds = make_dataset((label, month, t, X, mag_valid, ang_valid), graph_mode, options["history"], options["horizon"], options["max_gap"], min_meters=1)
             # Nothing
             if ds is None:
+                # Record the empty month so a later combine knows it was tried
+                open(skip_path, "w").close()
+                # Say so
+                log(f"  no windows in {label} {month}, wrote {skip_path}, rss {rss_mb():.0f} MB")
                 # Next
                 continue
+            # Batch count, for the progress line
+            n_batches = (len(ds) + options["batch_size"] - 1) // options["batch_size"]
+            # Announce before the long loop
+            log(f"  scoring {label} {month}: {len(ds)} windows, {n_batches} batches, rss {rss_mb():.0f} MB")
             # Batches in order
             loader = iter_batches(ds, options["batch_size"], False, np.random.default_rng(0), device)
             # Result arrays over the piece, NaN where no residual
@@ -1096,7 +1328,11 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
             # Position in the dataset
             pos = 0
             # Loop over batches
-            for x, y, y_valid, extra in loader:
+            for bi, (x, y, y_valid, extra) in enumerate(loader):
+                # First, last, and every 100th batch
+                if bi == 0 or (bi + 1) % 100 == 0 or (bi + 1) == n_batches:
+                    # Progress
+                    log(f"    {label} {month} batch {bi + 1}/{n_batches}, rss {rss_mb():.0f} MB")
                 # Forecast
                 y_hat = model(x) if graph_mode else model(x, extra)
                 # Persistence forecast and whether the history held anything to copy
@@ -1159,50 +1395,53 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
             table = pd.DataFrame(cols, index=pd.to_datetime(t[scored], unit="s", utc=True))
             # Index name
             table.index.name = "t_utc"
-            # Append to the block
-            tables.setdefault(label, []).append(table)
+            # Atomic month write: temp then replace, so a crash does not leave a half piece
+            tmp = piece_path + ".tmp"
+            # Save
+            table.to_parquet(tmp)
+            # Publish
+            os.replace(tmp, piece_path)
             # Progress
-            log(f"  scored {label} {month}: {int(scored.sum())} slots")
-    # Write per block
-    for label, parts in tables.items():
-        # Stack months
-        table = pd.concat(parts).sort_index()
-        # Path
-        path = os.path.join(out_dir, f"{label}.parquet")
-        # Save
-        table.to_parquet(path)
-        # Summary over all mag_res and ang_res columns
-        mag_cols = [c for c in table.columns if c.endswith("|mag_res")]
-        # Angle columns
-        ang_cols = [c for c in table.columns if c.endswith("|ang_res")]
-        # Values
-        mag_vals = table[mag_cols].to_numpy().ravel(); mag_vals = mag_vals[np.isfinite(mag_vals)]
-        # Angles
-        ang_vals = table[ang_cols].to_numpy().ravel(); ang_vals = ang_vals[np.isfinite(ang_vals)]
-        # Persistence
-        pm_cols = [c for c in table.columns if c.endswith("|pers_mag_res")]
-        # Values
-        pm_vals = table[pm_cols].to_numpy().ravel(); pm_vals = pm_vals[np.isfinite(pm_vals)]
-        # Summary
-        summary = {
-            # Label
-            "label": label, "slots": int(len(table)), "model": options["kind"],
-            # Magnitude residual in scaled units
-            "mag_res_median": float(np.median(mag_vals)) if len(mag_vals) else None,
-            # 99th percentile
-            "mag_res_p99": float(np.percentile(mag_vals, 99)) if len(mag_vals) else None,
-            # Angle residual in degrees
-            "ang_res_median": float(np.median(ang_vals)) if len(ang_vals) else None,
-            # 99th percentile
-            "ang_res_p99": float(np.percentile(ang_vals, 99)) if len(ang_vals) else None,
-            # Persistence for comparison
-            "pers_mag_res_median": float(np.median(pm_vals)) if len(pm_vals) else None,
-            # Options
-            "options": options,
-        }
-        # Write
-        with open(os.path.join(out_dir, f"{label}.json"), "w") as f:
-            # Pretty JSON
-            json.dump(summary, f, indent=2, default=str)
+            log(f"  scored {label} {month}: {int(scored.sum())} slots, wrote {piece_path}, rss {rss_mb():.0f} MB")
+            # Drop the month before the next one loads
+            del table, cols, res, val, ds, X, mag_valid, ang_valid, t
+            # Collect
+            gc.collect()
+            # GPU cache, when present
+            if torch.cuda.is_available():
+                # Free unused blocks
+                torch.cuda.empty_cache()
+    # Combine month pieces into one parquet per block that is not already done
+    for label, block in blocks.items():
+        # Already written
+        if label in done:
+            # Next
+            continue
+        # Expected months in this block
+        months = sd.months_in_block(block)
+        # Piece folder
+        piece_dir = residual_piece_dir(out_dir, label)
+        # Months with a table
+        present = [m for m in months if os.path.exists(os.path.join(piece_dir, f"{m}.parquet"))]
+        # Months tried and empty
+        skipped = [m for m in months if os.path.exists(os.path.join(piece_dir, f"{m}.skip"))]
+        # Still running or crashed before this month was recorded
+        missing = [m for m in months if m not in present and m not in skipped]
+        # Incomplete: do not write a partial combined file that main_score.py would treat as the whole block
+        if missing:
+            # Fail with the cause and how to resume
+            raise RuntimeError(f"incomplete {label}: still need months {missing}; re-run --score-only --score-splits {split_name} (month pieces are kept under {piece_dir}), rss {rss_mb():.0f} MB")
+        # No rows in any month
+        if not present:
+            # Fail with the cause
+            raise RuntimeError(f"scored {split_name} block {label} but every month had no usable windows; not writing an empty parquet")
+        # Paths in time order
+        piece_paths = [os.path.join(piece_dir, f"{m}.parquet") for m in present]
+        # Combined destination
+        dest = os.path.join(out_dir, f"{label}.parquet")
+        # Stream, never pd.concat of all months
+        n_rows = combine_residual_pieces(piece_paths, dest, log)
+        # JSON from the month files
+        write_residual_summary(piece_paths, label, options, n_rows, out_dir, log)
         # Report
-        log(f"wrote {path}: {len(table)} slots, mag_res median {summary['mag_res_median']}, persistence {summary['pers_mag_res_median']}")
+        log(f"wrote {dest}: {n_rows} slots")
