@@ -64,11 +64,15 @@
 #
 # Functions:
 #   Tables
+#     rss_mb()                            resident set size in megabytes, for scoring logs
 #     list_tables(run_dir, prefix)        block labels whose Parquet file starts with prefix
 #     load_table(run_dir, label)          read one residual table
 #     table_axes(table)                   (meters, channels) from the column names
+#     parquet_axes(path)                  the same, from a parquet schema, without loading residuals
+#     table_span(run_dir, label)          (first, last) timestamps of a table, times only
 #     residual_arrays(table, meters, channels, prefix)
 #                                         dict of (T, M, C) arrays: mag, ang, mag_valid, ang_valid
+#     load_residual_arrays(...)           the same arrays from one prefix's columns, no full DataFrame
 #     common_mask(model, pers)            mask both sources to their shared valid slots
 #   Calibration
 #     conformal_threshold(values, alpha)  one threshold from a 1-D array of residuals, or NaN
@@ -92,21 +96,66 @@
 #   Scoring
 #     bootstrap(detected, false_count, n_boot, seed)
 #                                         recall interval; conditional precision and F1 intervals
-#     score_source(run_dir, prefix, settings, other_prefix)
-#                                         the whole pipeline for one source, returns a dict
+#     score_source(run_dir, prefix, settings, other_prefix, log)
+#                                         the whole pipeline for one source, one test block at a time
 # =============================================================================
 
 # Standard library: ceilings for the conformal rank
 import math
+# Standard library: drop a block's arrays before the next one loads
+import gc
 # Standard library: paths
 import os
+# Standard library: RSS units on Linux vs macOS
+import resource
+# Standard library: platform check for RSS units
+import sys
 # Third party: numerics
 import numpy as np
 # Third party: tables and timestamps
 import pandas as pd
+# Third party: column-selective parquet reads, so a test block is never a full DataFrame
+import pyarrow.parquet as pq
 
 # Seconds per slot, the feature grid
 SLOT_SECONDS = 10
+# Residual and validity names stored per meter and channel, one prefix ("" or "pers_")
+RESIDUAL_NAMES = (("mag", "mag_res"), ("ang", "ang_res"), ("mag_valid", "mag_valid"), ("ang_valid", "ang_valid"))
+
+
+def rss_mb():
+    """
+    Resident set size in megabytes. Prefers current RSS from /proc; falls
+    back to getrusage, whose units are bytes on macOS and kilobytes on Linux.
+    """
+    # Linux current RSS
+    try:
+        # Status file
+        with open("/proc/self/status") as f:
+            # Each line
+            for line in f:
+                # Current resident set
+                if line.startswith("VmRSS:"):
+                    # kB -> MB
+                    return float(line.split()[1]) / 1024.0
+    # Missing /proc, including macOS
+    except OSError:
+        # Fall through
+        pass
+    # Peak RSS from the kernel
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports bytes
+    if sys.platform == "darwin":
+        # Bytes -> MB
+        return rss / (1024.0 * 1024.0)
+    # Linux peak is kilobytes
+    return rss / 1024.0
+
+
+def default_log(text):
+    """Print one scoring line and flush, so Colab shows progress before a later OOM."""
+    # Screen
+    print(text, flush=True)
 
 
 # -----------------------------------------------------------------------------
@@ -163,6 +212,42 @@ def table_axes(table):
     return meters, channels
 
 
+def parquet_axes(path):
+    """Meters and channels from a residual parquet schema, without reading residual values."""
+    # Schema names in file order, the same order table_axes sees after pandas writes the table
+    names = pq.ParquetFile(path).schema_arrow.names
+    # Reuse the column parser
+    return table_axes(pd.DataFrame(columns=[n for n in names if n.count("|") == 2]))
+
+
+def table_span(run_dir, label):
+    """
+    First and last timestamps of a residual table, as UTC pandas Timestamps.
+    Reads only the time column so a five-month test_normal table does not
+    enter RAM as residuals.
+    """
+    # Path
+    path = os.path.join(run_dir, f"{label}.parquet")
+    # Must exist
+    if not os.path.exists(path):
+        # Raise
+        raise FileNotFoundError(f"no residual table at {path}")
+    # Names
+    names = pq.ParquetFile(path).schema_arrow.names
+    # Time column written by score_split
+    if "t_utc" not in names:
+        # Cannot take a span without loading residuals
+        raise ValueError(f"no t_utc column in {path}")
+    # Times only
+    t = pd.to_datetime(pq.read_table(path, columns=["t_utc"]).column(0).to_pandas(), utc=True)
+    # Empty
+    if len(t) == 0:
+        # Raise
+        raise ValueError(f"empty residual table: {path}")
+    # First and last, the same values load_table().index[[0, -1]] would give
+    return t.iloc[0], t.iloc[-1]
+
+
 def residual_arrays(table, meters, channels, prefix=""):
     """
     Residuals of one source as (T, M, C) arrays. prefix "" is the model,
@@ -192,6 +277,76 @@ def residual_arrays(table, meters, channels, prefix=""):
     out["ang_valid"] &= np.isfinite(out["ang"])
     # Timestamps
     out["t"] = table.index.to_numpy()
+    # Return
+    return out
+
+
+def load_residual_arrays(run_dir, label, meters, channels, prefix=""):
+    """
+    Residual arrays of one prefix from disk, without a full pandas table.
+    Only that prefix's mag/ang residual and validity columns plus t_utc are
+    read, so model and persistence are never both materialized from a
+    DataFrame at once. Same dict as residual_arrays.
+    """
+    # Path
+    path = os.path.join(run_dir, f"{label}.parquet")
+    # Must exist
+    if not os.path.exists(path):
+        # Raise
+        raise FileNotFoundError(f"no residual table at {path}")
+    # File columns
+    names = set(pq.ParquetFile(path).schema_arrow.names)
+    # Time
+    if "t_utc" not in names:
+        # Need times
+        raise ValueError(f"no t_utc column in {path}")
+    # Requested residual columns that exist
+    wanted = ["t_utc"]
+    # Loop
+    for meter in meters:
+        # Channels
+        for ch in channels:
+            # Four stored names
+            for _, name in RESIDUAL_NAMES:
+                # Column
+                col = f"{meter}|{ch}|{prefix}{name}"
+                # Present
+                if col in names:
+                    # Keep
+                    wanted.append(col)
+    # One Arrow table of those columns
+    arrow = pq.read_table(path, columns=wanted)
+    # Empty
+    if arrow.num_rows == 0:
+        # Raise
+        raise ValueError(f"empty residual table: {path}")
+    # Times
+    t = pd.to_datetime(arrow.column("t_utc").to_pandas(), utc=True).to_numpy()
+    # Sizes
+    T, M, C = arrow.num_rows, len(meters), len(channels)
+    # Output arrays, same layout as residual_arrays
+    out = {"mag": np.full((T, M, C), np.nan, dtype=np.float32), "ang": np.full((T, M, C), np.nan, dtype=np.float32),
+           "mag_valid": np.zeros((T, M, C), dtype=bool), "ang_valid": np.zeros((T, M, C), dtype=bool), "t": t}
+    # File column set for membership
+    have = set(arrow.schema.names)
+    # Fill
+    for mi, meter in enumerate(meters):
+        # Channels
+        for ci, ch in enumerate(channels):
+            # Four names
+            for key, name in RESIDUAL_NAMES:
+                # Column
+                col = f"{meter}|{ch}|{prefix}{name}"
+                # Present
+                if col in have:
+                    # Copy into the dense array
+                    out[key][:, mi, ci] = np.asarray(arrow.column(col).to_numpy())
+    # Drop the Arrow table before the finite mask, so only the numpy arrays remain
+    del arrow
+    # A residual is valid only where it is also finite
+    out["mag_valid"] &= np.isfinite(out["mag"])
+    # Angle
+    out["ang_valid"] &= np.isfinite(out["ang"])
     # Return
     return out
 
@@ -508,7 +663,29 @@ def bootstrap(detected, false_count, n_boot, seed):
             "f1_cond_lo": float(np.percentile(f1, 2.5)), "f1_cond_hi": float(np.percentile(f1, 97.5)), "note": note}
 
 
-def score_source(run_dir, prefix, settings, other_prefix=None):
+def load_source_arrays(run_dir, label, meters, channels, prefix, other_prefix, common):
+    """
+    One prefix's residual arrays for a block. With common, mask to slots
+    where both prefixes are valid, loading the other prefix only for the
+    mask and then dropping it. Never holds a pandas copy of the whole table.
+    """
+    # This source
+    arr = load_residual_arrays(run_dir, label, meters, channels, prefix)
+    # Shared slots
+    if other_prefix is not None and common:
+        # Other source, same block
+        other = load_residual_arrays(run_dir, label, meters, channels, other_prefix)
+        # Mask in place
+        common_mask(arr, other)
+        # Drop the other arrays
+        del other
+        # Collect
+        gc.collect()
+    # Return
+    return arr
+
+
+def score_source(run_dir, prefix, settings, other_prefix=None, log=None):
     """
     The whole pipeline for one source ("" model, "pers_" persistence):
     calibrate on the calibration block, detect on every test table, match
@@ -518,49 +695,59 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
     with alpha, mode, min_meters, merge_slots, before_minutes,
     after_minutes, calib_label, test_prefixes, events, n_boot, seed,
     common. Returns a dict of results.
+
+    Test blocks are loaded one at a time. Block spans are read from t_utc
+    only, so episodes_in_scope does not need residual arrays of every
+    split in RAM at once. log defaults to a flushing print.
     """
+    # Logger
+    if log is None:
+        # Default
+        log = default_log
     # Windows
     before, after = pd.Timedelta(minutes=settings["before_minutes"]), pd.Timedelta(minutes=settings["after_minutes"])
-    # Calibration table
-    cal = load_table(run_dir, settings["calib_label"])
-    # Axes
-    meters, channels = table_axes(cal)
-    # Calibration residuals
-    arrays = residual_arrays(cal, meters, channels, prefix)
-    # Common slots
-    if other_prefix is not None and settings["common"]:
-        # Mask against the other source
-        common_mask(arrays, residual_arrays(cal, meters, channels, other_prefix))
+    # Calibration path
+    calib_path = os.path.join(run_dir, settings["calib_label"] + ".parquet")
+    # Axes from the schema, same first-seen order as table_axes on the loaded frame
+    meters, channels = parquet_axes(calib_path)
+    # Calibrate
+    log(f"calibrating {settings['calib_label']} prefix={prefix!r} common={bool(other_prefix is not None and settings['common'])} rss {rss_mb():.0f} MB")
+    # Calibration residuals, one prefix (and the other only if common)
+    arrays = load_source_arrays(run_dir, settings["calib_label"], meters, channels, prefix, other_prefix, settings["common"])
     # Thresholds
     thr = calibrate(arrays, settings["alpha"])
+    # Drop calibration arrays
+    del arrays
+    # Collect
+    gc.collect()
     # Channels without a threshold, by kind
     missing = {kind: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(~np.isfinite(thr[f"thr_{kind}"])))] for kind in ("mag", "ang")}
     # Events
     episodes = load_episodes(settings["events"])
     # Test tables, every requested prefix must have at least one
     labels = [lab for p in settings["test_prefixes"] for lab in list_tables(run_dir, p)]
-    # Load every test table once, with its residual arrays
-    tables = []
-    # Loop over labels
+    # Spans from times only, in the same label order as before
+    log(f"reading spans for {len(labels)} test tables, rss {rss_mb():.0f} MB")
+    # First and last scored slot of each table
+    blocks = []
+    # Loop
     for label in labels:
-        # Table
-        table = load_table(run_dir, label)
-        # Residuals
-        arr = residual_arrays(table, meters, channels, prefix)
-        # Common slots
-        if other_prefix is not None and settings["common"]:
-            # Mask
-            common_mask(arr, residual_arrays(table, meters, channels, other_prefix))
+        # Span
+        span = table_span(run_dir, label)
         # Keep
-        tables.append((label, arr))
-    # Block spans, from the first and last scored slot of each table
-    blocks = [(pd.to_datetime(arr["t"][0], utc=True), pd.to_datetime(arr["t"][-1], utc=True)) for _, arr in tables]
+        blocks.append(span)
+        # Progress
+        log(f"  span {label}: {span[0]} .. {span[1]}")
     # Episodes fully inside the scored blocks, and those only partly covered
     scoped, partial = episodes_in_scope(episodes, blocks, before, after)
     # Alarms, monitored time, per-block records over all test tables
     alarms, monitored_s, per_block = [], 0.0, []
-    # Loop over tables
-    for label, arr in tables:
+    # One test table at a time
+    for label in labels:
+        # Load
+        log(f"scoring {label} prefix={prefix!r} mode={settings['mode']} rss {rss_mb():.0f} MB")
+        # Residuals
+        arr = load_source_arrays(run_dir, label, meters, channels, prefix, other_prefix, settings["common"])
         # Firing channels
         fires = exceedances(arr, thr, settings["mode"])
         # Meters firing per slot
@@ -579,6 +766,12 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         monitored_s += float(mon.sum()) * SLOT_SECONDS
         # Per-block record
         per_block.append({"label": label, "slots": int(len(arr["t"])), "monitored_slots": int(mon.sum()), "alarm_slots": int(alarm.sum()), "alarm_episodes": len(eps)})
+        # Progress
+        log(f"  {label}: {int(len(arr['t']))} slots, {int(alarm.sum())} alarm slots, {len(eps)} episodes, rss {rss_mb():.0f} MB")
+        # Drop this block before the next load
+        del arr, fires, score, mon, alarm
+        # Collect
+        gc.collect()
     # Match
     results, unmatched = match(alarms, scoped, before, after)
     # Counts
@@ -595,6 +788,8 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
     delays = [r["delay_s"] for r in results if r["detected"]]
     # Bootstrap
     boot = bootstrap([r["detected"] for r in results], n_false, settings["n_boot"], settings["seed"])
+    # Done with this source
+    log(f"done prefix={prefix!r} mode={settings['mode']}: {n_det}/{n_ep} detected, {n_false} false alarms, rss {rss_mb():.0f} MB")
     # Return
     return {
         # Source

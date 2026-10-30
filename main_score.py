@@ -136,6 +136,12 @@ def line(name, r):
     return f"{name:<22} {r['episodes_detected']:>3}/{r['episodes_in_scope']:<3} {f(r['false_alarms_per_day'], 2):>8} {f(r['precision']):>7} {f(r['recall']):>7}{ci:<14} {f(r['f1']):>7} {f(r['delay_median_s'], 0):>8}"
 
 
+def log(text):
+    """Print and flush, so a later OOM still leaves the last scoring step on screen."""
+    # Screen
+    print(text, flush=True)
+
+
 def main():
     """Score the model and persistence in each mode, print the table, write the JSON."""
     # Options
@@ -156,35 +162,41 @@ def main():
     # Results per mode
     out = {"run_dir": os.path.abspath(args.run_dir), "settings": settings, "modes": {}}
     # Header
-    print(f"{'source / mode':<22} {'det':>7} {'FA/day':>8} {'prec':>7} {'recall':>7}{'':<14} {'F1':>7} {'delay s':>8}")
+    log(f"{'source / mode':<22} {'det':>7} {'FA/day':>8} {'prec':>7} {'recall':>7}{'':<14} {'F1':>7} {'delay s':>8}")
     # Loop over modes
     for mode in args.modes:
         # Mode setting
         settings_mode = dict(settings, mode=mode)
         # Model
-        model = ss.score_source(args.run_dir, "", settings_mode, other_prefix="pers_")
+        log(f"mode {mode}: model, rss {ss.rss_mb():.0f} MB")
+        # Score
+        model = ss.score_source(args.run_dir, "", settings_mode, other_prefix="pers_", log=log)
         # Persistence
-        pers = ss.score_source(args.run_dir, "pers_", settings_mode, other_prefix="")
+        log(f"mode {mode}: persistence, rss {ss.rss_mb():.0f} MB")
+        # Score
+        pers = ss.score_source(args.run_dir, "pers_", settings_mode, other_prefix="", log=log)
         # Keep
         out["modes"][mode] = {"model": model, "persistence": pers}
         # Print
-        print(line(f"model / {mode}", model))
+        log(line(f"model / {mode}", model))
         # Print
-        print(line(f"persistence / {mode}", pers))
+        log(line(f"persistence / {mode}", pers))
         # Channels without thresholds, once per mode
         miss = model["calibration"]["channels_without_threshold"]
         # Report if any
         if miss["mag"] or miss["ang"]:
             # Say so
-            print(f"  (model: no threshold for {len(miss['mag'])} mag and {len(miss['ang'])} ang channels)")
+            log(f"  (model: no threshold for {len(miss['mag'])} mag and {len(miss['ang'])} ang channels)")
     # Path
     path = os.path.join(args.run_dir, args.out)
     # Write, with no NaN allowed so the file is standard JSON
+    log(f"writing {path}, rss {ss.rss_mb():.0f} MB")
+    # File
     with open(path, "w") as f:
         # Pretty JSON, timestamps as strings
         json.dump(clean(out), f, indent=2, default=str, allow_nan=False)
     # Say so
-    print(f"\nwrote {path}")
+    log(f"wrote {path}")
 
 
 # Run only when executed directly
