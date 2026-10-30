@@ -18,6 +18,8 @@
 #     python main_features.py --start-date 2024-09-01 --end-date 2024-09-30
 #   With harmonics 1 and 2:
 #     python main_features.py --keep-harmonics
+#   Sequential (in-process) months:
+#     python main_features.py --workers 1
 #   Options: python main_features.py --help
 #
 # Output under <out_dir> (default data/features):
@@ -31,15 +33,20 @@
 #   parse_args()        command-line options with defaults
 #   append_log(path, row)
 #                       append one row to build_log.csv, header on first write
-#   main()              loop over months, build, save, verify, log, manifest
+#   run(args)           loop over months (optionally in parallel), log, manifest
+#   main()              parse options and run
 # =============================================================================
 
 # Standard library: command-line options
 import argparse
 # Standard library: CSV writing for the log
 import csv
+# Standard library: process pool for independent months
+from concurrent.futures import ProcessPoolExecutor
 # Standard library: JSON for printing stats
 import json
+# Standard library: spawn context, safe with numpy/pandas
+from multiprocessing import get_context
 # Standard library: file and folder operations
 import os
 # Project: date helpers from preprocessing
@@ -74,6 +81,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0, help="Seed for the spot-check sample")
     # Rebuild
     parser.add_argument("--force", action="store_true", help="Rebuild months that already have a file")
+    # Parallel months; 1 (or less) stays in-process
+    parser.add_argument("--workers", type=int, default=4, help="Independent months to process at once, 1 = in-process (default 4)")
     # Parse
     return parser.parse_args()
 
@@ -94,10 +103,36 @@ def append_log(path, row):
         writer.writerow(row)
 
 
-def main():
+def _handle_result(result, log_path, months_done):
+    """Apply one month's export result: skip, log, or count. Prints a line."""
+    # Month label
+    month = result["month"]
+    # Already on disk
+    if result["status"] == "exists":
+        # Same message as the sequential skip
+        print(f"{month}: exists, skipped")
+        # Count it
+        months_done.append(month)
+        # Done
+        return
+    # No Parquet
+    if result["status"] == "no_data":
+        # Same message as the sequential skip
+        print(f"{month}: no processed data, skipped")
+        # Not counted in the manifest
+        return
+    # Written
+    row = result["row"]
+    # Append in caller-determined order
+    append_log(log_path, row)
+    # Count it
+    months_done.append(month)
+    # Print the row, including stage timings
+    print(f"{month}: " + json.dumps(row))
+
+
+def run(args):
     """Loop over months: build, save, verify, log. Then write the manifest."""
-    # Options
-    args = parse_args()
     # Meters in fixed order
     meters = sf.meter_order(args.meters_file, args.exclude_meters)
     # Dates
@@ -108,69 +143,96 @@ def main():
     log_path = os.path.join(args.out_dir, "build_log.csv")
     # Months written or already present
     months_done = []
+    # Workers: 1 or less stays in-process
+    workers = 1 if args.workers < 2 else args.workers
     # Report the setup
-    print(f"{len(meters)} meters, {args.start_date} to {args.end_date}, harmonics {'kept' if args.keep_harmonics else 'dropped'}, out {args.out_dir}")
-    # Loop over months
+    print(f"{len(meters)} meters, {args.start_date} to {args.end_date}, harmonics {'kept' if args.keep_harmonics else 'dropped'}, workers {workers}, out {args.out_dir}")
+    # Months that still need work
+    jobs = []
+    # Loop over months for skip vs work
     for month_start, month_end in spp.month_chunks(start, end):
         # Month label
         month = month_start.strftime("%Y-%m")
         # Target path
         path = os.path.join(args.out_dir, f"{month}.npz")
-        # Skip existing unless forced
-        if os.path.exists(path) and not args.force:
+        # Skip a readable complete file unless forced; rebuild truncated copies
+        if not args.force and sf.npz_is_complete(path, args.keep_harmonics):
             # Say so
             print(f"{month}: exists, skipped")
             # Count it
             months_done.append(month)
             # Next
             continue
-        # Build
-        arrays, stats = sf.build_month(args.processed_dir, month, meters, args.keep_harmonics, args.freq_tolerance)
-        # Nothing for this month
-        if arrays is None:
-            # Say so
-            print(f"{month}: no processed data, skipped")
-            # Next
-            continue
-        # Save
-        path, size = sf.save_month(args.out_dir, month, arrays)
-        # Spot check
-        check = sf.verify_month(path, args.processed_dir, month, meters, args.verify_samples, args.seed) if args.verify_samples > 0 else {"checked": 0}
-        # Log row
-        row = {
-            # Month
-            "month": month,
-            # Slots in the month
-            "slots": int(len(arrays["t"])),
-            # Meters that had a file
-            "meters_with_files": stats["meters_with_files"],
-            # File size in megabytes
-            "size_mb": round(size / 1e6, 1),
-            # Spot-check numbers
-            "checked": check.get("checked", 0),
-            # Worst magnitude error
-            "rms_rel_err": check.get("rms_rel_err", ""),
-            # Worst angle error
-            "ang_err_deg": check.get("ang_err_deg", ""),
-            # Worst frequency error
-            "freq_err_hz": check.get("freq_err_hz", ""),
-            # Frequency disagreements summed over meters
-            "freq_disagreements": sum(stats.get("freq_disagreements", {}).values()),
-            # Share of present readings whose angle passed, over all meters
-            "angle_ok_fraction": round(float(arrays["angle_ok"].sum() / max(int(arrays["mask"].sum()), 1)), 4),
-            # Sampled cells whose angle was rejected
-            "angle_rejected_in_check": check.get("angle_rejected", 0),
-        }
-        # Append
-        append_log(log_path, row)
-        # Count it
-        months_done.append(month)
-        # Print the row
-        print(f"{month}: " + json.dumps(row))
+        # Queue
+        jobs.append(month)
+    # Shared kwargs for every job
+    job_kwargs = dict(
+        processed_dir=args.processed_dir,
+        out_dir=args.out_dir,
+        meters=meters,
+        keep_harmonics=args.keep_harmonics,
+        tolerance=args.freq_tolerance,
+        verify_samples=args.verify_samples,
+        seed=args.seed,
+        force=args.force,
+    )
+    # In-process when one worker or one remaining month
+    use_pool = workers > 1 and len(jobs) > 1
+    # Months that raised; other months still finish
+    errors = []
+    if not use_pool:
+        # Sequential, same order as before
+        for month in jobs:
+            try:
+                # One month
+                result = sf.export_month(month=month, **job_kwargs)
+            except Exception as exc:
+                # Keep going so later months are not abandoned
+                print(f"{month}: failed: {exc}")
+                errors.append((month, exc))
+                # Next
+                continue
+            # Log and print
+            _handle_result(result, log_path, months_done)
+    # Parallel months, results consumed in calendar order so the log is deterministic
+    else:
+        # Bound concurrency to the number of remaining months
+        pool_workers = min(workers, len(jobs))
+        # Process pool; each worker holds one month
+        with ProcessPoolExecutor(max_workers=pool_workers, mp_context=get_context("spawn")) as pool:
+            # Submit all, then wait in month order
+            futures = {month: pool.submit(sf.export_month, month=month, **job_kwargs) for month in jobs}
+            # Calendar order
+            for month in jobs:
+                try:
+                    # Block until this month is done
+                    result = futures[month].result()
+                except Exception as exc:
+                    # Other workers keep running; this month can be retried
+                    print(f"{month}: failed: {exc}")
+                    errors.append((month, exc))
+                    # Next
+                    continue
+                # Log and print
+                _handle_result(result, log_path, months_done)
     # Manifest covering every month present
     manifest_path = sf.write_manifest(args.out_dir, meters, args.keep_harmonics, months_done)
+    # Fail after writing whatever succeeded, so a retry can resume
+    if errors:
+        # Names only
+        failed = ", ".join(month for month, _ in errors)
+        # Chain the first exception
+        raise RuntimeError(f"{len(errors)} month(s) failed: {failed}") from errors[0][1]
     # Done
     print(f"\nWrote {len(months_done)} months. Manifest: {manifest_path}. Log: {log_path}")
+    # Return paths for tests
+    return months_done, manifest_path, log_path
+
+
+def main():
+    """Parse options and run the export."""
+    # Options
+    run(parse_args())
 
 
 # Run only when executed directly

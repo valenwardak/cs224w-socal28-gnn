@@ -14,6 +14,7 @@
 #              python main_socal.py --start-date 2023-08-01 --end-date 2025-09-03
 #              python main_socal.py --data-type magnitudes --channels L1 L2 L3 CT1 CT2 CT3
 #              python main_socal.py --meters-file meters.txt --output-dir data
+#              python main_socal.py --workers 4
 #              python main_socal.py --help
 #
 # Inputs:      meters.txt   one meter name per line, for example egauge_1
@@ -51,6 +52,8 @@ DEFAULT_RETRIES = 2
 DEFAULT_RETRY_WAIT = 30
 # Stop splitting a failed range once it is this many days or fewer
 DEFAULT_MIN_DAYS = 1
+# Meter-month downloads to overlap; threads wait on the network, not extra CPUs
+DEFAULT_WORKERS = 4
 
 
 def parse_args():
@@ -81,6 +84,8 @@ def parse_args():
     parser.add_argument("--retry-wait", type=int, default=DEFAULT_RETRY_WAIT, help="seconds between retries")
     # Smallest range to split down to
     parser.add_argument("--min-days", type=int, default=DEFAULT_MIN_DAYS, help="stop splitting at this many days")
+    # How many meter-month requests to overlap
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="parallel meter-month downloads (threads, not processes); 1 = sequential")
     # Parse and return
     return parser.parse_args()
 
@@ -98,7 +103,7 @@ def main():
     # Create the Caltech client (first run opens the GitHub sign-in)
     client = sd.make_client(args.credentials_file)
     # Download everything
-    missing = sd.download_all(client, args.output_dir, meters, args.data_type, args.channels, start_date, end_date, args.retries, args.retry_wait, args.min_days)
+    missing = sd.download_all(client, args.output_dir, meters, args.data_type, args.channels, start_date, end_date, args.retries, args.retry_wait, args.min_days, args.workers)
     # Summary of channels that never came back
     print(f"Finished. Meters with missing channels: {len(missing)}. See {args.output_dir}/{sd.MISSING_FILE}")
 

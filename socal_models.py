@@ -7,7 +7,7 @@
 #
 # Purpose:     The learned models and everything around them: the shared
 #              meter-conditioned GRU, the three GNNs built on top of it
-#              (GCN, GAT, GraphSAGE), the persistence baseline, the loss,
+#              (GCN, GAT, GraphSAGE, RGCN), the persistence baseline, the loss,
 #              the training loop with checkpoints, and the scoring that
 #              writes a residual per slot, meter, and channel. The data
 #              side lives in socal_modeldata.py. Imported by the thin main
@@ -54,7 +54,8 @@
 #              undirected, stored in both directions. GCN uses the scalar
 #              admittance_abs as the edge weight, GAT takes it as a one-
 #              number edge feature, GraphSAGE ignores weights (mean of
-#              neighbors). --edges none|random|true and --edge-weights
+#              neighbors), RGCN uses Line vs Transformer as two relations.
+#              --edges none|random|true and --edge-weights
 #              binary|admittance give the topology ablation. Two limits of
 #              that ablation, stated so nobody over-reads it: with "none",
 #              meters that share a node (19 and 21) are still averaged
@@ -115,7 +116,7 @@
 #     meter_node_index(graph, manifest)
 #                                     (M,) node index per meter
 #     build_edges(graph, mode, weights, seed)
-#                                     edge_index (2, E) and edge_weight (E,) tensors
+#                                     edge_index (2, E), edge_weight (E,), edge_type (E,)
 #   Models
 #     zero_head(layer)                start a head at zero weights, for predict-delta
 #     MeterGRU                        shared meter-conditioned GRU with a forecast head
@@ -134,19 +135,35 @@
 #     train(...)                      epochs over the train split, early stopping, checkpoints
 #     save_checkpoint / load_checkpoint / save_atomic
 #   Scoring
+#     rss_mb()                        resident set size in megabytes, for scoring logs
+#     residual_piece_dir(out_dir, label)
+#                                     folder for one block's per-month parquet files
+#     combine_residual_pieces(...)    stream month files into the combined parquet
+#     summarize_residual_paths(...)   median and p99 from month files, one kind at a time
+#     write_residual_summary(...)     <label>.json next to the combined parquet
 #     score_split(...)                residual tables per block, written to disk
 # =============================================================================
 
 # Standard library: JSON for graph and summaries
 import json
+# Standard library: garbage collection after each scored month, so the next month does not sit on top of the last
+import gc
 # Standard library: paths
 import os
+# Standard library: peak and current RSS for the scoring memory log
+import resource
+# Standard library: platform check for RSS units
+import sys
 # Standard library: timing
 import time
+# Standard library: traceback text in scoring failure logs
+import traceback
 # Third party: numerics
 import numpy as np
 # Third party: tables for the residual output
 import pandas as pd
+# Third party: streaming parquet combine, so the five test_normal months are never all in RAM
+import pyarrow.parquet as pq
 # Third party: deep learning
 import torch
 # Third party: layers
@@ -309,16 +326,17 @@ def build_edges(graph, mode="true", weights="admittance", seed=0):
               "none"   no edges, message passing sees only self-loops
       weights "admittance" admittance_abs scaled to a 0 to 1 range by its
                            maximum, "binary" all ones
-    Returns (edge_index LongTensor (2, E), edge_weight FloatTensor (E,)).
+    Returns (edge_index LongTensor (2, E), edge_weight FloatTensor (E,),
+             edge_type LongTensor (E,)), Line = 0, Transformer = 1.
     """
     # Node count
     n = len(graph["nodes"])
-    # Source, target, weight lists
-    src, dst, w = [], [], []
+    # Source, target, weight, relation lists
+    src, dst, w, rel = [], [], [], []
     # Loop over edges
     for e in graph["edges"]:
         # Ends
-        src.append(e["source"]); dst.append(e["target"]); w.append(float(e["admittance_abs"]))
+        src.append(e["source"]); dst.append(e["target"]); w.append(float(e["admittance_abs"])); rel.append(0 if e["type"] == "Line" else 1)
     # Random rewiring keeps the edge count
     if mode == "random":
         # Generator
@@ -338,7 +356,7 @@ def build_edges(graph, mode="true", weights="admittance", seed=0):
     # No edges at all
     elif mode == "none":
         # Empty
-        src, dst, w = [], [], []
+        src, dst, w, rel = [], [], [], []
     # Weights
     if weights == "binary" or not w:
         # All ones
@@ -353,8 +371,10 @@ def build_edges(graph, mode="true", weights="admittance", seed=0):
     edge_index = torch.tensor([src + dst, dst + src], dtype=torch.long).reshape(2, -1)
     # Weights for both directions
     edge_weight = torch.tensor(w + w, dtype=torch.float32)
+    # Types for both directions
+    edge_type = torch.tensor(rel + rel, dtype=torch.long)
     # Return
-    return edge_index, edge_weight
+    return edge_index, edge_weight, edge_type
 
 
 # -----------------------------------------------------------------------------
@@ -455,18 +475,18 @@ class GraphForecaster(nn.Module):
     grid graph, and a head that reads each meter's own state together with
     its node's mixed state.
 
-    kind: "gcn", "gat", or "sage". Needs torch_geometric. gnn_layers is
+    kind: "gcn", "gat", "sage", or "rgcn". Needs torch_geometric. gnn_layers is
     the number of message-passing hops; one hop does not reach a meter
     that sits two edges away behind an unmetered node.
     """
 
-    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_index, edge_weight, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True):
+    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_index, edge_weight, n_relations, edge_type, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True):
         # Base class
         super().__init__()
         # Whether the head outputs a correction to the persistence forecast
         self.predict_delta = predict_delta
         # Layers from PyTorch Geometric, imported here so the GRU runs without it
-        from torch_geometric.nn import GCNConv, GATConv, SAGEConv
+        from torch_geometric.nn import GCNConv, GATConv, SAGEConv, RGCNConv
         # Sizes
         self.C, self.hidden, self.n_nodes, self.kind = n_channels, hidden, n_nodes, kind
         # Shared encoder
@@ -477,6 +497,8 @@ class GraphForecaster(nn.Module):
         self.register_buffer("edge_index", edge_index)
         # Weights, fixed
         self.register_buffer("edge_weight", edge_weight)
+        # Relation ids, fixed
+        self.register_buffer("edge_type", edge_type)
         # Learned vector for nodes without a meter
         self.unmetered = nn.Parameter(torch.zeros(hidden))
         # Message passing layers, gnn_layers of them, each one hop
@@ -493,6 +515,9 @@ class GraphForecaster(nn.Module):
             elif kind == "sage":
                 # Mean of neighbors, no weights
                 convs.append(SAGEConv(hidden, hidden))
+            elif kind == "rgcn":
+                # Separate weights per relation
+                convs.append(RGCNConv(hidden, hidden, n_relations))
             else:
                 # Unknown
                 raise ValueError(f"unknown GNN kind: {kind}")
@@ -513,6 +538,18 @@ class GraphForecaster(nn.Module):
         # Keep
         self.register_buffer("node_count", counts)
 
+    def _batched_edges(self, B):
+        """
+        Stack B copies of the graph's edges by broadcasting node offsets.
+        Returns edge_index (2, B * E), edge_weight (B * E,), edge_type (B * E,).
+        """
+        # Node id shift per copy: 0, n_nodes, 2 * n_nodes, ...
+        offsets = torch.arange(B, device=self.edge_index.device) * self.n_nodes
+        # (2, E) + (B,) -> (2, B, E) -> (2, B * E), copies laid out in order
+        ei = (self.edge_index.unsqueeze(1) + offsets.view(1, -1, 1)).reshape(2, -1)
+        # Weights and types repeated in the same copy order
+        return ei, self.edge_weight.repeat(B), self.edge_type.repeat(B)
+
     def forward(self, x):
         """
         x (B, H, M, C * F) -> forecast (B, M, C, 3).
@@ -532,11 +569,7 @@ class GraphForecaster(nn.Module):
         # Average nodes with more than one meter
         nodes = nodes / self.node_count.clamp(min=1)[None, :, None]
         # Message passing per example: PyG works on one graph at a time, so batch by stacking graphs
-        offsets = torch.arange(B, device=x.device) * self.n_nodes
-        # Edge index for the stacked graphs
-        ei = torch.cat([self.edge_index + o for o in offsets], dim=1)
-        # Weights repeated
-        ew = self.edge_weight.repeat(B)
+        ei, ew, et = self._batched_edges(B)
         # Stacked node features
         mixed = nodes.reshape(B * self.n_nodes, self.hidden)
         # Each layer is one hop, with a residual connection
@@ -548,6 +581,9 @@ class GraphForecaster(nn.Module):
             elif self.kind == "gat":
                 # Weight as a feature
                 out = conv(mixed, ei, edge_attr=ew[:, None])
+            elif self.kind == "rgcn":
+                # Typed
+                out = conv(mixed, ei, edge_type=et)
             else:
                 # Unweighted
                 out = conv(mixed, ei)
@@ -675,7 +711,7 @@ def residuals(y_hat, y, y_valid):
 # -----------------------------------------------------------------------------
 
 def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True):
-    """Build a model by name: "gru", "gcn", "gat", or "sage"."""
+    """Build a model by name: "gru", "gcn", "gat", "sage", or "rgcn"."""
     # Sizes
     M, C = len(manifest["meters"]), len(manifest["channels"])
     # Plain GRU
@@ -689,9 +725,11 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
     # Meter placement
     meter_node = meter_node_index(graph, manifest)
     # Edges
-    edge_index, edge_weight = build_edges(graph, edges, edge_weights, seed)
+    edge_index, edge_weight, edge_type = build_edges(graph, edges, edge_weights, seed)
+    # Relation count from the graph
+    n_relations = len({e["type"] for e in graph["edges"]})
     # Build
-    return GraphForecaster(kind, M, C, len(graph["nodes"]), meter_node, edge_index, edge_weight, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta)
+    return GraphForecaster(kind, M, C, len(graph["nodes"]), meter_node, edge_index, edge_weight, n_relations, edge_type, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta)
 
 
 def new_sums():
@@ -715,10 +753,16 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None):
     One pass over an iterable of tensor batches already on the device.
     With an optimizer, trains; without, evaluates. Adds squared-error sums
     and valid counts into `sums` (see new_sums), so the caller can pool
-    over any number of pieces without batch-size bias.
+    over any number of pieces without batch-size bias. Accumulators stay on
+    the device until the pass ends; per-meter stats are evaluation-only.
     """
     # Mode
-    model.train(optimizer is not None)
+    train = optimizer is not None
+    model.train(train)
+    # Device-side pooled sums, created on the first batch
+    mag_se_t = mag_n_t = ang_se_t = ang_n_t = None
+    # Per-meter sums, evaluation only
+    per_se_t = per_n_t = seen = None
     # Loop
     for x, y, y_valid, extra in batches:
         # Forward
@@ -726,7 +770,7 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None):
         # Loss for the gradient step, batch-level means are fine for optimization
         loss, _, _ = masked_loss(y_hat, y, y_valid, angle_weight)
         # Train step
-        if optimizer is not None:
+        if train:
             # Clear
             optimizer.zero_grad()
             # Backward
@@ -735,7 +779,7 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             # Step
             optimizer.step()
-        # Bookkeeping without gradient
+        # Bookkeeping without gradient; stay on the device until the pass ends
         with torch.no_grad():
             # Validity as floats
             mv = y_valid[..., 0].float()
@@ -745,31 +789,60 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None):
             mag_se = ((y_hat[..., 0] - y[..., 0]) ** 2) * mv
             # Angle
             ang_se = ((y_hat[..., 1:3] - y[..., 1:3]) ** 2).sum(dim=-1) * av
-            # Pooled sums
-            sums["mag_se"] += float(mag_se.sum()); sums["mag_n"] += float(mv.sum())
-            # Angle
-            sums["ang_se"] += float(ang_se.sum()); sums["ang_n"] += float(av.sum())
-            # Per meter, magnitude only
-            if graph_mode:
-                # Every meter in every example
-                per_se = mag_se.sum(dim=(0, 2)).cpu().numpy()
-                # Counts
-                per_n = mv.sum(dim=(0, 2)).cpu().numpy()
-                # Meter ids are positions
-                ids = range(len(per_se))
+            # First batch starts the device accumulators as float64, matching
+            # the original per-batch float() promotion before adding
+            if mag_se_t is None:
+                mag_se_t = mag_se.sum().double()
+                mag_n_t = mv.sum().double()
+                ang_se_t = ang_se.sum().double()
+                ang_n_t = av.sum().double()
             else:
-                # One meter per example
-                per_se = mag_se.sum(dim=1).cpu().numpy()
-                # Counts
-                per_n = mv.sum(dim=1).cpu().numpy()
-                # Meter ids from the batch
-                ids = extra.cpu().numpy()
-            # Add
-            for mi, se, n in zip(ids, per_se, per_n):
-                # Error
-                sums["per_meter_se"][int(mi)] = sums["per_meter_se"].get(int(mi), 0.0) + float(se)
-                # Count
-                sums["per_meter_n"][int(mi)] = sums["per_meter_n"].get(int(mi), 0.0) + float(n)
+                mag_se_t += mag_se.sum().double()
+                mag_n_t += mv.sum().double()
+                ang_se_t += ang_se.sum().double()
+                ang_n_t += av.sum().double()
+            # Per meter only when reporting, not when training
+            if not train:
+                if graph_mode:
+                    # Every meter in every example
+                    se = mag_se.sum(dim=(0, 2)).double()
+                    n = mv.sum(dim=(0, 2)).double()
+                    if per_se_t is None:
+                        per_se_t, per_n_t = se, n
+                    else:
+                        per_se_t += se
+                        per_n_t += n
+                else:
+                    # One meter per example
+                    if per_se_t is None:
+                        n_meters = model.meter_embed.num_embeddings
+                        per_se_t = torch.zeros(n_meters, dtype=torch.float64, device=x.device)
+                        per_n_t = torch.zeros(n_meters, dtype=torch.float64, device=x.device)
+                        seen = torch.zeros(n_meters, dtype=torch.bool, device=x.device)
+                    ids = extra.long()
+                    per_se_t.index_add_(0, ids, mag_se.sum(dim=1).double())
+                    per_n_t.index_add_(0, ids, mv.sum(dim=1).double())
+                    seen[ids] = True
+    # Transfer pooled sums once per pass
+    if mag_se_t is not None:
+        sums["mag_se"] += float(mag_se_t)
+        sums["mag_n"] += float(mag_n_t)
+        sums["ang_se"] += float(ang_se_t)
+        sums["ang_n"] += float(ang_n_t)
+    # Per-meter dict, same keys as the original per-batch loop
+    if per_se_t is not None:
+        if graph_mode:
+            ids = range(per_se_t.shape[0])
+            se_np = per_se_t.cpu().numpy()
+            n_np = per_n_t.cpu().numpy()
+        else:
+            idx = seen.nonzero(as_tuple=False).view(-1)
+            ids = idx.cpu().numpy()
+            se_np = per_se_t[idx].cpu().numpy()
+            n_np = per_n_t[idx].cpu().numpy()
+        for mi, se, n in zip(ids, se_np, n_np):
+            sums["per_meter_se"][int(mi)] = sums["per_meter_se"].get(int(mi), 0.0) + float(se)
+            sums["per_meter_n"][int(mi)] = sums["per_meter_n"].get(int(mi), 0.0) + float(n)
 
 
 def make_dataset(piece, graph_mode, history, horizon, max_gap, min_meters=1):
@@ -997,6 +1070,181 @@ def train(model, features_dir, splits, scale, manifest, device, options, checkpo
 # Scoring
 # -----------------------------------------------------------------------------
 
+def rss_mb():
+    """
+    Resident set size in megabytes. Prefers current RSS from /proc; falls
+    back to getrusage, whose units are bytes on macOS and kilobytes on Linux.
+    """
+    # Linux current RSS
+    try:
+        # Status file
+        with open("/proc/self/status") as f:
+            # Each line
+            for line in f:
+                # Current resident set
+                if line.startswith("VmRSS:"):
+                    # kB -> MB
+                    return float(line.split()[1]) / 1024.0
+    # Missing /proc, including macOS
+    except OSError:
+        # Fall through
+        pass
+    # Peak RSS from the kernel
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports bytes
+    if sys.platform == "darwin":
+        # Bytes -> MB
+        return rss / (1024.0 * 1024.0)
+    # Linux peak is kilobytes
+    return rss / 1024.0
+
+
+def residual_piece_dir(out_dir, label):
+    """Folder for one block's per-month parquet files, not listed by main_score.py."""
+    # Under _pieces so top-level glob of <prefix>*.parquet stays the combined files
+    return os.path.join(out_dir, "_pieces", label)
+
+
+def combine_residual_pieces(piece_paths, dest, log):
+    """
+    Stream month parquet files into dest without concatenating them in pandas.
+    Writes dest via a temp file then os.replace, so a crash never leaves a
+    half combined table that a later run would skip. piece_paths must be
+    non-empty and share a schema. Returns the number of rows written.
+    """
+    # Nothing to combine is a scoring bug, not an empty result
+    if not piece_paths:
+        # Fail
+        raise RuntimeError("no month parquet files to combine")
+    # Temporary next to the destination, same filesystem so replace is atomic
+    tmp = dest + ".tmp"
+    # Row count
+    n_rows = 0
+    # Write, and always drop a leftover temp on failure
+    try:
+        # Disk size, for the log; a missing piece must land in the same FAILED log as a later error
+        nbytes = sum(os.path.getsize(p) for p in piece_paths)
+        # Announce before the write, the step that used to OOM with no message
+        log(f"combining {len(piece_paths)} month files into {dest} ({nbytes / 1e6:.1f} MB on disk, rss {rss_mb():.0f} MB)")
+        # Schema from the first month, including pandas index metadata
+        schema = pq.ParquetFile(piece_paths[0]).schema_arrow
+        # Writer
+        writer = pq.ParquetWriter(tmp, schema)
+        # Each month, one at a time
+        try:
+            # Loop
+            for path in piece_paths:
+                # Open
+                pf = pq.ParquetFile(path)
+                # Batches, not the whole month as a pandas frame
+                for batch in pf.iter_batches(batch_size=65536):
+                    # Count
+                    n_rows += batch.num_rows
+                    # Append
+                    writer.write_batch(batch)
+                # Progress
+                log(f"  appended {path}: {pf.metadata.num_rows} rows, rss {rss_mb():.0f} MB")
+        # Close the writer before replace
+        finally:
+            # Close
+            writer.close()
+        # Empty combined file cannot be scored
+        if n_rows == 0:
+            # Drop the temp
+            os.remove(tmp)
+            # Fail
+            raise RuntimeError(f"combined residual table would be empty: {dest}")
+        # Atomic publish
+        os.replace(tmp, dest)
+        # Done
+        log(f"combined {n_rows} rows into {dest}, rss {rss_mb():.0f} MB")
+        # Count
+        return n_rows
+    # Any failure: say why, drop the temp, re-raise
+    except Exception as exc:
+        # Leftover temp
+        if os.path.exists(tmp):
+            # Remove
+            os.remove(tmp)
+        # Diagnostic, including the exception type Colab used to swallow
+        log(f"FAILED combining into {dest}: {type(exc).__name__}: {exc}; rss {rss_mb():.0f} MB; pieces {piece_paths}")
+        # Stack
+        log(traceback.format_exc())
+        # Re-raise
+        raise
+
+
+def summarize_residual_paths(piece_paths, suffix):
+    """
+    Finite values of every column whose name ends with suffix, from month
+    parquet files, without loading the whole split. One month's matching
+    columns are in RAM at a time, then concatenated for the percentile.
+    """
+    # Pieces
+    chunks = []
+    # Each month file
+    for path in piece_paths:
+        # Names in this file
+        names = pq.ParquetFile(path).schema_arrow.names
+        # Matching columns
+        cols = [n for n in names if n.endswith(suffix)]
+        # None
+        if not cols:
+            # Next
+            continue
+        # Those columns only
+        arr = pq.read_table(path, columns=cols).to_pandas().to_numpy().ravel()
+        # Finite
+        arr = arr[np.isfinite(arr)]
+        # Keep
+        if len(arr):
+            # One 1-D piece
+            chunks.append(arr)
+    # Nothing
+    if not chunks:
+        # Empty
+        return np.array([], dtype=np.float64)
+    # One array for median and percentile
+    return np.concatenate(chunks)
+
+
+def write_residual_summary(piece_paths, label, options, n_rows, out_dir, log):
+    """Write <label>.json from the month files, not from a concatenated frame."""
+    # Magnitude residuals
+    mag_vals = summarize_residual_paths(piece_paths, "|mag_res")
+    # Angle
+    ang_vals = summarize_residual_paths(piece_paths, "|ang_res")
+    # Persistence magnitude
+    pm_vals = summarize_residual_paths(piece_paths, "|pers_mag_res")
+    # Summary, same keys as before
+    summary = {
+        # Label
+        "label": label, "slots": int(n_rows), "model": options["kind"],
+        # Magnitude residual in scaled units
+        "mag_res_median": float(np.median(mag_vals)) if len(mag_vals) else None,
+        # 99th percentile
+        "mag_res_p99": float(np.percentile(mag_vals, 99)) if len(mag_vals) else None,
+        # Angle residual in degrees
+        "ang_res_median": float(np.median(ang_vals)) if len(ang_vals) else None,
+        # 99th percentile
+        "ang_res_p99": float(np.percentile(ang_vals, 99)) if len(ang_vals) else None,
+        # Persistence for comparison
+        "pers_mag_res_median": float(np.median(pm_vals)) if len(pm_vals) else None,
+        # Options
+        "options": options,
+    }
+    # Path
+    path = os.path.join(out_dir, f"{label}.json")
+    # Write
+    with open(path, "w") as f:
+        # Pretty JSON
+        json.dump(summary, f, indent=2, default=str)
+    # Report
+    log(f"wrote {path}: {n_rows} slots, mag_res median {summary['mag_res_median']}, persistence {summary['pers_mag_res_median']}")
+    # Return for tests
+    return summary
+
+
 def score_split(model, features_dir, splits, split_name, scale, manifest, device, options, out_dir, log):
     """
     Write one residual table per block of a split:
@@ -1007,6 +1255,15 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
         percentile of mag_res and ang_res, options used
     Every slot that is the target of a usable window gets a row; other
     slots are absent, never written as zero.
+
+    Each month is written under <out_dir>/_pieces/<label>/<YYYY-MM>.parquet
+    as soon as it finishes, then dropped from RAM. The combined parquet is
+    streamed from those files with pyarrow, never pd.concat of the whole
+    split. Re-running skips months that already have a piece and blocks that
+    already have a combined parquet. Progress and RSS are logged at the
+    start of each month, every 100 batches, and around the combine. A block
+    that still lacks month files after scoring raises instead of writing a
+    partial combined table.
     """
     # Graph models take synchronized batches
     graph_mode = options["kind"] != "gru"
@@ -1018,18 +1275,50 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
     os.makedirs(out_dir, exist_ok=True)
     # Eval mode
     model.eval()
-    # Collect per block label
-    tables = {}
+    # Blocks of this split, label -> block
+    blocks = {f"{split_name}_{b['start']}_{b['end']}": b for b in splits[split_name]}
+    # Combined parquet already on disk, skip the whole block
+    done = {label for label in blocks if os.path.exists(os.path.join(out_dir, f"{label}.parquet"))}
+    # Report skips
+    for label in sorted(done):
+        # Already written
+        log(f"skip {label}: {os.path.join(out_dir, label + '.parquet')} already exists")
     # No gradient
     with torch.no_grad():
         # Loop over pieces
         for label, month, t, X, mag_valid, ang_valid in sd.iter_blocks(features_dir, splits, split_name, scale, manifest=manifest):
+            # Combined file already written
+            if label in done:
+                # Next
+                continue
+            # Piece folder
+            piece_dir = residual_piece_dir(out_dir, label)
+            # Make it
+            os.makedirs(piece_dir, exist_ok=True)
+            # This month
+            piece_path = os.path.join(piece_dir, f"{month}.parquet")
+            # Marker for a month with no usable window
+            skip_path = os.path.join(piece_dir, f"{month}.skip")
+            # Resume: month already scored
+            if os.path.exists(piece_path) or os.path.exists(skip_path):
+                # Say so
+                log(f"  resume {label} {month}: already on disk, rss {rss_mb():.0f} MB")
+                # Next
+                continue
             # Dataset, every meter kept so residuals exist wherever a meter is usable
             ds = make_dataset((label, month, t, X, mag_valid, ang_valid), graph_mode, options["history"], options["horizon"], options["max_gap"], min_meters=1)
             # Nothing
             if ds is None:
+                # Record the empty month so a later combine knows it was tried
+                open(skip_path, "w").close()
+                # Say so
+                log(f"  no windows in {label} {month}, wrote {skip_path}, rss {rss_mb():.0f} MB")
                 # Next
                 continue
+            # Batch count, for the progress line
+            n_batches = (len(ds) + options["batch_size"] - 1) // options["batch_size"]
+            # Announce before the long loop
+            log(f"  scoring {label} {month}: {len(ds)} windows, {n_batches} batches, rss {rss_mb():.0f} MB")
             # Batches in order
             loader = iter_batches(ds, options["batch_size"], False, np.random.default_rng(0), device)
             # Result arrays over the piece, NaN where no residual
@@ -1039,7 +1328,11 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
             # Position in the dataset
             pos = 0
             # Loop over batches
-            for x, y, y_valid, extra in loader:
+            for bi, (x, y, y_valid, extra) in enumerate(loader):
+                # First, last, and every 100th batch
+                if bi == 0 or (bi + 1) % 100 == 0 or (bi + 1) == n_batches:
+                    # Progress
+                    log(f"    {label} {month} batch {bi + 1}/{n_batches}, rss {rss_mb():.0f} MB")
                 # Forecast
                 y_hat = model(x) if graph_mode else model(x, extra)
                 # Persistence forecast and whether the history held anything to copy
@@ -1102,50 +1395,53 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
             table = pd.DataFrame(cols, index=pd.to_datetime(t[scored], unit="s", utc=True))
             # Index name
             table.index.name = "t_utc"
-            # Append to the block
-            tables.setdefault(label, []).append(table)
+            # Atomic month write: temp then replace, so a crash does not leave a half piece
+            tmp = piece_path + ".tmp"
+            # Save
+            table.to_parquet(tmp)
+            # Publish
+            os.replace(tmp, piece_path)
             # Progress
-            log(f"  scored {label} {month}: {int(scored.sum())} slots")
-    # Write per block
-    for label, parts in tables.items():
-        # Stack months
-        table = pd.concat(parts).sort_index()
-        # Path
-        path = os.path.join(out_dir, f"{label}.parquet")
-        # Save
-        table.to_parquet(path)
-        # Summary over all mag_res and ang_res columns
-        mag_cols = [c for c in table.columns if c.endswith("|mag_res")]
-        # Angle columns
-        ang_cols = [c for c in table.columns if c.endswith("|ang_res")]
-        # Values
-        mag_vals = table[mag_cols].to_numpy().ravel(); mag_vals = mag_vals[np.isfinite(mag_vals)]
-        # Angles
-        ang_vals = table[ang_cols].to_numpy().ravel(); ang_vals = ang_vals[np.isfinite(ang_vals)]
-        # Persistence
-        pm_cols = [c for c in table.columns if c.endswith("|pers_mag_res")]
-        # Values
-        pm_vals = table[pm_cols].to_numpy().ravel(); pm_vals = pm_vals[np.isfinite(pm_vals)]
-        # Summary
-        summary = {
-            # Label
-            "label": label, "slots": int(len(table)), "model": options["kind"],
-            # Magnitude residual in scaled units
-            "mag_res_median": float(np.median(mag_vals)) if len(mag_vals) else None,
-            # 99th percentile
-            "mag_res_p99": float(np.percentile(mag_vals, 99)) if len(mag_vals) else None,
-            # Angle residual in degrees
-            "ang_res_median": float(np.median(ang_vals)) if len(ang_vals) else None,
-            # 99th percentile
-            "ang_res_p99": float(np.percentile(ang_vals, 99)) if len(ang_vals) else None,
-            # Persistence for comparison
-            "pers_mag_res_median": float(np.median(pm_vals)) if len(pm_vals) else None,
-            # Options
-            "options": options,
-        }
-        # Write
-        with open(os.path.join(out_dir, f"{label}.json"), "w") as f:
-            # Pretty JSON
-            json.dump(summary, f, indent=2, default=str)
+            log(f"  scored {label} {month}: {int(scored.sum())} slots, wrote {piece_path}, rss {rss_mb():.0f} MB")
+            # Drop the month before the next one loads
+            del table, cols, res, val, ds, X, mag_valid, ang_valid, t
+            # Collect
+            gc.collect()
+            # GPU cache, when present
+            if torch.cuda.is_available():
+                # Free unused blocks
+                torch.cuda.empty_cache()
+    # Combine month pieces into one parquet per block that is not already done
+    for label, block in blocks.items():
+        # Already written
+        if label in done:
+            # Next
+            continue
+        # Expected months in this block
+        months = sd.months_in_block(block)
+        # Piece folder
+        piece_dir = residual_piece_dir(out_dir, label)
+        # Months with a table
+        present = [m for m in months if os.path.exists(os.path.join(piece_dir, f"{m}.parquet"))]
+        # Months tried and empty
+        skipped = [m for m in months if os.path.exists(os.path.join(piece_dir, f"{m}.skip"))]
+        # Still running or crashed before this month was recorded
+        missing = [m for m in months if m not in present and m not in skipped]
+        # Incomplete: do not write a partial combined file that main_score.py would treat as the whole block
+        if missing:
+            # Fail with the cause and how to resume
+            raise RuntimeError(f"incomplete {label}: still need months {missing}; re-run --score-only --score-splits {split_name} (month pieces are kept under {piece_dir}), rss {rss_mb():.0f} MB")
+        # No rows in any month
+        if not present:
+            # Fail with the cause
+            raise RuntimeError(f"scored {split_name} block {label} but every month had no usable windows; not writing an empty parquet")
+        # Paths in time order
+        piece_paths = [os.path.join(piece_dir, f"{m}.parquet") for m in present]
+        # Combined destination
+        dest = os.path.join(out_dir, f"{label}.parquet")
+        # Stream, never pd.concat of all months
+        n_rows = combine_residual_pieces(piece_paths, dest, log)
+        # JSON from the month files
+        write_residual_summary(piece_paths, label, options, n_rows, out_dir, log)
         # Report
-        log(f"wrote {path}: {len(table)} slots, mag_res median {summary['mag_res_median']}, persistence {summary['pers_mag_res_median']}")
+        log(f"wrote {dest}: {n_rows} slots")

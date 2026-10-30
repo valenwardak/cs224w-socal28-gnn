@@ -67,26 +67,40 @@
 #     meter_order(meters_file, exclude)          meters in fixed order, excluded ones removed
 #     load_meter_month(processed_dir, month, meter, keep_harmonics)
 #                                                one meter-month Parquet, needed columns only
+#     load_month_tables(processed_dir, month, meters, keep_harmonics)
+#                                                every meter-month Parquet, None when missing
 #   Building arrays
 #     wrap_degrees(angle)                        wrap to (-180, 180]
 #     aligned_angle(ang, freq, toff, harmonic)   shift an angle to the slot time
 #     meter_frequency(table, meter)              one frequency per slot from the voltage channels
+#     build_month_from_tables(tables, month, meters, keep_harmonics, tolerance)
+#                                                arrays from already-loaded tables
 #     build_month(processed_dir, month, meters, keep_harmonics, tolerance)
 #                                                all arrays for one month, plus a stats dict
 #   Writing and checking
-#     save_month(out_dir, month, arrays)         write <month>.npz, return path and size
+#     npz_is_complete(path, keep_harmonics)      True when a written .npz is readable and complete
+#     save_month(out_dir, month, arrays)         write <month>.npz (ZIP DEFLATE level 1), atomic replace
 #     write_manifest(out_dir, meters, keep_harmonics, months, version)
 #                                                write manifest.json
-#     verify_month(path, processed_dir, month, meters, n_samples, seed)
+#     verify_month(path, processed_dir, month, meters, n_samples, seed, arrays, tables)
 #                                                compare stored values against the Parquet
+#     export_month(...)                          build, save, verify one month; timing and skip/resume
 # =============================================================================
 
 # Standard library: JSON for the manifest
 import json
 # Standard library: file and folder operations
 import os
+# Standard library: unique temp files for atomic writes
+import tempfile
+# Standard library: timing one month's stages
+import time
+# Standard library: ZIP DEFLATE for .npz
+import zipfile
 # Third party: numerics
 import numpy as np
+# Third party: npy format writer used inside .npz
+from numpy.lib.format import write_array
 # Third party: tables and Parquet reading
 import pandas as pd
 # Third party: Parquet schema reading, to pick columns before loading
@@ -106,6 +120,13 @@ VOLTAGE_CHANNELS = ("L1", "L2", "L3")
 HARMONIC_COLUMNS = {0: ("rms", "ang0"), 1: ("mag1", "ang1"), 2: ("mag2", "ang2")}
 # Format version written into the manifest, bump when the layout changes
 VERSION = "1"
+# ZIP DEFLATE level for .npz; 1 is much faster than numpy's default of 6
+# and still np.load-compatible
+NPZ_COMPRESSLEVEL = 1
+# Arrays every written month file must contain
+REQUIRED_NPZ = ("t", "rms", "ang", "freq", "mask", "angle_ok")
+# Extra arrays when harmonics were requested
+HARMONIC_NPZ = ("mag1", "ang1", "mag2", "ang2")
 
 
 # -----------------------------------------------------------------------------
@@ -149,8 +170,13 @@ def load_meter_month(processed_dir, month, meter, keep_harmonics):
     wanted += [c for c in names if c.startswith(f"mask{SEP}{meter}{SEP}")]
     # Offset column
     wanted += [c for c in names if c == f"{meter}{SEP}{TOFF}"]
-    # Read
+    # pandas restores the datetime index even when columns= is set
     return pd.read_parquet(path, columns=wanted)
+
+
+def load_month_tables(processed_dir, month, meters, keep_harmonics):
+    """Read every meter-month Parquet, None when a meter has no file."""
+    return {meter: load_meter_month(processed_dir, month, meter, keep_harmonics) for meter in meters}
 
 
 # -----------------------------------------------------------------------------
@@ -179,6 +205,25 @@ def aligned_angle(ang, freq, toff, harmonic):
     return wrap_degrees(ang - shift)
 
 
+def _column_to_numpy(table, col, dtype, length, fill=np.nan):
+    """
+    Convert one table column to a numpy array. Missing columns become
+    `fill`. fillna is used only when the series actually has NA.
+    """
+    # Column absent
+    if col not in table.columns:
+        # Default
+        return np.full(length, fill, dtype=dtype)
+    # Series
+    series = table[col]
+    # Boolean masks and similar need NA filled; value columns keep NaN
+    if series.hasnans and not (isinstance(fill, float) and np.isnan(fill)):
+        # Fill then convert
+        series = series.fillna(fill)
+    # copy=False is a no-op when a dtype change is required
+    return series.to_numpy(dtype=dtype, copy=False)
+
+
 def meter_frequency(table, meter):
     """
     One frequency per slot for a meter: the first present voltage
@@ -188,25 +233,36 @@ def meter_frequency(table, meter):
     """
     # Voltage frequency columns that exist, in order
     cols = [f"{meter}{SEP}{c}{SEP}freq" for c in VOLTAGE_CHANNELS if f"{meter}{SEP}{c}{SEP}freq" in table.columns]
+    # Length
+    n = len(table)
     # No voltage frequency at all
     if not cols:
         # All NaN
-        return np.full(len(table), np.nan, dtype=np.float64)
-    # Side-by-side frame
-    frame = table[cols].astype("float64")
+        return np.full(n, np.nan, dtype=np.float64)
+    # Empty table
+    if n == 0:
+        return np.full(0, np.nan, dtype=np.float64)
+    # Side-by-side array, same order as L1, L2, L3
+    stacked = np.column_stack([table[c].to_numpy(dtype=np.float64, copy=False) for c in cols])
+    # Finite flags
+    finite = np.isfinite(stacked)
+    # First present channel per slot (0 when none are present)
+    first = finite.argmax(axis=1)
+    # Gather
+    out = stacked[np.arange(n, dtype=np.intp), first]
+    # Slots with no voltage frequency stay NaN
+    out[~finite.any(axis=1)] = np.nan
     # First present value per slot
-    return frame.bfill(axis=1).iloc[:, 0].to_numpy(dtype=np.float64)
+    return out
 
 
-def build_month(processed_dir, month, meters, keep_harmonics, tolerance):
+def build_month_from_tables(tables, month, meters, keep_harmonics, tolerance):
     """
-    Build the arrays for one month. Returns (arrays, stats) where arrays
-    is a dictionary ready for save_month and stats holds per-meter
-    presence fractions and frequency disagreement counts. Returns
-    (None, stats) when no meter has a file for the month.
+    Build the arrays for one month from already-loaded tables. Aligns
+    tables to the shared grid in place when needed so a later spot-check
+    can reuse them. Returns (arrays, stats), or (None, stats) when no
+    meter has a file.
     """
-    # Tables per meter, None when missing
-    tables = {m: load_meter_month(processed_dir, month, m, keep_harmonics) for m in meters}
     # The grid comes from any meter that exists, all share the same month grid
     present = [t for t in tables.values() if t is not None]
     # Nothing this month
@@ -239,8 +295,12 @@ def build_month(processed_dir, month, meters, keep_harmonics, tolerance):
         if table is None:
             # Next
             continue
-        # Align to the shared grid in case of any difference
-        table = table.reindex(grid)
+        # Align to the shared grid only when the index actually differs
+        if not table.index.equals(grid):
+            # Copy onto the shared slots
+            table = table.reindex(grid)
+            # Keep the aligned table for a later spot-check
+            tables[meter] = table
         # Meter frequency from the voltage channels, float64 for the arithmetic
         meter_freq = meter_frequency(table, meter)
         # Store as float32
@@ -250,17 +310,17 @@ def build_month(processed_dir, month, meters, keep_harmonics, tolerance):
         # Capture offset
         toff_col = f"{meter}{SEP}{TOFF}"
         # Offset values, NaN if the column is missing
-        toff = table[toff_col].to_numpy(dtype=np.float64) if toff_col in table.columns else np.full(T, np.nan)
+        toff = _column_to_numpy(table, toff_col, np.float64, T)
         # Loop over channels
         for ci, channel in enumerate(CHANNELS):
             # Mask column
             mask_col = f"mask{SEP}{meter}{SEP}{channel}"
             # Present flags, False if the channel does not exist
-            mask[:, mi, ci] = table[mask_col].fillna(False).to_numpy(dtype=bool) if mask_col in table.columns else False
+            mask[:, mi, ci] = _column_to_numpy(table, mask_col, bool, T, fill=False)
             # This channel's own frequency column
             freq_col = f"{meter}{SEP}{channel}{SEP}freq"
             # Channel frequency, NaN if absent
-            channel_freq = table[freq_col].to_numpy(dtype=np.float64) if freq_col in table.columns else np.full(T, np.nan)
+            channel_freq = _column_to_numpy(table, freq_col, np.float64, T)
             # Agreement with the meter frequency, False where either is NaN
             agree = np.abs(channel_freq - meter_freq) <= tolerance
             # Count disagreements among present readings with both frequencies
@@ -278,9 +338,9 @@ def build_month(processed_dir, month, meters, keep_harmonics, tolerance):
                     # Next
                     continue
                 # Magnitude
-                mags[k][:, mi, ci] = table[mag_col].to_numpy(dtype=np.float32)
+                mags[k][:, mi, ci] = _column_to_numpy(table, mag_col, np.float32, T)
                 # Angle at capture, float64
-                ang_capture = table[ang_col].to_numpy(dtype=np.float64)
+                ang_capture = _column_to_numpy(table, ang_col, np.float64, T)
                 # Validity: reading present, angle, offset, both frequencies finite, frequencies agree
                 ok = mask[:, mi, ci] & np.isfinite(ang_capture) & np.isfinite(toff) & np.isfinite(meter_freq) & agree
                 # The fundamental decides angle_ok for the channel
@@ -311,18 +371,90 @@ def build_month(processed_dir, month, meters, keep_harmonics, tolerance):
     return arrays, stats
 
 
+def build_month(processed_dir, month, meters, keep_harmonics, tolerance):
+    """
+    Build the arrays for one month. Returns (arrays, stats) where arrays
+    is a dictionary ready for save_month and stats holds per-meter
+    presence fractions and frequency disagreement counts. Returns
+    (None, stats) when no meter has a file for the month.
+    """
+    # Tables per meter, None when missing
+    tables = load_month_tables(processed_dir, month, meters, keep_harmonics)
+    # Build from the loaded tables
+    return build_month_from_tables(tables, month, meters, keep_harmonics, tolerance)
+
+
 # -----------------------------------------------------------------------------
 # Writing and checking
 # -----------------------------------------------------------------------------
 
+def npz_is_complete(path, keep_harmonics=False):
+    """
+    True when path is a readable .npz with the arrays this export writes.
+    Uses the ZIP directory only, so a truncated Drive copy fails without
+    decompressing. Empty or missing files are False.
+    """
+    # Missing or empty
+    if not os.path.exists(path) or os.path.getsize(path) < 22:
+        # Too small to be a zip
+        return False
+    # Names that must be present
+    needed = set(REQUIRED_NPZ)
+    # Harmonics if this run asked for them
+    if keep_harmonics:
+        # Add the four extra arrays
+        needed.update(HARMONIC_NPZ)
+    try:
+        # Central directory sits at the end, so a truncated write fails here
+        with zipfile.ZipFile(path, "r") as zf:
+            # Member names without the .npy suffix numpy uses
+            names = {os.path.splitext(name)[0] for name in zf.namelist()}
+        # All required arrays present
+        return needed.issubset(names)
+    except (zipfile.BadZipFile, OSError, ValueError):
+        # Unreadable
+        return False
+
+
 def save_month(out_dir, month, arrays):
-    """Write the month's arrays to <out_dir>/<month>.npz, compressed. Returns (path, bytes)."""
+    """
+    Write the month's arrays to <out_dir>/<month>.npz using ZIP DEFLATE
+    level 1 (np.load-compatible). Writes to a unique temp file and replaces
+    atomically. Returns (path, bytes).
+    """
     # Make sure the folder exists
     os.makedirs(out_dir, exist_ok=True)
     # Path
     path = os.path.join(out_dir, f"{month}.npz")
-    # Write compressed
-    np.savez_compressed(path, **arrays)
+    # Unique sibling so two processes cannot share a temp name
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{month}.", suffix=".npz.tmp", dir=out_dir)
+    # Close the fd; ZipFile opens the path itself
+    os.close(fd)
+    try:
+        # ZIP container numpy itself uses for .npz
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=NPZ_COMPRESSLEVEL, allowZip64=True) as zf:
+            # One member per array
+            for key, val in arrays.items():
+                # Same member names as np.savez
+                with zf.open(key + ".npy", "w", force_zip64=True) as fid:
+                    # Raw npy bytes, no pickles
+                    write_array(fid, np.asanyarray(val), allow_pickle=False)
+        # Flush to disk before publishing
+        with open(tmp_path, "rb") as flush:
+            # File contents
+            os.fsync(flush.fileno())
+        # Atomic publish
+        os.replace(tmp_path, path)
+    except BaseException:
+        # Do not leave a partial destination; temp is dropped too
+        if os.path.exists(tmp_path):
+            # Best-effort cleanup
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        # Re-raise
+        raise
     # Return path and size
     return path, os.path.getsize(path)
 
@@ -381,7 +513,13 @@ def write_manifest(out_dir, meters, keep_harmonics, months, version=VERSION):
     return path
 
 
-def verify_month(path, processed_dir, month, meters, n_samples, seed):
+def _load_npz_arrays(path):
+    """Load every array in an .npz once, so members are not decompressed per access."""
+    with np.load(path) as data:
+        return {name: data[name] for name in data.files}
+
+
+def verify_month(path, processed_dir, month, meters, n_samples, seed, arrays=None, tables=None):
     """
     Spot-check a written month against the Parquet it came from. Draws
     n_samples random (slot, meter, channel) cells where a reading exists
@@ -389,10 +527,17 @@ def verify_month(path, processed_dir, month, meters, n_samples, seed):
     angle error (degrees, circular, over cells with angle_ok True), the
     largest frequency error against the meter's L1, and how many sampled
     cells had angle_ok False.
+
+    Expected values are always rebuilt from the Parquet columns (rms,
+    capture angle, toff, meter frequency), never copied from the export
+    arrays. Stored values come from `arrays` when given, otherwise from
+    the written .npz. Passing tables skips Parquet rereads but does not
+    skip that independent reconstruction.
+    Meter frequency is computed once per sampled meter.
     """
-    # Load the file
-    data = np.load(path)
-    # Random generator
+    # Stored arrays, from memory or from disk
+    data = arrays if arrays is not None else _load_npz_arrays(path)
+    # Random generator, same seed as the original sequential run
     rng = np.random.default_rng(seed)
     # Cells with a reading
     present = np.argwhere(data["mask"])
@@ -404,14 +549,18 @@ def verify_month(path, processed_dir, month, meters, n_samples, seed):
     picks = present[rng.choice(len(present), size=min(n_samples, len(present)), replace=False)]
     # Worst errors
     worst = {"checked": int(len(picks)), "rms_rel_err": 0.0, "ang_err_deg": 0.0, "freq_err_hz": 0.0, "angle_rejected": 0}
+    # Stored arrays pulled out once
+    rms_arr, ang_arr, freq_arr, ok_arr = data["rms"], data["ang"], data["freq"], data["angle_ok"]
     # Cache of loaded meter tables
-    cache = {}
+    cache = {} if tables is None else tables
+    # Meter frequency per sampled meter
+    freq_cache = {}
     # Loop over samples
     for ti, mi, ci in picks:
         # Meter and channel names
         meter, channel = meters[mi], CHANNELS[ci]
         # Load the meter table once
-        if meter not in cache:
+        if meter not in cache or cache[meter] is None:
             # Read
             cache[meter] = load_meter_month(processed_dir, month, meter, False)
         # Table
@@ -422,20 +571,24 @@ def verify_month(path, processed_dir, month, meters, n_samples, seed):
         rms0 = float(row[f"{meter}{SEP}{channel}{SEP}rms"])
         # Original angle at capture
         ang0 = float(row[f"{meter}{SEP}{channel}{SEP}ang0"])
-        # Meter voltage frequency for this slot
-        freq_meter = float(meter_frequency(table, meter)[ti])
+        # Meter voltage frequency, computed once for this meter
+        if meter not in freq_cache:
+            # Full series
+            freq_cache[meter] = meter_frequency(table, meter)
+        # This slot
+        freq_meter = float(freq_cache[meter][ti])
         # Offset
         toff0 = float(row[f"{meter}{SEP}{TOFF}"])
         # Stored values
-        rms1 = float(data["rms"][ti, mi, ci])
+        rms1 = float(rms_arr[ti, mi, ci])
         # Angle
-        ang1 = float(data["ang"][ti, mi, ci])
+        ang1 = float(ang_arr[ti, mi, ci])
         # Frequency
-        freq1 = float(data["freq"][ti, mi])
+        freq1 = float(freq_arr[ti, mi])
         # Relative magnitude error, guarded against zero
         worst["rms_rel_err"] = max(worst["rms_rel_err"], abs(rms1 - rms0) / max(abs(rms0), 1e-6))
         # Angle check only where the export accepted the angle
-        if data["angle_ok"][ti, mi, ci]:
+        if ok_arr[ti, mi, ci]:
             # Expected aligned angle with the meter frequency
             expected_ang = aligned_angle(ang0, freq_meter, toff0, 0)
             # Circular angle error
@@ -450,3 +603,72 @@ def verify_month(path, processed_dir, month, meters, n_samples, seed):
             worst["freq_err_hz"] = max(worst["freq_err_hz"], abs(freq1 - freq_meter))
     # Return
     return worst
+
+
+def export_month(processed_dir, out_dir, month, meters, keep_harmonics, tolerance, verify_samples, seed, force=False):
+    """
+    Build, save, and optionally verify one month. Safe to call from a
+    worker process. Returns a dict with status, month, and when written
+    a log row including stage timings.
+    """
+    # Destination
+    path = os.path.join(out_dir, f"{month}.npz")
+    # Resume: a readable complete file is left alone unless forced
+    if not force and npz_is_complete(path, keep_harmonics):
+        # Same skip the sequential loop used
+        return {"status": "exists", "month": month}
+    # Load once, reuse for the spot-check
+    tables = load_month_tables(processed_dir, month, meters, keep_harmonics)
+    # Build
+    t0 = time.perf_counter()
+    arrays, stats = build_month_from_tables(tables, month, meters, keep_harmonics, tolerance)
+    build_s = time.perf_counter() - t0
+    # Nothing this month
+    if arrays is None:
+        # Same skip as the sequential loop
+        return {"status": "no_data", "month": month}
+    # Save
+    t0 = time.perf_counter()
+    path, size = save_month(out_dir, month, arrays)
+    save_s = time.perf_counter() - t0
+    # Spot-check against the in-memory arrays and tables
+    t0 = time.perf_counter()
+    if verify_samples > 0:
+        # Stored values from the written file; expected values from Parquet tables
+        check = verify_month(path, processed_dir, month, meters, verify_samples, seed, tables=tables)
+    # Skipped
+    else:
+        # Empty report
+        check = {"checked": 0}
+    verify_s = time.perf_counter() - t0
+    # Log row
+    row = {
+        # Month
+        "month": month,
+        # Slots in the month
+        "slots": int(len(arrays["t"])),
+        # Meters that had a file
+        "meters_with_files": stats["meters_with_files"],
+        # File size in megabytes
+        "size_mb": round(size / 1e6, 1),
+        # Spot-check numbers
+        "checked": check.get("checked", 0),
+        # Worst magnitude error
+        "rms_rel_err": check.get("rms_rel_err", ""),
+        # Worst angle error
+        "ang_err_deg": check.get("ang_err_deg", ""),
+        # Worst frequency error
+        "freq_err_hz": check.get("freq_err_hz", ""),
+        # Frequency disagreements summed over meters
+        "freq_disagreements": sum(stats.get("freq_disagreements", {}).values()),
+        # Share of present readings whose angle passed, over all meters
+        "angle_ok_fraction": round(float(arrays["angle_ok"].sum() / max(int(arrays["mask"].sum()), 1)), 4),
+        # Sampled cells whose angle was rejected
+        "angle_rejected_in_check": check.get("angle_rejected", 0),
+        # Stage timings in seconds
+        "build_s": round(build_s, 3),
+        "save_s": round(save_s, 3),
+        "verify_s": round(verify_s, 3),
+    }
+    # Hand back
+    return {"status": "wrote", "month": month, "row": row}
