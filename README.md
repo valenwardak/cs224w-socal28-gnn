@@ -272,14 +272,14 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 - egauge_1 and egauge_2 are not in the network file and are excluded. egauge_23 and egauge_24 are in it and are downloaded.
 - Meters present over time: egauge_3 and 4 report from September 2024 only; egauge_15 stops after September 2024; egauge_23 stops after June 2024. So 20 meters report in each year, not the same 20.
 - Phase labels for egauge_13, 14, 15, 20 follow the network file, not the L1 L2 L3 order. `meters.json` carries the map.
-- February 1, 2024 is logged at exactly midnight with nothing visible in the readings and is not scored. That leaves 32 changes on 5 days in about 7 episodes.
+- February 1, 2024 is logged at exactly 00:00:00, which we read as a date without a time of day, so it cannot be given a matching window and is not scored. Nothing is visible in the readings at that time. That leaves 32 changes on 5 days in 7 episodes.
 - September 26, 2023 shows large current steps one hour before the logged times on several meters. The logged times for that day are unverified against the readings.
 - Site-wide outages: September 28 to October 27, 2023; July 18 to September 4, 2024; October 30 to November 6 and December 12 to 22, 2024. August 2025 has meter-specific gaps on egauge_4, 10, 11, 12, 14, 16.
 - Captures land about 36 milliseconds after each ten-second boundary on a typical meter (median `toff`), with rare captures up to a full slot late.
 - Voltage channels always agree on frequency within a meter. Current channels carrying a few amps (egauge_6 at 4.5 A on 55 to 71 percent of slots, egauge_18 and egauge_20 on 2 to 10 percent, egauge_16 rarely) report a frequency 1 to 4 Hz off, a wrong FFT bin, and their angles on those slots are not usable (`main_freqcheck.py`, September 2024).
 - Float16 magnitudes in the feature files have a spacing of 0.25 V near 277 V, so a rounding error of up to about 0.125 V there; voltage readings are often identical from one slot to the next, and persistence's median voltage residual is exactly zero.
 - The angle from one slot to the next rotates by tens of degrees, since the grid frequency is never exactly 60 Hz and ten seconds of a small offset is a large angle. Persistence's median angle residual is about 47 degrees; the learned models' is about 11.
-- From July 29 to about August 10, 2025, egauge_3's current ran at 115 to 135 A against a usual 45 A and egauge_20's at 42 A against a usual 4 to 7 A, both at once, with readings present, angles accepted, and frequency normal (`main_channelcheck.py`). The cause is not logged. The learned models' residuals on those meters are twenty times persistence's for the whole period (`main_forecastcheck.py`), since the models forecast a return toward the usual level and persistence does not.
+- From July 29, 2025, egauge_3's current ran at 115 to 135 A against a usual 45 A until August 11, and egauge_20's at 42 A against a usual 4 to 7 A for a shorter time, both starting together, with readings present, angles accepted, and frequency normal (`main_channelcheck.py`). The cause is not logged. The learned models' residuals on those meters are twenty times persistence's for the whole period (`main_forecastcheck.py`), since the models forecast a return toward the usual level and persistence does not.
 
 ## Files
 
