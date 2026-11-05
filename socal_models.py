@@ -41,6 +41,35 @@
 #              is exactly persistence wherever a valid history value exists,
 #              and training moves away from it only where the data pushes.
 #
+# Masked objective (--masked on main_gcn.py, added 2026-11-05 on the TA's
+#              suggestion): the forecaster above asks "how different is this
+#              meter from its own past". The masked model asks "how different
+#              is this meter from what its neighbors say it should be". In
+#              training, one meter per window is hidden: its whole history
+#              is zeroed in the input (magnitude, cos, sin, and both validity
+#              flags) before the encoder sees it, and a learned mask vector
+#              is added to its encoder state so the model can tell a
+#              deliberate mask from a real outage. The head then has only
+#              the neighbors' messages through the graph and the meter's
+#              identity to forecast that meter's next reading, and the loss
+#              is on that meter's valid targets only. Persistence has
+#              nothing to copy for a hidden meter, so the masked model
+#              forecasts the absolute value (predict-delta is off). The
+#              meter to hide is drawn among the maskable meters that have a
+#              valid target in the window; a window with none is skipped.
+#              The maskable meters are fixed from the true meter graph
+#              (every meter with at least one edge; egauge_24 has none) and
+#              do not change with the --edges control, so every control is
+#              evaluated on the same meters. In evaluation and scoring every
+#              maskable meter is hidden in turn, deterministically, with the
+#              passes batched --mask-chunk meters at a time, and the residual
+#              written for a meter is the one from the pass that hid it. The
+#              output layout is unchanged (all 22 meters, the non-maskable
+#              ones invalid), so main_score.py scores a masked run as it
+#              scores any other. Persistence columns still come from the
+#              untouched history. Built for graph_meters.json, where every
+#              meter but egauge_24 has a metered neighbor one hop away.
+#
 # Batches:     assembled in bulk with array indexing (get_batch on the
 #              datasets, iter_batches below), not one example at a time,
 #              which was the cost in the first smoke test.
@@ -94,7 +123,9 @@
 #              written every epoch, so a Colab disconnect loses at most one
 #              epoch and a resumed run continues the same sequence. On
 #              resume the saved options are compared with the current ones
-#              and a mismatch raises.
+#              and a mismatch raises. A key added after a checkpoint was
+#              written (masked, maskable_meters, graph_id) is checked only
+#              when the checkpoint holds it, so older runs still score.
 #
 # Losses reported: pooled over valid readings, not averaged over batches:
 #              sum of squared errors divided by the number of valid targets,
@@ -119,14 +150,17 @@
 #   Models
 #     zero_head(layer)                start a head at zero weights, for predict-delta
 #     MeterGRU                        shared meter-conditioned GRU with a forecast head
-#     GraphForecaster                 MeterGRU encoder + one GNN layer + head
+#     GraphForecaster                 MeterGRU encoder + one GNN layer + head, with the masked mode
 #     persistence_forecast(x, C)      last valid reading as the forecast, with validity
+#     draw_masks(y_valid, maskable)   one hidden meter per window for training
+#     masked_forecast(model, x, chunk)
+#                                     every maskable meter hidden in turn, for evaluation and scoring
 #   Loss and metrics
 #     masked_loss(y_hat, y, y_valid, angle_weight)
 #                                     the training loss
 #     residuals(y_hat, y, y_valid)    mag_res and ang_res arrays
 #   Training
-#     make_model(kind, ...)           build a model by name
+#     make_model(kind, ...)           build a model by name, masked or not
 #     run_batches(...)                one pass over a batch iterator, accumulates error sums
 #     pooled(sums)                    pooled losses from the sums
 #     make_dataset(...)               the right dataset kind for one piece
@@ -460,11 +494,23 @@ class GraphForecaster(nn.Module):
     that sits two edges away behind an unmetered node.
     """
 
-    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_index, edge_weight, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True):
+    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_index, edge_weight, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None):
         # Base class
         super().__init__()
-        # Whether the head outputs a correction to the persistence forecast
-        self.predict_delta = predict_delta
+        # Masked mode: hidden meters are forecast from their neighbors, never from persistence
+        self.masked = masked
+        # Whether the head outputs a correction to the persistence forecast; never in masked mode
+        self.predict_delta = predict_delta and not masked
+        # Masked mode needs the fixed list of meters that may be hidden
+        if masked:
+            # Must be given
+            if maskable is None:
+                # Raise
+                raise ValueError("masked mode needs the maskable meter list")
+            # Fixed, saved with the weights
+            self.register_buffer("maskable", torch.as_tensor(maskable, dtype=torch.bool))
+            # Learned vector added to a hidden meter's state, so a mask is not mistaken for an outage
+            self.mask_token = nn.Parameter(torch.zeros(hidden))
         # Layers from PyTorch Geometric, imported here so the GRU runs without it
         from torch_geometric.nn import GCNConv, GATConv, SAGEConv
         # Sizes
@@ -503,7 +549,7 @@ class GraphForecaster(nn.Module):
         # Angle head
         self.head_ang = nn.Linear(2 * hidden, 2 * n_channels)
         # With predict-delta the heads start at zero, so the first forecast is persistence
-        if predict_delta:
+        if self.predict_delta:
             # Magnitude
             zero_head(self.head_mag)
             # Angle
@@ -513,18 +559,34 @@ class GraphForecaster(nn.Module):
         # Keep
         self.register_buffer("node_count", counts)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         """
         x (B, H, M, C * F) -> forecast (B, M, C, 3).
+        mask (B, M) bool, masked mode only: True hides that meter's whole
+        history from the input before anything reads it, and adds the mask
+        token to its encoder state. Every other meter is forecast as usual
+        in the same pass; only the hidden meters' forecasts are neighbor-based.
         """
         # Sizes
         B, H, M, _ = x.shape
+        # Hide the masked meters before the encoder, persistence, or anything else sees x
+        if mask is not None:
+            # Must be in masked mode
+            if not self.masked:
+                # Raise
+                raise ValueError("a mask was given to a model that is not in masked mode")
+            # Zero every feature of every channel over the whole history: magnitude, cos, sin, both validity flags
+            x = x * (~mask).to(x.dtype)[:, None, :, None]
         # Every meter through the shared encoder: fold meters into the batch
         flat = x.permute(0, 2, 1, 3).reshape(B * M, H, -1)
         # Meter ids matching the fold
         meter = torch.arange(M, device=x.device).repeat(B)
         # States (B * M, hidden) -> (B, M, hidden)
         own = self.encoder.encode(flat, meter).reshape(B, M, self.hidden)
+        # Mark the hidden meters with the learned token
+        if mask is not None:
+            # Add where masked
+            own = own + self.mask_token[None, None, :] * mask.to(own.dtype)[:, :, None]
         # Node features start as the unmetered vector everywhere
         nodes = self.unmetered.expand(B, self.n_nodes, self.hidden).clone()
         # Sum meter states into their nodes
@@ -614,6 +676,74 @@ def persistence_forecast(x, n_channels):
     return torch.cat([mag, ang], dim=-1), valid
 
 
+def draw_masks(y_valid, maskable):
+    """
+    One hidden meter per window for training. y_valid (B, M, C, 2) is the
+    target validity before any masking; maskable (M,) bool. A meter is
+    eligible when it is maskable and has at least one valid target in the
+    window. One eligible meter is drawn uniformly per example with torch's
+    generator (its state is checkpointed). Returns mask (B, M) bool; a
+    window with no eligible meter gets an all-False row, so its loss is zero.
+    """
+    # Eligible meters: maskable with any valid target
+    eligible = y_valid.any(dim=-1).any(dim=-1) & maskable[None, :]
+    # Sampling weights
+    weights = eligible.float()
+    # Windows with no eligible meter get uniform dummy weights so multinomial does not fail
+    none = weights.sum(dim=1) == 0
+    # Fill
+    weights[none] = 1.0
+    # One draw per window
+    idx = torch.multinomial(weights, 1).squeeze(1)
+    # One-hot mask
+    mask = torch.zeros_like(eligible)
+    # Set
+    mask[torch.arange(len(idx), device=idx.device), idx] = True
+    # Windows with nothing eligible hide nothing
+    mask[none] = False
+    # Return
+    return mask
+
+
+def masked_forecast(model, x, chunk):
+    """
+    Every maskable meter hidden in turn, deterministically. For meters
+    m_1 .. m_k in a chunk, the batch is repeated k times, copy j hides
+    meter m_j, and the forecast kept for meter m_j is the one from copy j.
+    Returns (y_hat (B, M, C, 3), keep (M,) bool) where keep is the model's
+    maskable buffer: entries for non-maskable meters are zero and must be
+    treated as invalid by the caller.
+    """
+    # A chunk below one would hide nothing and return zeros marked valid
+    if chunk < 1:
+        # Raise
+        raise ValueError(f"mask chunk must be at least 1, got {chunk}")
+    # Sizes
+    B, H, M, _ = x.shape
+    # Meters to hide, in index order
+    meters = torch.nonzero(model.maskable).squeeze(1)
+    # Output
+    out = torch.zeros(B, M, model.C, 3, device=x.device, dtype=x.dtype)
+    # Chunks of meters
+    for start in range(0, len(meters), chunk):
+        # This chunk
+        ms = meters[start:start + chunk]
+        # Copies
+        k = len(ms)
+        # Batch repeated k times: copy j of example b sits at row b * k + j
+        xr = x.repeat_interleave(k, dim=0)
+        # Mask: row b * k + j hides meter ms[j]
+        mask = torch.zeros(B * k, M, dtype=torch.bool, device=x.device)
+        # Set
+        mask[torch.arange(B * k, device=x.device), ms.repeat(B)] = True
+        # Forward
+        y = model(xr, mask).reshape(B, k, M, model.C, 3)
+        # Keep each copy's hidden meter
+        out[:, ms] = y[:, torch.arange(k, device=x.device), ms]
+    # Return
+    return out, model.maskable
+
+
 # -----------------------------------------------------------------------------
 # Loss and metrics
 # -----------------------------------------------------------------------------
@@ -674,12 +804,20 @@ def residuals(y_hat, y, y_valid):
 # Training
 # -----------------------------------------------------------------------------
 
-def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True):
-    """Build a model by name: "gru", "gcn", "gat", or "sage"."""
+def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None):
+    """
+    Build a model by name: "gru", "gcn", "gat", or "sage". With masked,
+    maskable_meters is the list of meter names that may be hidden, fixed
+    by the caller from the true graph, not from the edges in use.
+    """
     # Sizes
     M, C = len(manifest["meters"]), len(manifest["channels"])
     # Plain GRU
     if kind == "gru":
+        # No masked mode for the GRU: it has no neighbors to forecast from
+        if masked:
+            # Raise
+            raise ValueError("masked mode needs a graph model")
         # Build
         return MeterGRU(M, C, hidden, embed, layers, dropout, predict_delta)
     # GNNs need the graph
@@ -690,14 +828,30 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
     meter_node = meter_node_index(graph, manifest)
     # Edges
     edge_index, edge_weight = build_edges(graph, edges, edge_weights, seed)
+    # Maskable flags in manifest order
+    maskable = None
+    # Masked mode
+    if masked:
+        # Names must be given
+        if not maskable_meters:
+            # Raise
+            raise ValueError("masked mode needs a non-empty maskable meter list")
+        # Every name must be a meter
+        unknown = [m for m in maskable_meters if m not in manifest["meters"]]
+        # Refuse
+        if unknown:
+            # Raise
+            raise ValueError(f"maskable meters not in the manifest: {unknown}")
+        # Flags
+        maskable = [m in maskable_meters for m in manifest["meters"]]
     # Build
-    return GraphForecaster(kind, M, C, len(graph["nodes"]), meter_node, edge_index, edge_weight, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta)
+    return GraphForecaster(kind, M, C, len(graph["nodes"]), meter_node, edge_index, edge_weight, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable)
 
 
 def new_sums():
     """Empty accumulator for pooled losses: squared-error sums and valid counts."""
     # Dictionary
-    return {"mag_se": 0.0, "mag_n": 0.0, "ang_se": 0.0, "ang_n": 0.0, "per_meter_se": {}, "per_meter_n": {}}
+    return {"mag_se": 0.0, "mag_n": 0.0, "ang_se": 0.0, "ang_n": 0.0, "per_meter_se": {}, "per_meter_n": {}, "skipped_windows": 0}
 
 
 def pooled(sums, angle_weight):
@@ -710,19 +864,46 @@ def pooled(sums, angle_weight):
     return {"loss": mag + angle_weight * ang, "mag": mag, "ang": ang, "mag_n": sums["mag_n"], "ang_n": sums["ang_n"]}
 
 
-def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None):
+def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None, mask_chunk=7):
     """
     One pass over an iterable of tensor batches already on the device.
     With an optimizer, trains; without, evaluates. Adds squared-error sums
     and valid counts into `sums` (see new_sums), so the caller can pool
-    over any number of pieces without batch-size bias.
+    over any number of pieces without batch-size bias. In masked mode,
+    training hides one drawn meter per window and counts only its targets;
+    evaluation hides every maskable meter in turn (mask_chunk per pass)
+    and counts the targets of maskable meters only.
     """
     # Mode
     model.train(optimizer is not None)
+    # Masked model
+    masked = getattr(model, "masked", False)
     # Loop
     for x, y, y_valid, extra in batches:
-        # Forward
-        y_hat = model(x) if graph_mode else model(x, extra)
+        # Masked training: one hidden meter per window, loss on it alone
+        if masked and optimizer is not None:
+            # Draw from the validity before masking
+            mask = draw_masks(y_valid, model.maskable)
+            # Windows with no eligible meter, counted for the epoch report
+            sums["skipped_windows"] += int((~mask.any(dim=1)).sum())
+            # A batch with no eligible window at all gets no step: Adam's momentum would still move the weights on a zero gradient
+            if not bool(mask.any()):
+                # Next batch
+                continue
+            # Forward with the mask
+            y_hat = model(x, mask)
+            # Only the hidden meter's targets count
+            y_valid = y_valid & mask[:, :, None, None]
+        # Masked evaluation: every maskable meter hidden in turn
+        elif masked:
+            # Deterministic passes
+            y_hat, keep = masked_forecast(model, x, mask_chunk)
+            # Non-maskable meters have no masked forecast
+            y_valid = y_valid & keep[None, :, None, None]
+        # Ordinary forward
+        else:
+            # Forward
+            y_hat = model(x) if graph_mode else model(x, extra)
         # Loss for the gradient step, batch-level means are fine for optimization
         loss, _, _ = masked_loss(y_hat, y, y_valid, angle_weight)
         # Train step
@@ -787,7 +968,7 @@ def make_dataset(piece, graph_mode, history, horizon, max_gap, min_meters=1):
     return ds if len(ds) else None
 
 
-def evaluate(model, features_dir, splits, split_name, scale, manifest, device, graph_mode, history, horizon, max_gap, batch_size, angle_weight, blocks=None):
+def evaluate(model, features_dir, splits, split_name, scale, manifest, device, graph_mode, history, horizon, max_gap, batch_size, angle_weight, blocks=None, mask_chunk=7):
     """
     Pooled loss over a split, or over the listed block indices of it:
     error sums divided by valid counts, so batch sizes do not bias it.
@@ -815,7 +996,7 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
                 # Next
                 continue
             # Pass, in order
-            run_batches(model, iter_batches(ds, batch_size, False, rng, device), graph_mode, angle_weight, sums)
+            run_batches(model, iter_batches(ds, batch_size, False, rng, device), graph_mode, angle_weight, sums, mask_chunk=mask_chunk)
     # Nothing to evaluate on is an error, never a perfect score
     if sums["mag_n"] == 0:
         # Raise
@@ -829,7 +1010,10 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
 
 
 # Options that define the experiment; a resumed run must match them
-EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta")
+EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id")
+# Keys added after the first checkpoints were written. A checkpoint without "masked" was not masked, so it
+# compares as False; the other two are compared only when the checkpoint holds them
+LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None}
 
 
 def save_atomic(body, path):
@@ -878,8 +1062,23 @@ def load_checkpoint(path, model, options, optimizer=None, device="cpu", rng=None
     body = torch.load(path, map_location=device, weights_only=False)
     # Saved options
     saved = body.get("options", {})
-    # Compare the keys that define the experiment
-    diffs = {k: (saved.get(k), options.get(k)) for k in EXPERIMENT_KEYS if saved.get(k) != options.get(k)}
+    # Compare the keys that define the experiment. "masked" missing from the checkpoint means False;
+    # the other later keys are skipped when the checkpoint predates them
+    diffs = {}
+    # Loop
+    for k in EXPERIMENT_KEYS:
+        # Saved value, with the later-key defaults
+        have = saved.get(k, LATER_KEYS.get(k))
+        # Skip a later key the checkpoint lacks, except "masked" which defaults to False
+        if k in LATER_KEYS and k not in saved and k != "masked":
+            # Next
+            continue
+        # Current value, with the same defaults, so a main script that does not set a later key (main_gru.py) still matches
+        want = options.get(k, LATER_KEYS.get(k))
+        # Record a difference
+        if have != want:
+            # Keep
+            diffs[k] = (have, want)
     # Any difference is a different experiment
     if diffs:
         # Raise with the list
@@ -958,9 +1157,13 @@ def train(model, features_dir, splits, scale, manifest, device, options, checkpo
         # Pooled training loss
         tr = pooled(sums, options["angle_weight"])
         # Validation on block 0 only, raises if empty
-        val = evaluate(model, features_dir, splits, "validation", scale, manifest, device, graph_mode, options["history"], options["horizon"], options["max_gap"], options["batch_size"], options["angle_weight"], blocks=[0])
+        val = evaluate(model, features_dir, splits, "validation", scale, manifest, device, graph_mode, options["history"], options["horizon"], options["max_gap"], options["batch_size"], options["angle_weight"], blocks=[0], mask_chunk=options.get("mask_chunk", 7))
         # Report
         log(f"epoch {epoch + 1}: train {tr['loss']:.5f}  val {val['loss']:.5f} (mag {val['mag']:.5f} ang {val['ang']:.5f}, {int(val['mag_n'])} targets)  {time.time() - t0:.0f} s")
+        # Masked mode: windows that had no eligible meter to hide
+        if options.get("masked"):
+            # Count
+            log(f"  masked: {int(tr['mag_n'])} hidden-meter magnitude targets, {sums['skipped_windows']} windows skipped with no eligible meter")
         # Per-meter report, worst three
         worst = sorted(val["per_meter_mag"].items(), key=lambda kv: -kv[1])[:3]
         # Print
@@ -1040,12 +1243,20 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
             pos = 0
             # Loop over batches
             for x, y, y_valid, extra in loader:
-                # Forecast
-                y_hat = model(x) if graph_mode else model(x, extra)
-                # Persistence forecast and whether the history held anything to copy
+                # Persistence forecast from the untouched history, and whether it held anything to copy
                 y_pers, p_ok = persistence_forecast(x, C)
                 # Persistence validity: a target to compare with and a value to copy
                 p_valid = y_valid & p_ok
+                # Masked model: every maskable meter hidden in turn, non-maskable meters invalid
+                if getattr(model, "masked", False):
+                    # Forecasts
+                    y_hat, keep = masked_forecast(model, x, options.get("mask_chunk", 7))
+                    # Model validity
+                    y_valid = y_valid & keep[None, :, None, None]
+                # Ordinary forecast
+                else:
+                    # Forward
+                    y_hat = model(x) if graph_mode else model(x, extra)
                 # Residuals
                 mr, ar = residuals(y_hat, y, y_valid)
                 # Persistence residuals under its own validity

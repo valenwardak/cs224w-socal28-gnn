@@ -28,6 +28,19 @@
 #              point and it only has to learn what persistence misses.
 #              --no-predict-delta makes it forecast the reading directly.
 #
+#              Masked objective (--masked, added 2026-11-05): one meter per
+#              training window is hidden and forecast from its neighbors
+#              through the graph; see socal_models.py. Meant for the meter
+#              graph: --graph graph_meters.json, where every meter but
+#              egauge_24 has a metered neighbor one hop away, and
+#              --splits splits_v2.json, which holds out a 2023 calibration
+#              block. The maskable meters are read from the graph file given
+#              (every meter with at least one edge) and are the same for
+#              every --edges control. Predict-delta is off in masked mode,
+#              whatever --predict-delta says, and the effective value is
+#              recorded in the options. The output layout is unchanged, so
+#              main_score.py scores a masked run like any other.
+#
 #              Ablations (the proposal's "does the graph help" test):
 #                --edges true     the real wiring            (default)
 #                --edges random   same number of edges, random node pairs
@@ -48,6 +61,8 @@
 #     python main_gcn.py --run-name gcn_none --edges none
 #   Score only, from a finished run:
 #     python main_gcn.py --run-name gcn_v1 --score-only
+#   Masked model on the meter graph with the held-out 2023 block:
+#     python main_gcn.py --run-name gcn_masked --masked --graph graph_meters.json --splits splits_v2.json --angle-weight 0.01
 #   Options: python main_gcn.py --help
 #
 # Requires torch_geometric (pip install torch_geometric) for the GCN layers.
@@ -65,11 +80,16 @@
 #   pick_device(name)   cuda, mps, or cpu
 #   restrict_months(blocks, months)
 #                       cut train blocks down to the chosen months
+#   graph_identity(path) the graph file's name and a hash of its contents, saved with the run
+#   maskable_from_graph(graph)
+#                       meters with at least one edge in the graph file, in meter-number order
 #   main()              scale, graph, model, train, score
 # =============================================================================
 
 # Standard library: command-line options
 import argparse
+# Standard library: content hash of the graph file, for its identity
+import hashlib
 # Standard library: paths
 import os
 # Third party: numerics
@@ -102,6 +122,10 @@ def parse_args():
     parser.add_argument("--gnn-layers", type=int, default=1, help="Number of GCN layers (hops of message passing)")
     # Window rule for synchronized batches
     parser.add_argument("--min-meters", type=int, default=1, help="Keep a time slot only if at least this many meters pass the gap rule")
+    # Masked objective
+    parser.add_argument("--masked", action="store_true", help="Masked objective: hide one meter per window and forecast it from its neighbors; see socal_models.py")
+    # Meters per masked evaluation pass
+    parser.add_argument("--mask-chunk", type=int, default=7, help="Masked evaluation and scoring: meters hidden per forward pass (the batch is repeated this many times)")
     # Output
     parser.add_argument("--out-dir", default=os.path.join("data", "processed", "models"), help="Parent folder for runs")
     # Run name
@@ -151,7 +175,13 @@ def parse_args():
     # Score only
     parser.add_argument("--score-only", action="store_true", help="Skip training, load the best checkpoint, and score")
     # Parse
-    return parser.parse_args()
+    args = parser.parse_args()
+    # The masked evaluation chunk must hide at least one meter per pass
+    if args.mask_chunk < 1:
+        # Refuse
+        parser.error(f"--mask-chunk must be at least 1, got {args.mask_chunk}")
+    # Done
+    return args
 
 
 def pick_device(name):
@@ -208,6 +238,35 @@ def restrict_months(blocks, months):
     return out
 
 
+def graph_identity(path):
+    """The graph file's name and the first 16 hex digits of the SHA-256 of its bytes, so two files with the same counts but different wiring differ."""
+    # Hash the bytes
+    with open(path, "rb") as f:
+        # Digest
+        digest = hashlib.sha256(f.read()).hexdigest()[:16]
+    # Name and digest
+    return f"{os.path.basename(path)}:{digest}"
+
+
+def maskable_from_graph(graph):
+    """
+    The meters that may be hidden in masked mode: every meter whose node
+    has at least one edge in the graph file as written, before any --edges
+    control is applied. In meter-number order. egauge_24 has no edge in
+    graph_meters.json and is left out.
+    """
+    # Nodes with an edge
+    touched = set()
+    # Loop over edges
+    for e in graph["edges"]:
+        # Both ends
+        touched.add(int(e["source"])); touched.add(int(e["target"]))
+    # Meters on those nodes
+    names = [m for m, rec in graph["meters"].items() if int(rec["node"]) in touched]
+    # Sorted by number
+    return sorted(names, key=lambda m: int(m.split("_")[1]))
+
+
 def main():
     """Scale, graph, model, train, score."""
     # Options
@@ -256,6 +315,22 @@ def main():
         log(f"training restricted to months {months}: {len(splits['train'])} block pieces")
     # Identity of the training data, checked on resume
     train_blocks = [f"{b['start_utc']}/{b['end_utc_exclusive']}" for b in splits["train"]]
+    # Graph, required for a GNN, loaded before the options so its identity and maskable meters are recorded
+    graph = sm.load_graph(args.graph)
+    # Identity of the graph file, checked on resume: its name and a hash of its contents, not its path, so Colab and local runs agree
+    graph_id = graph_identity(args.graph)
+    # Maskable meters, from the file as written, the same for every --edges control
+    maskable_meters = maskable_from_graph(graph) if args.masked else None
+    # Masked mode forecasts the absolute value, never a correction to persistence
+    predict_delta = args.predict_delta and not args.masked
+    # Say so when the flag was overridden
+    if args.masked and args.predict_delta:
+        # Note
+        log("masked mode: predict-delta turned off, the hidden meter has no persistence value to correct")
+    # Masked mode needs at least one maskable meter
+    if args.masked and not maskable_meters:
+        # Raise
+        raise ValueError(f"no meter in {args.graph} has an edge, nothing can be masked")
     # Options that define the experiment, saved with the checkpoint
     options = {
         # Model kind
@@ -263,9 +338,11 @@ def main():
         # Window
         "history": args.history, "horizon": args.horizon, "max_gap": args.max_gap,
         # Model
-        "hidden": args.hidden, "embed": args.embed, "layers": args.layers, "dropout": args.dropout, "gnn_layers": args.gnn_layers, "heads": 0, "predict_delta": args.predict_delta,
+        "hidden": args.hidden, "embed": args.embed, "layers": args.layers, "dropout": args.dropout, "gnn_layers": args.gnn_layers, "heads": 0, "predict_delta": predict_delta,
         # Graph options
         "edges": args.edges, "edge_weights": args.edge_weights, "min_meters": args.min_meters,
+        # Graph identity and the masked objective
+        "graph_id": graph_id, "masked": args.masked, "maskable_meters": maskable_meters, "mask_chunk": args.mask_chunk,
         # Training
         "lr": args.lr, "weight_decay": args.weight_decay, "batch_size": args.batch_size, "angle_weight": args.angle_weight,
         # Stopping
@@ -295,12 +372,14 @@ def main():
         used = [f"{manifest['meters'][mi]}|{manifest['channels'][ci]}" for mi, ci in zip(*np.nonzero(fallback))]
         # Report
         log(f"computed scale from {int(count.sum())} valid train readings, saved to {scale_path}; nominal fallback used for {len(used)} channels" + (f": {used}" if used else ""))
-    # Graph, required for a GNN
-    graph = sm.load_graph(args.graph)
-    # Report it
+    # Report the graph
     log(f"graph {args.graph}: {len(graph['nodes'])} nodes, {len(graph['edges'])} edges, edges={args.edges}, edge_weights={args.edge_weights}")
+    # Report the masked setup
+    if args.masked:
+        # Names
+        log(f"masked objective: {len(maskable_meters)} maskable meters {maskable_meters}; not maskable: {[m for m in manifest['meters'] if m not in maskable_meters]}; {args.mask_chunk} meters per evaluation pass")
     # Model
-    model = sm.make_model("gcn", manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=args.predict_delta).to(device)
+    model = sm.make_model("gcn", manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters).to(device)
     # Parameter count
     log(f"model gcn with {sum(p.numel() for p in model.parameters())} parameters")
     # Checkpoint path
