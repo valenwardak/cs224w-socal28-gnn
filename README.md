@@ -23,7 +23,7 @@ The data is not stored in this repo. Each team member downloads it with the scri
 3. Split: `main_splits.py` writes `splits.json`, the fixed train / validation / test blocks that every later script reads.
 4. Physics baseline: `main_physics.py` runs a least-squares state estimator with no learning over any window or split and writes a residual per ten-second slot to `data/processed/physics/`.
 5. Feature tables: `main_features.py` exports the processed tables as compact monthly files in `data/features/` for training on Colab.
-6. Graph: `main_graph.py` writes the grid's electrical graph to `graph.json`, which every GNN loads.
+6. Graph: `main_graph.py` writes the grid's electrical graph to `graph.json`, which every GNN loads. `main_metergraph.py` derives the meter graph `graph_meters.json` from it.
 7. Learned models: `main_gru.py` (no graph) and `main_gcn.py` (graph) train on Colab from `data/features/`, `graph.json`, and `splits.json`, and write a residual per slot, meter, and channel.
 8. Scoring: `main_score.py` turns any run's residuals into event-detection scores with one fixed procedure, for the model and for the persistence baseline alike.
 
@@ -209,6 +209,19 @@ What is in it: 43 nodes, 33 edges (15 lines, 18 transformers), 22 meters all pla
 
 The GRU baseline does not use the graph. Each meter forecasts from its own history, which is what makes it the no-graph comparison.
 
+### The meter graph
+
+24 of the 43 nodes carry no meter, and they sit between the metered ones. A reach check on `graph.json` found that with one GCN layer 13 of the 22 meters receive nothing from any other meter, only the learned vectors of unmetered nodes; the nearest other meter is three or four hops away for most of them. A model that must predict a hidden meter from its neighbors needs those neighbors one hop away, so `main_metergraph.py` writes a second graph, `graph_meters.json`, from `graph.json` without changing it:
+
+```bash
+python main_metergraph.py
+python checks/main_metergraphcheck.py --manifest data/features/manifest.json
+```
+
+One node per meter, 22 in meter-number order. An edge joins two meters that share a physical node or whose physical nodes are joined by a path with only unmetered nodes in between; the search stops at the first metered node it reaches, so the meter graph keeps the order of the wiring instead of joining every meter in a component to every other. Every edge has `admittance_abs` 1.0 (binary) and records the physical path it came from (`hops`, `path_nodes`, `path_elements`), so an electrical weight can be added later. The file keeps the layout of `graph.json`, so `main_gcn.py --graph graph_meters.json` trains on it with no other change.
+
+What is in it: 22 nodes, 36 edges. The A-side has 9 meters and 19 edges, the B-side 9 meters and 14 edges, meters 5, 6, 23 form a triangle, and egauge_24 is alone in its component and has no edge, so a model predicting meters from their neighbors has nothing to predict it from. Edges by physical hops: 3 at 0 (meters sharing a node), 3 at 1, 5 at 2, 17 at 3, 8 at 4. `checks/main_metergraphcheck.py` verifies the file against `graph.json` (one node per meter, every edge's path real and passing only unmetered nodes, the counts above, egauge_24 the only isolated meter, and the training code's loaders accept it) and draws it to `graph_meters.png`. `graph_meters.json` is committed.
+
 ## Step 9: learned models
 
 Two helper modules and two thin main scripts. `socal_modeldata.py` is the data side: it reads the monthly feature files, checks them against `manifest.json`, cuts them to the blocks in `splits.json`, computes the per-channel scale from the train blocks (95th percentile of valid magnitudes, with a floor from the clamp ratings in `graph.json`, and the bus nominal voltage or a tenth of the clamp rating for a channel with no train readings), builds the model input (scaled magnitude, cos and sin of the angle, two validity flags per channel), and makes training windows. `socal_models.py` is the model side: the models, the persistence baseline, the loss, the training loop with checkpoints, and the scoring output.
@@ -303,6 +316,10 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `main_graph.py` | Writes `graph.json` |
 | `graph.json` | The grid's electrical graph: nodes, edges with admittance, meter placement |
 | `graph.png` | Drawing of `graph.json` from the check script |
+| `socal_metergraph.py` | Meter graph helper functions: paths through unmetered nodes |
+| `main_metergraph.py` | Writes `graph_meters.json` from `graph.json` |
+| `graph_meters.json` | The meter graph: one node per meter, binary edges with their physical paths |
+| `graph_meters.png` | Drawing of `graph_meters.json` from the check script |
 | `socal_modeldata.py` | Model data side: feature loading, scale, inputs, windows |
 | `socal_models.py` | Models, persistence, loss, training loop, residual output |
 | `main_gru.py` | Train and score the no-graph GRU baseline |
@@ -313,5 +330,5 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `meters.txt` | The 22 meters, one per line |
 | `requirements.txt` | Python packages |
 | `topology/` | Caltech's network description, breaker status files, change logs |
-| `checks/` | One-off scripts, each a single file run from the repo root: the data-fact checks above; `main_physics_events.py` (physics residual against the events); `main_freqcheck.py` (channel frequency against the voltage); `main_graphcheck.py` (graph consistency and drawing); `main_residualcheck.py` (model residual distributions against persistence per channel); `main_alarmcheck.py` (where a run's alarms come from on a block); `main_channelcheck.py` (one meter day by day: current level, data quality, residuals); `main_forecastcheck.py` (what the model forecast, in physical units, over chosen windows); `main_scoreview.py` (the primary and grid score files side by side) |
+| `checks/` | One-off scripts, each a single file run from the repo root: the data-fact checks above; `main_physics_events.py` (physics residual against the events); `main_freqcheck.py` (channel frequency against the voltage); `main_graphcheck.py` (graph consistency and drawing); `main_metergraphcheck.py` (the meter graph against `graph.json`, and that the training code loads it); `main_residualcheck.py` (model residual distributions against persistence per channel); `main_alarmcheck.py` (where a run's alarms come from on a block); `main_channelcheck.py` (one meter day by day: current level, data quality, residuals); `main_forecastcheck.py` (what the model forecast, in physical units, over chosen windows); `main_scoreview.py` (the primary and grid score files side by side) |
 | `notes/` | Data notes: gaps, outages, known issues. Read before analysis. |
