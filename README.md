@@ -262,6 +262,8 @@ Output: `score.json` in the run folder with every setting, threshold, coverage, 
 
 Two exploratory options exist alongside the primary procedure and write to separate files. `--statistic grid` replaces the per-channel thresholds with one threshold on a grid-level number per slot: each channel's residual divided by a reference scale from validation block 0 (its 99th percentile there, with a floor), the maximum over a meter's channels, then the second-largest meter score among available meters, calibrated on block 1. It calibrates the quantity that raises the alarm rather than each channel. `--restrict-common` limits both statistics to the channels that have both a threshold and a reference, so they watch the same sensors and the comparison isolates aggregation from coverage. Both were motivated by test findings and are labeled exploratory in their output.
 
+The scoring procedure, both statistics and every setting above, was fixed on November 5, 2026 and has not changed since. Results scored before that date are exploratory, since the grid statistic was designed after inspection of the first test results. Runs scored after that date, new seeds and new models alike, are primary results under the same procedure.
+
 ## Data facts the code relies on
 
 Established by the scripts in `checks/`, which can be rerun with `--data-dir ../data`, and by the coverage report:
