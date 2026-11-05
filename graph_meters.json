@@ -1,0 +1,1391 @@
+{
+ "reference_time": "2024-11-14T07:00:00",
+ "note": "Meter graph built from graph.json by main_metergraph.py: one node per meter; an edge between two meters that share a physical node or whose physical nodes are joined by a path with only unmetered nodes in between (the search stops at the first metered node). admittance_abs is 1.0 on every edge (binary). Each edge records its physical path. Node index order is the nodes list order.",
+ "source_graph_nodes": 43,
+ "source_graph_edges": 33,
+ "nodes": [
+  {
+   "name": "egauge_3",
+   "buses": [
+    "bus_1107"
+   ],
+   "nominal_voltage": {
+    "bus_1107": 277
+   },
+   "component": 1,
+   "physical_node": 20,
+   "meter": "egauge_3"
+  },
+  {
+   "name": "egauge_4",
+   "buses": [
+    "bus_1113"
+   ],
+   "nominal_voltage": {
+    "bus_1113": 277
+   },
+   "component": 0,
+   "physical_node": 22,
+   "meter": "egauge_4"
+  },
+  {
+   "name": "egauge_5",
+   "buses": [
+    "bus_1134"
+   ],
+   "nominal_voltage": {
+    "bus_1134": 277
+   },
+   "component": 2,
+   "physical_node": 29,
+   "meter": "egauge_5"
+  },
+  {
+   "name": "egauge_6",
+   "buses": [
+    "bus_1140"
+   ],
+   "nominal_voltage": {
+    "bus_1140": 277
+   },
+   "component": 2,
+   "physical_node": 29,
+   "meter": "egauge_6"
+  },
+  {
+   "name": "egauge_7",
+   "buses": [
+    "bus_1119"
+   ],
+   "nominal_voltage": {
+    "bus_1119": 277
+   },
+   "component": 1,
+   "physical_node": 24,
+   "meter": "egauge_7"
+  },
+  {
+   "name": "egauge_8",
+   "buses": [
+    "bus_1125"
+   ],
+   "nominal_voltage": {
+    "bus_1125": 277
+   },
+   "component": 0,
+   "physical_node": 26,
+   "meter": "egauge_8"
+  },
+  {
+   "name": "egauge_9",
+   "buses": [
+    "bus_1083"
+   ],
+   "nominal_voltage": {
+    "bus_1083": 277
+   },
+   "component": 1,
+   "physical_node": 13,
+   "meter": "egauge_9"
+  },
+  {
+   "name": "egauge_10",
+   "buses": [
+    "bus_1089"
+   ],
+   "nominal_voltage": {
+    "bus_1089": 277
+   },
+   "component": 0,
+   "physical_node": 14,
+   "meter": "egauge_10"
+  },
+  {
+   "name": "egauge_11",
+   "buses": [
+    "bus_1070"
+   ],
+   "nominal_voltage": {
+    "bus_1070": 277
+   },
+   "component": 1,
+   "physical_node": 10,
+   "meter": "egauge_11"
+  },
+  {
+   "name": "egauge_12",
+   "buses": [
+    "bus_1076"
+   ],
+   "nominal_voltage": {
+    "bus_1076": 277
+   },
+   "component": 0,
+   "physical_node": 12,
+   "meter": "egauge_12"
+  },
+  {
+   "name": "egauge_13",
+   "buses": [
+    "bus_1098"
+   ],
+   "nominal_voltage": {
+    "bus_1098": 277
+   },
+   "component": 1,
+   "physical_node": 17,
+   "meter": "egauge_13"
+  },
+  {
+   "name": "egauge_14",
+   "buses": [
+    "bus_1101"
+   ],
+   "nominal_voltage": {
+    "bus_1101": 277
+   },
+   "component": 0,
+   "physical_node": 18,
+   "meter": "egauge_14"
+  },
+  {
+   "name": "egauge_15",
+   "buses": [
+    "bus_1078"
+   ],
+   "nominal_voltage": {
+    "bus_1078": 277
+   },
+   "component": 1,
+   "physical_node": 10,
+   "meter": "egauge_15"
+  },
+  {
+   "name": "egauge_16",
+   "buses": [
+    "bus_1161"
+   ],
+   "nominal_voltage": {
+    "bus_1161": 277
+   },
+   "component": 0,
+   "physical_node": 37,
+   "meter": "egauge_16"
+  },
+  {
+   "name": "egauge_17",
+   "buses": [
+    "bus_1041"
+   ],
+   "nominal_voltage": {
+    "bus_1041": 1386
+   },
+   "component": 1,
+   "physical_node": 5,
+   "meter": "egauge_17"
+  },
+  {
+   "name": "egauge_18",
+   "buses": [
+    "bus_1052"
+   ],
+   "nominal_voltage": {
+    "bus_1052": 1386
+   },
+   "component": 0,
+   "physical_node": 6,
+   "meter": "egauge_18"
+  },
+  {
+   "name": "egauge_19",
+   "buses": [
+    "bus_1032"
+   ],
+   "nominal_voltage": {
+    "bus_1032": 9526.3
+   },
+   "component": 1,
+   "physical_node": 0,
+   "meter": "egauge_19"
+  },
+  {
+   "name": "egauge_20",
+   "buses": [
+    "bus_1040"
+   ],
+   "nominal_voltage": {
+    "bus_1040": 9526.3
+   },
+   "component": 0,
+   "physical_node": 2,
+   "meter": "egauge_20"
+  },
+  {
+   "name": "egauge_21",
+   "buses": [
+    "bus_1038"
+   ],
+   "nominal_voltage": {
+    "bus_1038": 9526.3
+   },
+   "component": 1,
+   "physical_node": 0,
+   "meter": "egauge_21"
+  },
+  {
+   "name": "egauge_22",
+   "buses": [
+    "bus_1176"
+   ],
+   "nominal_voltage": {
+    "bus_1176": 277
+   },
+   "component": 0,
+   "physical_node": 40,
+   "meter": "egauge_22"
+  },
+  {
+   "name": "egauge_23",
+   "buses": [
+    "bus_1184"
+   ],
+   "nominal_voltage": {
+    "bus_1184": 240
+   },
+   "component": 2,
+   "physical_node": 41,
+   "meter": "egauge_23"
+  },
+  {
+   "name": "egauge_24",
+   "buses": [
+    "bus_1192"
+   ],
+   "nominal_voltage": {
+    "bus_1192": 277
+   },
+   "component": 3,
+   "physical_node": 42,
+   "meter": "egauge_24"
+  }
+ ],
+ "edges": [
+  {
+   "source": 0,
+   "target": 6,
+   "element": "egauge_3--egauge_9",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    20,
+    19,
+    7,
+    13
+   ],
+   "path_elements": [
+    "tr_125",
+    "line_416",
+    "tr_121"
+   ]
+  },
+  {
+   "source": 0,
+   "target": 8,
+   "element": "egauge_3--egauge_11",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 4,
+   "path_nodes": [
+    20,
+    19,
+    7,
+    9,
+    10
+   ],
+   "path_elements": [
+    "tr_125",
+    "line_416",
+    "line_415",
+    "tr_119"
+   ]
+  },
+  {
+   "source": 0,
+   "target": 10,
+   "element": "egauge_3--egauge_13",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 4,
+   "path_nodes": [
+    20,
+    19,
+    7,
+    15,
+    17
+   ],
+   "path_elements": [
+    "tr_125",
+    "line_416",
+    "line_417",
+    "tr_123"
+   ]
+  },
+  {
+   "source": 0,
+   "target": 12,
+   "element": "egauge_3--egauge_15",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 4,
+   "path_nodes": [
+    20,
+    19,
+    7,
+    9,
+    10
+   ],
+   "path_elements": [
+    "tr_125",
+    "line_416",
+    "line_415",
+    "tr_119"
+   ]
+  },
+  {
+   "source": 0,
+   "target": 14,
+   "element": "egauge_3--egauge_17",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    20,
+    19,
+    7,
+    5
+   ],
+   "path_elements": [
+    "tr_125",
+    "line_416",
+    "line_408"
+   ]
+  },
+  {
+   "source": 1,
+   "target": 7,
+   "element": "egauge_4--egauge_10",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    22,
+    21,
+    8,
+    14
+   ],
+   "path_elements": [
+    "tr_126",
+    "line_420",
+    "tr_122"
+   ]
+  },
+  {
+   "source": 1,
+   "target": 9,
+   "element": "egauge_4--egauge_12",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 4,
+   "path_nodes": [
+    22,
+    21,
+    8,
+    11,
+    12
+   ],
+   "path_elements": [
+    "tr_126",
+    "line_420",
+    "line_419",
+    "tr_120"
+   ]
+  },
+  {
+   "source": 1,
+   "target": 11,
+   "element": "egauge_4--egauge_14",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 4,
+   "path_nodes": [
+    22,
+    21,
+    8,
+    16,
+    18
+   ],
+   "path_elements": [
+    "tr_126",
+    "line_420",
+    "line_421",
+    "tr_124"
+   ]
+  },
+  {
+   "source": 1,
+   "target": 15,
+   "element": "egauge_4--egauge_18",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    22,
+    21,
+    8,
+    6
+   ],
+   "path_elements": [
+    "tr_126",
+    "line_420",
+    "line_411"
+   ]
+  },
+  {
+   "source": 2,
+   "target": 3,
+   "element": "egauge_5--egauge_6",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 0,
+   "path_nodes": [
+    29
+   ],
+   "path_elements": []
+  },
+  {
+   "source": 2,
+   "target": 20,
+   "element": "egauge_5--egauge_23",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    29,
+    27,
+    38,
+    41
+   ],
+   "path_elements": [
+    "tr_129",
+    "line_422",
+    "tr_133"
+   ]
+  },
+  {
+   "source": 3,
+   "target": 20,
+   "element": "egauge_6--egauge_23",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    29,
+    27,
+    38,
+    41
+   ],
+   "path_elements": [
+    "tr_129",
+    "line_422",
+    "tr_133"
+   ]
+  },
+  {
+   "source": 4,
+   "target": 14,
+   "element": "egauge_7--egauge_17",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 2,
+   "path_nodes": [
+    24,
+    23,
+    5
+   ],
+   "path_elements": [
+    "tr_127",
+    "line_409"
+   ]
+  },
+  {
+   "source": 5,
+   "target": 15,
+   "element": "egauge_8--egauge_18",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 2,
+   "path_nodes": [
+    26,
+    25,
+    6
+   ],
+   "path_elements": [
+    "tr_128",
+    "line_410"
+   ]
+  },
+  {
+   "source": 6,
+   "target": 8,
+   "element": "egauge_9--egauge_11",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    13,
+    7,
+    9,
+    10
+   ],
+   "path_elements": [
+    "tr_121",
+    "line_415",
+    "tr_119"
+   ]
+  },
+  {
+   "source": 6,
+   "target": 10,
+   "element": "egauge_9--egauge_13",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    13,
+    7,
+    15,
+    17
+   ],
+   "path_elements": [
+    "tr_121",
+    "line_417",
+    "tr_123"
+   ]
+  },
+  {
+   "source": 6,
+   "target": 12,
+   "element": "egauge_9--egauge_15",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    13,
+    7,
+    9,
+    10
+   ],
+   "path_elements": [
+    "tr_121",
+    "line_415",
+    "tr_119"
+   ]
+  },
+  {
+   "source": 6,
+   "target": 14,
+   "element": "egauge_9--egauge_17",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 2,
+   "path_nodes": [
+    13,
+    7,
+    5
+   ],
+   "path_elements": [
+    "tr_121",
+    "line_408"
+   ]
+  },
+  {
+   "source": 7,
+   "target": 9,
+   "element": "egauge_10--egauge_12",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    14,
+    8,
+    11,
+    12
+   ],
+   "path_elements": [
+    "tr_122",
+    "line_419",
+    "tr_120"
+   ]
+  },
+  {
+   "source": 7,
+   "target": 11,
+   "element": "egauge_10--egauge_14",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    14,
+    8,
+    16,
+    18
+   ],
+   "path_elements": [
+    "tr_122",
+    "line_421",
+    "tr_124"
+   ]
+  },
+  {
+   "source": 7,
+   "target": 15,
+   "element": "egauge_10--egauge_18",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 2,
+   "path_nodes": [
+    14,
+    8,
+    6
+   ],
+   "path_elements": [
+    "tr_122",
+    "line_411"
+   ]
+  },
+  {
+   "source": 8,
+   "target": 10,
+   "element": "egauge_11--egauge_13",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 4,
+   "path_nodes": [
+    10,
+    9,
+    7,
+    15,
+    17
+   ],
+   "path_elements": [
+    "tr_119",
+    "line_415",
+    "line_417",
+    "tr_123"
+   ]
+  },
+  {
+   "source": 8,
+   "target": 12,
+   "element": "egauge_11--egauge_15",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 0,
+   "path_nodes": [
+    10
+   ],
+   "path_elements": []
+  },
+  {
+   "source": 8,
+   "target": 14,
+   "element": "egauge_11--egauge_17",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    10,
+    9,
+    7,
+    5
+   ],
+   "path_elements": [
+    "tr_119",
+    "line_415",
+    "line_408"
+   ]
+  },
+  {
+   "source": 9,
+   "target": 11,
+   "element": "egauge_12--egauge_14",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 4,
+   "path_nodes": [
+    12,
+    11,
+    8,
+    16,
+    18
+   ],
+   "path_elements": [
+    "tr_120",
+    "line_419",
+    "line_421",
+    "tr_124"
+   ]
+  },
+  {
+   "source": 9,
+   "target": 15,
+   "element": "egauge_12--egauge_18",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    12,
+    11,
+    8,
+    6
+   ],
+   "path_elements": [
+    "tr_120",
+    "line_419",
+    "line_411"
+   ]
+  },
+  {
+   "source": 10,
+   "target": 12,
+   "element": "egauge_13--egauge_15",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 4,
+   "path_nodes": [
+    10,
+    9,
+    7,
+    15,
+    17
+   ],
+   "path_elements": [
+    "tr_119",
+    "line_415",
+    "line_417",
+    "tr_123"
+   ]
+  },
+  {
+   "source": 10,
+   "target": 14,
+   "element": "egauge_13--egauge_17",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    17,
+    15,
+    7,
+    5
+   ],
+   "path_elements": [
+    "tr_123",
+    "line_417",
+    "line_408"
+   ]
+  },
+  {
+   "source": 11,
+   "target": 15,
+   "element": "egauge_14--egauge_18",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    18,
+    16,
+    8,
+    6
+   ],
+   "path_elements": [
+    "tr_124",
+    "line_421",
+    "line_411"
+   ]
+  },
+  {
+   "source": 12,
+   "target": 14,
+   "element": "egauge_15--egauge_17",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    10,
+    9,
+    7,
+    5
+   ],
+   "path_elements": [
+    "tr_119",
+    "line_415",
+    "line_408"
+   ]
+  },
+  {
+   "source": 13,
+   "target": 15,
+   "element": "egauge_16--egauge_18",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 2,
+   "path_nodes": [
+    37,
+    36,
+    6
+   ],
+   "path_elements": [
+    "tr_131",
+    "line_426"
+   ]
+  },
+  {
+   "source": 14,
+   "target": 16,
+   "element": "egauge_17--egauge_19",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 1,
+   "path_nodes": [
+    5,
+    0
+   ],
+   "path_elements": [
+    "tr_117"
+   ]
+  },
+  {
+   "source": 14,
+   "target": 18,
+   "element": "egauge_17--egauge_21",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 1,
+   "path_nodes": [
+    5,
+    0
+   ],
+   "path_elements": [
+    "tr_117"
+   ]
+  },
+  {
+   "source": 15,
+   "target": 17,
+   "element": "egauge_18--egauge_20",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 1,
+   "path_nodes": [
+    6,
+    2
+   ],
+   "path_elements": [
+    "tr_118"
+   ]
+  },
+  {
+   "source": 15,
+   "target": 19,
+   "element": "egauge_18--egauge_22",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 3,
+   "path_nodes": [
+    6,
+    30,
+    39,
+    40
+   ],
+   "path_elements": [
+    "line_412",
+    "line_423",
+    "tr_134"
+   ]
+  },
+  {
+   "source": 16,
+   "target": 18,
+   "element": "egauge_19--egauge_21",
+   "type": "meter_path",
+   "admittance_abs": 1.0,
+   "hops": 0,
+   "path_nodes": [
+    0
+   ],
+   "path_elements": []
+  }
+ ],
+ "meters": {
+  "egauge_3": {
+   "node": 0,
+   "voltage_bus": "bus_1107",
+   "current_elements": [
+    "cb_143"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 2000,
+    "S2": 2000,
+    "S3": 2000
+   },
+   "physical_node": 20
+  },
+  "egauge_4": {
+   "node": 1,
+   "voltage_bus": "bus_1113",
+   "current_elements": [
+    "cb_145"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 2000,
+    "S2": 2000,
+    "S3": 2000
+   },
+   "physical_node": 22
+  },
+  "egauge_5": {
+   "node": 2,
+   "voltage_bus": "bus_1134",
+   "current_elements": [
+    "cb_149"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 640,
+    "S2": 640,
+    "S3": 640
+   },
+   "physical_node": 29
+  },
+  "egauge_6": {
+   "node": 3,
+   "voltage_bus": "bus_1140",
+   "current_elements": [
+    "cb_151"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 640,
+    "S2": 640,
+    "S3": 640
+   },
+   "physical_node": 29
+  },
+  "egauge_7": {
+   "node": 4,
+   "voltage_bus": "bus_1119",
+   "current_elements": [
+    "cb_146"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 3200,
+    "S2": 3200,
+    "S3": 3200
+   },
+   "physical_node": 24
+  },
+  "egauge_8": {
+   "node": 5,
+   "voltage_bus": "bus_1125",
+   "current_elements": [
+    "cb_148"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 3200,
+    "S2": 3200,
+    "S3": 3200
+   },
+   "physical_node": 26
+  },
+  "egauge_9": {
+   "node": 6,
+   "voltage_bus": "bus_1083",
+   "current_elements": [
+    "cb_137"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 2000,
+    "S2": 2000,
+    "S3": 2000
+   },
+   "physical_node": 13
+  },
+  "egauge_10": {
+   "node": 7,
+   "voltage_bus": "bus_1089",
+   "current_elements": [
+    "cb_139"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 2000,
+    "S2": 2000,
+    "S3": 2000
+   },
+   "physical_node": 14
+  },
+  "egauge_11": {
+   "node": 8,
+   "voltage_bus": "bus_1070",
+   "current_elements": [
+    "cb_134"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 2000,
+    "S2": 2000,
+    "S3": 2000
+   },
+   "physical_node": 10
+  },
+  "egauge_12": {
+   "node": 9,
+   "voltage_bus": "bus_1076",
+   "current_elements": [
+    "cb_136"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 2000,
+    "S2": 2000,
+    "S3": 2000
+   },
+   "physical_node": 12
+  },
+  "egauge_13": {
+   "node": 10,
+   "voltage_bus": "bus_1098",
+   "current_elements": [
+    "cb_140"
+   ],
+   "phase": {
+    "L3": "ag",
+    "L2": "bg",
+    "L1": "cg",
+    "S3": "a",
+    "S2": "b",
+    "S1": "c"
+   },
+   "current_rating": {
+    "S3": 1200,
+    "S2": 1200,
+    "S1": 1200
+   },
+   "physical_node": 17
+  },
+  "egauge_14": {
+   "node": 11,
+   "voltage_bus": "bus_1101",
+   "current_elements": [
+    "cb_141"
+   ],
+   "phase": {
+    "L3": "ag",
+    "L2": "bg",
+    "L1": "cg",
+    "S3": "a",
+    "S2": "b",
+    "S1": "c"
+   },
+   "current_rating": {
+    "S3": 1200,
+    "S2": 1200,
+    "S1": 1200
+   },
+   "physical_node": 18
+  },
+  "egauge_15": {
+   "node": 12,
+   "voltage_bus": "bus_1078",
+   "current_elements": [
+    "line_387"
+   ],
+   "phase": {
+    "L3": "ag",
+    "L2": "bg",
+    "L1": "cg",
+    "S3": "a",
+    "S2": "b",
+    "S1": "c"
+   },
+   "current_rating": {
+    "S3": 600,
+    "S2": 600,
+    "S1": 600
+   },
+   "physical_node": 10
+  },
+  "egauge_16": {
+   "node": 13,
+   "voltage_bus": "bus_1161",
+   "current_elements": [
+    "line_402"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 2775,
+    "S2": 2775,
+    "S3": 2775
+   },
+   "physical_node": 37
+  },
+  "egauge_17": {
+   "node": 14,
+   "voltage_bus": "bus_1041",
+   "current_elements": [
+    "line_382"
+   ],
+   "phase": {
+    "L1": "ab",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 2000,
+    "S2": 2000,
+    "S3": 2000
+   },
+   "physical_node": 5
+  },
+  "egauge_18": {
+   "node": 15,
+   "voltage_bus": "bus_1052",
+   "current_elements": [
+    "line_384"
+   ],
+   "phase": {
+    "L1": "ab",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 2000,
+    "S2": 2000,
+    "S3": 2000
+   },
+   "physical_node": 6
+  },
+  "egauge_19": {
+   "node": 16,
+   "voltage_bus": "bus_1032",
+   "current_elements": [
+    "line_379"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 1200,
+    "S2": 1200,
+    "S3": 1200
+   },
+   "physical_node": 0
+  },
+  "egauge_20": {
+   "node": 17,
+   "voltage_bus": "bus_1040",
+   "current_elements": [
+    "line_383"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S2": "a",
+    "S1": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S2": 1200,
+    "S1": 1200,
+    "S3": 1200
+   },
+   "physical_node": 2
+  },
+  "egauge_21": {
+   "node": 18,
+   "voltage_bus": "bus_1038",
+   "current_elements": [
+    "line_381"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 600,
+    "S2": 600,
+    "S3": 600
+   },
+   "physical_node": 0
+  },
+  "egauge_22": {
+   "node": 19,
+   "voltage_bus": "bus_1176",
+   "current_elements": [
+    "line_429"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 3000,
+    "S2": 3000,
+    "S3": 3000
+   },
+   "physical_node": 40
+  },
+  "egauge_23": {
+   "node": 20,
+   "voltage_bus": "bus_1184",
+   "current_elements": [
+    "line_430"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 3000,
+    "S2": 3000,
+    "S3": 3000
+   },
+   "physical_node": 41
+  },
+  "egauge_24": {
+   "node": 21,
+   "voltage_bus": "bus_1192",
+   "current_elements": [
+    "line_431"
+   ],
+   "phase": {
+    "L1": "ag",
+    "L2": "bg",
+    "L3": "cg",
+    "S1": "a",
+    "S2": "b",
+    "S3": "c"
+   },
+   "current_rating": {
+    "S1": 3000,
+    "S2": 3000,
+    "S3": 3000
+   },
+   "physical_node": 42
+  }
+ }
+}
