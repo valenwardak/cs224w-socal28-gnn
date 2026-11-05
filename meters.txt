@@ -1,5 +1,3 @@
-egauge_1
-egauge_2
 egauge_3
 egauge_4
 egauge_5
