@@ -131,6 +131,16 @@ The split is by time blocks, fixed before any model is trained:
 
 Train and validation contain no scored event. The event log is used only to define normal data and to score; the models never see a label.
 
+### splits_v2.json: a held-out 2023 calibration block
+
+Conformal thresholds must be set on data the model never trained on, and `splits.json` has no such block in 2023, so thresholds set on February 2025 are the only held-out ones and they transfer poorly to the 2023 episodes. `splits_v2.json`, written on November 5, 2026, reserves November 1 to 14, 2023 as a third validation block, for calibration only. It was chosen from coverage and distance to logged events alone, without looking at any residual or score: November 2023 is the best-covered month of that year (the site-wide outage ends October 27, the next event block starts November 24), and the block has 94.1 percent coverage, 20 meters, and no logged change.
+
+```bash
+python main_splits.py --splits-file splits_v2.json --validation-blocks 2024-01-08:2024-01-21 2025-02-03:2025-02-16 2023-11-01:2023-11-14
+```
+
+The three validation blocks keep their roles by position: block 0 (January 2024) is for early stopping and design, block 1 (February 2025) is the 2025 calibration block, block 2 (November 2023) is the 2023 calibration block and never chooses a model. Train loses those 14 days (525 days instead of 539); every other block is identical to `splits.json`. Training windows are built inside each block, so no window crosses into the held-out block. `splits.json` is unchanged and the runs made with it stay valid under it. A model whose thresholds come from block 2 must be trained with `--splits splits_v2.json` in a new run folder, so its scale is recomputed from the new train blocks.
+
 ## Step 6: physics baseline
 
 A least-squares state estimator, following Caltech's bus injection model in their `code_examples/state_estimation_phasor.py`. For every ten-second slot it takes the measured voltage and current phasors and the admittance matrix of a fixed reference wiring (the normal switch state), solves for the bus voltages that best fit the circuit equations, and reports the residual: the leftover gap between the readings and the wiring, averaged over readings and expressed in percent of nominal. When a switch changes state the readings stop fitting the fixed wiring and the residual shifts. No training.
@@ -307,6 +317,7 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `socal_preprocess.py` | Preprocessing helper functions |
 | `main_splits.py` | Writes `splits.json` and reports each split |
 | `splits.json` | The fixed train / validation / test blocks |
+| `splits_v2.json` | The same with November 1 to 14, 2023 held out as a 2023 calibration block |
 | `main_physics.py` | Physics baseline main script |
 | `socal_physics.py` | Physics baseline helper functions |
 | `physics_config.json` | Reference wiring, kept component, injection map and signs for the physics baseline |
