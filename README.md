@@ -266,6 +266,19 @@ Output under `data/processed/models/<run_name>/`:
 
 Training runs on Google Colab with a GPU: download the shared features folder, clone the repo, `pip install torch_geometric`, and run the commands above with `--features-dir /content/features --out-dir <a Drive folder>` so checkpoints survive a disconnect. The GCN batches time slots (every meter at once) and the GRU batches meters, so the same `--batch-size` means different work; the defaults (64 and 512) are set accordingly.
 
+### The masked objective
+
+Added November 5, 2026 on the TA's suggestion. The forecasters above ask how different a meter is from its own past. The masked model asks how different it is from what its neighbors say it should be: in training one meter per window is hidden (its whole history zeroed in the input, with a learned mask vector added to its encoder state so a mask is not mistaken for an outage) and forecast from its neighbors through the graph, with the loss on that meter alone and no persistence to lean on. At validation and scoring every maskable meter is hidden in turn, and the residual files keep the standard layout, so `main_score.py` scores a masked run like any other. The maskable meters are the meters with an edge in the graph file (all but egauge_24 on `graph_meters.json`) and do not change with `--edges`.
+
+```bash
+python main_gcn.py --run-name gcn_masked_aw001 --masked --graph graph_meters.json --splits splits_v2.json --angle-weight 0.01
+python checks/main_maskcheck.py --run-dir data/processed/models/gcn_masked_aw001 --graph graph_meters.json --manifest data/features/manifest.json
+```
+
+`checks/main_maskcheck.py` confirms on a trained run that the hidden meter's own history cannot reach its forecast, that a neighbor's history can, that a meter the saved edges do not connect to it cannot, and that the chunked evaluation matches one pass per meter. `checks/main_maskalarmcheck.py` locates a run's quiet-block exceedances under its frozen thresholds by month, meter, and the number of neighbors with a valid persistence residual in the slot.
+
+Result: in one seed, the masked GCN passed the implementation checks but produced a substantially greater false-alarm burden than the matched ordinary forecaster on the same graph and split under the fixed February 2025 calibration (48 percent of monitored quiet-block slots in alarm in magnitude mode against 4 percent; 10 percent against 0.1 percent in angle mode), while detecting the same three episodes. Excess channel exceedances occurred throughout April to August 2025 and were associated with reduced neighbor availability for several meters. The causes and the effectiveness of possible remedies remain unresolved, and the masked run is recorded rather than developed further.
+
 ## Step 10: scoring
 
 ```bash
@@ -334,12 +347,12 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `socal_modeldata.py` | Model data side: feature loading, scale, inputs, windows |
 | `socal_models.py` | Models, persistence, loss, training loop, residual output |
 | `main_gru.py` | Train and score the no-graph GRU baseline |
-| `main_gcn.py` | Train and score the GCN, with the topology ablation options |
+| `main_gcn.py` | Train and score the GCN, with the topology ablation options and the masked objective |
 | `socal_score.py` | Event-detection scoring method |
 | `main_score.py` | Score one run: model and persistence, primary and exploratory statistics |
 | `merge_years.sh` | Merges two per-year download folders into one |
 | `meters.txt` | The 22 meters, one per line |
 | `requirements.txt` | Python packages |
 | `topology/` | Caltech's network description, breaker status files, change logs |
-| `checks/` | One-off scripts, each a single file run from the repo root: the data-fact checks above; `main_physics_events.py` (physics residual against the events); `main_freqcheck.py` (channel frequency against the voltage); `main_graphcheck.py` (graph consistency and drawing); `main_metergraphcheck.py` (the meter graph against `graph.json`, and that the training code loads it); `main_residualcheck.py` (model residual distributions against persistence per channel); `main_alarmcheck.py` (where a run's alarms come from on a block); `main_channelcheck.py` (one meter day by day: current level, data quality, residuals); `main_forecastcheck.py` (what the model forecast, in physical units, over chosen windows); `main_scoreview.py` (the primary and grid score files side by side) |
+| `checks/` | One-off scripts, each a single file run from the repo root: the data-fact checks above; `main_physics_events.py` (physics residual against the events); `main_freqcheck.py` (channel frequency against the voltage); `main_graphcheck.py` (graph consistency and drawing); `main_metergraphcheck.py` (the meter graph against `graph.json`, and that the training code loads it); `main_residualcheck.py` (model residual distributions against persistence per channel); `main_alarmcheck.py` (where a run's alarms come from on a block); `main_channelcheck.py` (one meter day by day: current level, data quality, residuals); `main_forecastcheck.py` (what the model forecast, in physical units, over chosen windows); `main_scoreview.py` (the primary and grid score files side by side); `main_maskcheck.py` (a masked run forecasts hidden meters from their neighbors, not from their own history); `main_maskalarmcheck.py` (where a run's quiet-block exceedances come from, under its frozen thresholds) |
 | `notes/` | Data notes: gaps, outages, known issues. Read before analysis. |
