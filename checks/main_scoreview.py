@@ -15,7 +15,11 @@
 #                   channels without a threshold (channel statistic),
 #                   channels without a reference (grid), split into both,
 #                   grid only, channel only; channels at the floor listed
-#                   separately since they stay included
+#                   separately since they stay included. Under scoring
+#                   version 2 (per-era calibration) a file holds one
+#                   threshold set per calibration block, so the exclusions
+#                   are printed per calibration block, with the test blocks
+#                   that use it, and the grid threshold per block
 #                3. paired episode outcomes by episode id: detected under
 #                   channel, under grid, both, lost, gained, with delays
 #                4. exposure per split for both statistics: monitored days,
@@ -94,18 +98,51 @@ def settings_diff(a, b, ignore):
     return {k: (a.get(k), b.get(k)) for k in keys if k not in ignore and a.get(k) != b.get(k)}
 
 
-def exclusions(ch, gr, kind):
+def calibration_sets(r):
+    """
+    The calibration sets of one result, keyed by calibration label, each
+    with the test blocks that use it. Version-2 files carry them under
+    "calibrations"; a version-1 file has the single "calibration".
+    """
+    # Version 2
+    if "calibrations" in r:
+        # Blocks per calibration label
+        blocks = {}
+        # Loop
+        for b in r["blocks"]:
+            # Append
+            blocks.setdefault(b.get("calib_label"), []).append(b["label"])
+        # Sets
+        return {c: dict(rec, blocks=blocks.get(c, [])) for c, rec in r["calibrations"].items()}
+    # Version 1
+    return {r["calibration"]["label"]: dict(r["calibration"], blocks=[b["label"] for b in r["blocks"]])}
+
+
+def exclusions(ch, gr, kind, calib_label=None):
     """
     Exclusion sets for one residual kind: channels without a threshold
-    (channel statistic), channels without a reference (grid), and their
-    overlap. Returns (both, grid_only, channel_only, floored).
+    (channel statistic, from the calibration set `calib_label`, or the
+    default set), channels without a reference (grid), and their overlap.
+    Returns (both, grid_only, channel_only, floored).
     """
-    # Channel statistic exclusions
-    c = set(ch["calibration"]["channels_without_threshold"][kind])
-    # Grid exclusions
-    g = set(gr["grid"]["channels_without_reference"][kind]) if gr.get("grid") else set()
-    # Floored, still included
-    f = set(gr["grid"]["channels_at_floor"][kind]) if gr.get("grid") else set()
+    # Channel statistic exclusions, from the named calibration set
+    cal = calibration_sets(ch).get(calib_label) if calib_label else ch["calibration"]
+    # Channels without a threshold
+    c = set(cal["channels_without_threshold"][kind])
+    # Grid exclusions: the same calibration set in the grid file when it carries them (version 2), else the top-level grid record
+    gset = calibration_sets(gr).get(calib_label) if calib_label else None
+    # Per-set record present
+    if gset and gset.get("grid_channels_without_reference") is not None:
+        # References as that set used them
+        g = set(gset["grid_channels_without_reference"][kind])
+        # Floored
+        f = set(gset["grid_channels_at_floor"][kind])
+    # Fallback: one shared grid record
+    else:
+        # Grid exclusions
+        g = set(gr["grid"]["channels_without_reference"][kind]) if gr.get("grid") else set()
+        # Floored, still included
+        f = set(gr["grid"]["channels_at_floor"][kind]) if gr.get("grid") else set()
     # Return
     return sorted(c & g), sorted(g - c), sorted(c - g), sorted(f)
 
@@ -150,24 +187,44 @@ def main():
         for source in ("model", "persistence"):
             # Results
             ch, gr = ch_all["modes"][mode][source], gr_all["modes"][mode][source]
-            # 2. Exclusions
+            # 2. Exclusions, per calibration set in the channel file
             section(f"2. exclusions, mode {mode}, {source}")
-            # Per kind
-            for kind in ("mag", "ang"):
-                # Sets
-                both, g_only, c_only, floored = exclusions(ch, gr, kind)
-                # Print
-                print(f"  {kind}: excluded by both ({len(both)}): {both}")
-                # Grid only
-                print(f"       grid only, no reference ({len(g_only)}): {g_only}")
-                # Channel only
-                print(f"       channel only, no threshold ({len(c_only)}): {c_only}")
-                # Floored
-                print(f"       at the floor, still included ({len(floored)}): {floored}")
-            # Grid threshold
-            if gr.get("grid"):
-                # Print
-                print(f"  grid threshold {gr['grid']['threshold']:.3f}, calibration coverage {gr['grid']['calibration_coverage']:.5f}, meters needed {gr['grid']['meters_needed']}")
+            # Calibration sets of both files
+            ch_sets, gr_sets = calibration_sets(ch), calibration_sets(gr)
+            # Loop over the channel file's calibration sets
+            for c, cset in ch_sets.items():
+                # Which test blocks use it
+                print(f"  calibration {c}: used by {', '.join(cset['blocks']) or 'no test block'}")
+                # Per kind
+                for kind in ("mag", "ang"):
+                    # Sets
+                    both, g_only, c_only, floored = exclusions(ch, gr, kind, c)
+                    # Print
+                    print(f"    {kind}: excluded by both ({len(both)}): {both}")
+                    # Grid only
+                    print(f"         grid only, no reference ({len(g_only)}): {g_only}")
+                    # Channel only
+                    print(f"         channel only, no threshold ({len(c_only)}): {c_only}")
+                    # Floored
+                    print(f"         at the floor, still included ({len(floored)}): {floored}")
+                # Grid threshold of the same calibration block in the grid file
+                g = gr_sets.get(c)
+                # Version 2 record
+                if g and g.get("grid_threshold") is not None:
+                    # Print
+                    print(f"    grid threshold {g['grid_threshold']:.3f}, calibration coverage {g['grid_calibration_coverage']:.5f}")
+                # Version 1 record, one grid threshold
+                elif gr.get("grid") and len(gr_sets) == 1:
+                    # Print
+                    print(f"    grid threshold {gr['grid']['threshold']:.3f}, calibration coverage {gr['grid']['calibration_coverage']:.5f}, meters needed {gr['grid']['meters_needed']}")
+            # The two files must map test blocks to the same calibration blocks
+            ch_map = {b["label"]: b.get("calib_label") for b in ch["blocks"]}
+            # Grid file
+            gr_map = {b["label"]: b.get("calib_label") for b in gr["blocks"]}
+            # Compare
+            if ch_map != gr_map:
+                # Flag
+                print(f"  WARNING: the two files calibrate test blocks differently: {ch_map} vs {gr_map}")
 
             # 3. Paired episodes
             section(f"3. episodes by id, mode {mode}, {source}: channel vs grid")

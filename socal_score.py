@@ -55,6 +55,26 @@
 #      resamples episodes only: the recall interval is a plain bootstrap;
 #      the precision and F1 intervals hold the false-alarm count fixed and
 #      are conditional on it, which the output says.
+#   6b. Per-era calibration (scoring version 2, defined 2026-11-06, the
+#      --era-calib option). Version 1 calibrates every test block on the
+#      same block. Version 2 maps test-label prefixes to calibration
+#      labels, so each test block is calibrated on a held-out quiet block
+#      from its own era: the 2023 event blocks on November 1 to 14, 2023
+#      (validation block 2 of splits_v2.json), the November 2024 block and
+#      the quiet block on February 2025 as before. Each test label must
+#      resolve to exactly one rule, or to the default calibration label
+#      when no rule matches; two matching rules raise; an unused rule is
+#      reported. Thresholds (and the grid threshold) are computed once per
+#      calibration block and applied to the blocks assigned to it; the
+#      grid references stay on the design block. Every calibration block
+#      is checked against the run's training blocks, read from the block's
+#      own summary file, and an overlap raises: calibration must be held
+#      out. Version 2 is retrospective: the November 2023 calibration
+#      follows the September 2023 events in time, and February 2025
+#      follows the November 2024 events, so it does not show calibration
+#      that would have been available at deployment. The quiet-block
+#      result under version 2 is the version-1 result reused, not another
+#      evaluation. With no rules the output is version 1, unchanged.
 #   7. Fairness. Persistence is calibrated and scored from its own columns
 #      by the same steps. With common=True, every residual is first masked
 #      to the slots where both the model and persistence are valid for that
@@ -117,6 +137,12 @@
 #     residual_arrays(table, meters, channels, prefix)
 #                                         dict of (T, M, C) arrays: mag, ang, mag_valid, ang_valid
 #     common_mask(model, pers)            mask both sources to their shared valid slots
+#     label_bounds(label)                 UTC bounds of a block from its label
+#     check_held_out(run_dir, label)      raise if a calibration block overlaps the run's training blocks
+#     resolve_calibration(labels, settings)
+#                                         calibration label per test label from the era rules
+#     calibrate_source(run_dir, calib_label, prefix, other_prefix, settings, meters, channels, refs)
+#                                         thresholds, exclusions, and the grid threshold for one calibration block
 #   Calibration
 #     conformal_threshold(values, alpha)  one threshold from a 1-D array of residuals, or NaN
 #     calibrate(arrays, alpha)            (M, C) thresholds and coverage for mag and ang
@@ -150,6 +176,8 @@
 
 # Standard library: ceilings for the conformal rank
 import math
+# Standard library: block summaries, for the held-out check
+import json
 # Standard library: to silence numpy's all-NaN warnings where NaN means "no score"
 import warnings
 # Standard library: paths
@@ -645,23 +673,113 @@ def bootstrap(detected, false_count, n_boot, seed):
             "f1_cond_lo": float(np.percentile(f1, 2.5)), "f1_cond_hi": float(np.percentile(f1, 97.5)), "note": note}
 
 
-def score_source(run_dir, prefix, settings, other_prefix=None):
+def label_bounds(label):
     """
-    The whole pipeline for one source ("" model, "pers_" persistence):
-    calibrate on the calibration block, detect on every test table, match
-    against the event episodes, count false alarms over monitored time.
-    With other_prefix given and settings["common"] true, residuals are
-    masked to the slots where both sources are valid. settings is a dict
-    with alpha, mode, min_meters, merge_slots, before_minutes,
-    after_minutes, calib_label, test_prefixes, events, n_boot, seed,
-    common. Returns a dict of results.
+    UTC bounds [start, end) of a block from its label "<split>_<YYYY-MM-DD>_<YYYY-MM-DD>",
+    whose dates are inclusive days in fixed Pacific Standard Time.
     """
-    # Windows
-    before, after = pd.Timedelta(minutes=settings["before_minutes"]), pd.Timedelta(minutes=settings["after_minutes"])
+    # Last two underscore parts are the dates
+    parts = label.rsplit("_", 2)
+    # Must have them
+    if len(parts) != 3:
+        # Raise
+        raise ValueError(f"cannot read block dates from label {label}")
+    # Start of the first day
+    start = pd.Timestamp(parts[1]) + pd.Timedelta(hours=8)
+    # Start of the day after the last
+    end = pd.Timestamp(parts[2]) + pd.Timedelta(days=1, hours=8)
+    # UTC
+    return start.tz_localize("UTC"), end.tz_localize("UTC")
+
+
+def check_held_out(run_dir, label):
+    """
+    Raise if the calibration block `label` overlaps any training block of
+    the run, read from the block's own summary file (<label>.json, which
+    score_split writes with the training options). Returns the splits file
+    the run was trained with, for the record.
+    """
+    # Summary path
+    path = os.path.join(run_dir, f"{label}.json")
+    # Must exist
+    if not os.path.exists(path):
+        # Raise
+        raise FileNotFoundError(f"no summary at {path}; cannot check that calibration block {label} is held out of training")
+    # Read
+    with open(path) as f:
+        # Parse
+        summary = json.load(f)
+    # Training blocks as "start/end" UTC strings
+    train = summary.get("options", {}).get("train_blocks")
+    # Must be recorded
+    if not train:
+        # Raise
+        raise ValueError(f"{path} records no training blocks; cannot check that {label} is held out")
+    # Bounds of the calibration block
+    c0, c1 = label_bounds(label)
+    # Loop over training blocks
+    for item in train:
+        # Bounds
+        t0, t1 = (pd.Timestamp(x) for x in item.split("/"))
+        # Overlap
+        if t0 < c1 and c0 < t1:
+            # Raise: in-sample calibration is not allowed
+            raise ValueError(f"calibration block {label} overlaps training block {item} of this run: calibration must be held out")
+    # Splits file identity
+    return summary.get("options", {}).get("splits_file")
+
+
+def resolve_calibration(labels, settings):
+    """
+    Calibration label per test label. settings["era_calib"] is an ordered
+    list of [prefix, calib_label] rules; a test label takes the rule whose
+    prefix it starts with, and the default settings["calib_label"] when no
+    rule matches. Two matching rules raise. Returns (mapping, unused rules).
+    """
+    # Rules
+    rules = settings.get("era_calib") or []
+    # Mapping
+    mapping = {}
+    # Rules that matched something
+    used = set()
+    # Loop over labels
+    for label in labels:
+        # Matching rules
+        hits = [(p, c) for p, c in rules if label.startswith(p)]
+        # Ambiguous
+        if len(hits) > 1:
+            # Raise
+            raise ValueError(f"test block {label} matches more than one era rule: {hits}")
+        # One rule
+        if hits:
+            # Record
+            mapping[label] = hits[0][1]
+            # Used
+            used.add(tuple(hits[0]))
+        # Default
+        else:
+            # Record
+            mapping[label] = settings["calib_label"]
+    # Unused rules
+    unused = [list(r) for r in rules if tuple(r) not in used]
+    # Done
+    return mapping, unused
+
+
+def calibrate_source(run_dir, calib_label, prefix, other_prefix, settings, meters, channels, refs):
+    """
+    Thresholds for one source on one calibration block, with the common
+    mask, the optional common-channel restriction (which also edits refs
+    in place), the channels left without a threshold, and the grid
+    threshold when the grid statistic is in use. Returns a dict with thr,
+    missing, restriction, grid.
+    """
     # Calibration table
-    cal = load_table(run_dir, settings["calib_label"])
-    # Axes
-    meters, channels = table_axes(cal)
+    cal = load_table(run_dir, calib_label)
+    # Its axes must match
+    if table_axes(cal) != (meters, channels):
+        # Raise
+        raise ValueError(f"calibration block {calib_label} has different meters or channels from the other tables")
     # Calibration residuals
     arrays = residual_arrays(cal, meters, channels, prefix)
     # Common slots
@@ -670,24 +788,10 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         common_mask(arrays, residual_arrays(cal, meters, channels, other_prefix))
     # Thresholds, per channel
     thr = calibrate(arrays, settings["alpha"])
-    # Grid statistic asked for, or the common-channel restriction, which needs the references too
+    # Grid statistic asked for
     use_grid = settings.get("statistic", "channel") == "grid"
     # Restriction flag
     restrict = bool(settings.get("restrict_common", False))
-    # References from the design block when either needs them
-    refs = None
-    # Build
-    if use_grid or restrict:
-        # Design table
-        des = load_table(run_dir, settings["design_label"])
-        # Design residuals
-        darr = residual_arrays(des, meters, channels, prefix)
-        # Common slots
-        if other_prefix is not None and settings["common"]:
-            # Mask
-            common_mask(darr, residual_arrays(des, meters, channels, other_prefix))
-        # References
-        refs = references(darr, settings["ref_percentile"], settings["ref_min_count"], settings["ref_floor_mag"], settings["ref_floor_ang"])
     # Restriction: keep only channels with both a threshold and a reference, per kind, for both statistics
     restriction = None
     # Apply
@@ -710,7 +814,7 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
             restriction[kind] = {"channels_kept": int(keep.sum()), "channels_dropped": [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(dropped))]}
     # Channels without a threshold, by kind, after any restriction
     missing = {kind: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(~np.isfinite(thr[f"thr_{kind}"])))] for kind in ("mag", "ang")}
-    # Grid statistic: one threshold from the calibration block
+    # Grid statistic: one threshold from this calibration block
     grid = None
     # Asked for
     if use_grid:
@@ -723,15 +827,82 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         # Without a threshold the grid statistic cannot alarm; a silent zero-alarm result would mislead, so it raises
         if not np.isfinite(gthr):
             # Raise with the numbers
-            raise ValueError(f"grid threshold cannot be calibrated: {int(np.isfinite(gscore).sum())} valid calibration slots on {settings['calib_label']} at alpha {settings['alpha']} (need at least {math.ceil(1.0 / settings['alpha']) - 1})")
+            raise ValueError(f"grid threshold cannot be calibrated: {int(np.isfinite(gscore).sum())} valid calibration slots on {calib_label} at alpha {settings['alpha']} (need at least {math.ceil(1.0 / settings['alpha']) - 1})")
         # Empirical calibration coverage
         gcov = float(np.mean(gscore[np.isfinite(gscore)] <= gthr))
         # Record
         grid = {"refs": refs, "threshold": gthr, "coverage": gcov, "n_calibration": int(np.isfinite(gscore).sum()), "need": need}
+    # Done
+    return {"thr": thr, "missing": missing, "restriction": restriction, "grid": grid}
+
+
+def calibration_record(label, cset, settings, meters, channels):
+    """The calibration summary of one calibration set: label, alpha, mean and per-channel coverage, counts, channels without a threshold."""
+    # Thresholds
+    thr = cset["thr"]
+    # Record
+    return {"label": label, "alpha": settings["alpha"],
+            "coverage_mag_mean": float(np.nanmean(thr["cov_mag"])) if np.isfinite(thr["cov_mag"]).any() else None,
+            "coverage_ang_mean": float(np.nanmean(thr["cov_ang"])) if np.isfinite(thr["cov_ang"]).any() else None,
+            "coverage_mag": thr["cov_mag"].tolist(), "coverage_ang": thr["cov_ang"].tolist(),
+            "n_mag": thr["n_mag"].tolist(), "n_ang": thr["n_ang"].tolist(),
+            "channels_without_threshold": cset["missing"]}
+
+
+def score_source(run_dir, prefix, settings, other_prefix=None):
+    """
+    The whole pipeline for one source ("" model, "pers_" persistence):
+    calibrate on each calibration block in use, detect on every test
+    table with the thresholds of its own calibration block, match against
+    the event episodes, count false alarms over monitored time. With
+    other_prefix given and settings["common"] true, residuals are masked
+    to the slots where both sources are valid. settings is a dict with
+    alpha, mode, min_meters, merge_slots, before_minutes, after_minutes,
+    calib_label, test_prefixes, events, n_boot, seed, common, and the
+    optional era_calib rules (scoring version 2). Returns a dict of results.
+    """
+    # Windows
+    before, after = pd.Timedelta(minutes=settings["before_minutes"]), pd.Timedelta(minutes=settings["after_minutes"])
+    # Axes from the default calibration table
+    meters, channels = table_axes(load_table(run_dir, settings["calib_label"]))
+    # Grid statistic asked for, or the common-channel restriction, which needs the references too
+    use_grid = settings.get("statistic", "channel") == "grid"
+    # Restriction flag
+    restrict = bool(settings.get("restrict_common", False))
     # Events
     episodes = load_episodes(settings["events"])
     # Test tables, every requested prefix must have at least one
     labels = [lab for p in settings["test_prefixes"] for lab in list_tables(run_dir, p)]
+    # Calibration block per test label
+    calib_of, unused_rules = resolve_calibration(labels, settings)
+    # Distinct calibration blocks, the default first when present
+    calib_labels = sorted(set(calib_of.values()), key=lambda c: (c != settings["calib_label"], c))
+    # Every calibration block must be held out of training; record the splits identity
+    splits_files = {c: check_held_out(run_dir, c) for c in calib_labels}
+    # One calibration per block in use; each gets its own copy of the references, since the restriction edits them
+    cal_sets = {}
+    # Loop
+    for c in calib_labels:
+        # References from the design block when needed, fresh per calibration block
+        refs = None
+        # Build
+        if use_grid or restrict:
+            # Design table
+            des = load_table(run_dir, settings["design_label"])
+            # Design residuals
+            darr = residual_arrays(des, meters, channels, prefix)
+            # Common slots
+            if other_prefix is not None and settings["common"]:
+                # Mask
+                common_mask(darr, residual_arrays(des, meters, channels, other_prefix))
+            # References
+            refs = references(darr, settings["ref_percentile"], settings["ref_min_count"], settings["ref_floor_mag"], settings["ref_floor_ang"])
+        # Calibrate
+        cal_sets[c] = calibrate_source(run_dir, c, prefix, other_prefix, settings, meters, channels, refs)
+    # The default calibration set, for the top-level fields version 1 readers expect
+    main_label = calib_labels[0]
+    # Its pieces
+    thr, missing, restriction, grid = cal_sets[main_label]["thr"], cal_sets[main_label]["missing"], cal_sets[main_label]["restriction"], cal_sets[main_label]["grid"]
     # Load every test table once, with its residual arrays
     tables = []
     # Loop over labels
@@ -752,18 +923,24 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
     scoped, partial = episodes_in_scope(episodes, blocks, before, after)
     # Alarms, monitored time, per-block records over all test tables
     alarms, monitored_s, per_block = [], 0.0, []
-    # Exceedance counts by available-meter count, grid statistic only
+    # Exceedance counts by available-meter count, grid statistic only: pooled, and per calibration block
     by_avail = {}
+    # Per calibration block
+    by_avail_cal = {c: {} for c in calib_labels}
     # Loop over tables
     for label, arr in tables:
+        # The calibration set this block uses
+        cset = cal_sets[calib_of[label]]
+        # Its thresholds and grid
+        b_thr, b_grid = cset["thr"], cset["grid"]
         # Per-channel statistic
-        if grid is None:
+        if b_grid is None:
             # Firing channels
-            fires = exceedances(arr, thr, settings["mode"])
+            fires = exceedances(arr, b_thr, settings["mode"])
             # Meters firing per slot
             score = slot_scores(fires)
             # Monitored slots: enough meters with a residual on a thresholded channel
-            mon = monitored_slots(arr, thr, settings["mode"], settings["min_meters"])
+            mon = monitored_slots(arr, b_thr, settings["mode"], settings["min_meters"])
             # Slots inside a partly covered event window are neither alarms nor monitored
             mon &= ~window_mask(arr["t"], partial, before, after)
             # Alarm slots: enough meters firing, and the slot is monitored
@@ -771,19 +948,25 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         # Grid statistic
         else:
             # Scores and availability
-            gscore, gavail = grid_scores(arr, grid["refs"], settings["mode"], grid["need"])
+            gscore, gavail = grid_scores(arr, b_grid["refs"], settings["mode"], b_grid["need"])
             # Monitored: enough available meters, outside partial windows
             mon = np.isfinite(gscore) & ~window_mask(arr["t"], partial, before, after)
-            # Alarm: score above the one threshold
-            alarm = mon & (np.nan_to_num(gscore, nan=-np.inf) > grid["threshold"])
-            # Exceedance by available-meter count
+            # Alarm: score above this calibration block's threshold
+            alarm = mon & (np.nan_to_num(gscore, nan=-np.inf) > b_grid["threshold"])
+            # Exceedance by available-meter count, pooled and for this block's calibration set
             for a in np.unique(gavail[mon]):
                 # Slots with this count
                 sel = mon & (gavail == a)
-                # Tally
+                # Counts
+                n_sel, n_alarm = int(sel.sum()), int((alarm & sel).sum())
+                # Pooled tally
                 rec = by_avail.setdefault(int(a), {"slots": 0, "alarm_slots": 0})
                 # Add
-                rec["slots"] += int(sel.sum()); rec["alarm_slots"] += int((alarm & sel).sum())
+                rec["slots"] += n_sel; rec["alarm_slots"] += n_alarm
+                # Per calibration set
+                rec_c = by_avail_cal[calib_of[label]].setdefault(int(a), {"slots": 0, "alarm_slots": 0})
+                # Add
+                rec_c["slots"] += n_sel; rec_c["alarm_slots"] += n_alarm
         # Episodes
         eps = alarm_episodes(arr["t"], alarm, settings["merge_slots"])
         # Keep
@@ -792,8 +975,8 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         monitored_s += float(mon.sum()) * SLOT_SECONDS
         # Merged episode spans in seconds, slot-inclusive
         spans = [float((e - s0).total_seconds()) + SLOT_SECONDS for s0, e in eps]
-        # Per-block record, with the alarm-slot fraction and the merged-span summary
-        per_block.append({"label": label, "slots": int(len(arr["t"])), "monitored_slots": int(mon.sum()), "alarm_slots": int(alarm.sum()),
+        # Per-block record, with its calibration block, the alarm-slot fraction, and the merged-span summary
+        per_block.append({"label": label, "calib_label": calib_of[label], "slots": int(len(arr["t"])), "monitored_slots": int(mon.sum()), "alarm_slots": int(alarm.sum()),
                           "alarm_slot_fraction": (float(alarm.sum()) / float(mon.sum())) if mon.sum() else None,
                           "alarm_episodes": len(eps), "merged_span_median_s": float(np.median(spans)) if spans else None, "merged_span_max_s": float(max(spans)) if spans else None})
     # Match
@@ -853,18 +1036,31 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
             "channels_at_floor": {k: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(grid["refs"][f"floored_{k}"]))] for k in ("mag", "ang")},
             # Threshold and its empirical calibration coverage
             "threshold": grid["threshold"], "calibration_coverage": grid["coverage"], "n_calibration": grid["n_calibration"], "meters_needed": grid["need"],
-            # Test exceedance by available-meter count
+            # Test exceedance by available-meter count, pooled over every test block (and so over calibration sets under version 2)
             "alarm_slots_by_available_meters": {str(k): dict(v, rate=(v["alarm_slots"] / v["slots"]) if v["slots"] else None) for k, v in sorted(by_avail.items())},
+            "alarm_slots_by_available_meters_note": "pooled over all test blocks; under version 2 the per-calibration tables are in calibrations",
         },
-        # Calibration, with the per-channel coverage and counts
-        "calibration": {"label": settings["calib_label"], "alpha": settings["alpha"],
-                        "coverage_mag_mean": float(np.nanmean(thr["cov_mag"])) if np.isfinite(thr["cov_mag"]).any() else None,
-                        "coverage_ang_mean": float(np.nanmean(thr["cov_ang"])) if np.isfinite(thr["cov_ang"]).any() else None,
-                        "coverage_mag": thr["cov_mag"].tolist(), "coverage_ang": thr["cov_ang"].tolist(),
-                        "n_mag": thr["n_mag"].tolist(), "n_ang": thr["n_ang"].tolist(),
-                        "channels_without_threshold": missing},
-        # Thresholds for the record, same (meters x channels) layout as the coverage and counts
+        # Calibration of the default block, with the per-channel coverage and counts (version 1 layout)
+        "calibration": calibration_record(main_label, cal_sets[main_label], settings, meters, channels),
+        # Thresholds of the default block for the record, same (meters x channels) layout as the coverage and counts
         "thresholds": {"meters": meters, "channels": channels, "mag": thr["thr_mag"].tolist(), "ang": thr["thr_ang"].tolist()},
+        # Scoring version 2: every calibration block in use, the block-to-calibration map, and the held-out check
+        "calibrations": {c: dict(calibration_record(c, cal_sets[c], settings, meters, channels),
+                                 thresholds={"mag": cal_sets[c]["thr"]["thr_mag"].tolist(), "ang": cal_sets[c]["thr"]["thr_ang"].tolist()},
+                                 grid_threshold=None if cal_sets[c]["grid"] is None else cal_sets[c]["grid"]["threshold"],
+                                 grid_calibration_coverage=None if cal_sets[c]["grid"] is None else cal_sets[c]["grid"]["coverage"],
+                                 grid_n_calibration=None if cal_sets[c]["grid"] is None else cal_sets[c]["grid"]["n_calibration"],
+                                 # The references as this set uses them, after any restriction: exclusions and floor flags
+                                 grid_channels_without_reference=None if cal_sets[c]["grid"] is None else {k: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(~np.isfinite(cal_sets[c]["grid"]["refs"][f"ref_{k}"])))] for k in ("mag", "ang")},
+                                 grid_channels_at_floor=None if cal_sets[c]["grid"] is None else {k: [f"{meters[mi]}|{channels[ci]}" for mi, ci in zip(*np.nonzero(cal_sets[c]["grid"]["refs"][f"floored_{k}"]))] for k in ("mag", "ang")},
+                                 # Test exceedance by available-meter count for the blocks this set calibrated
+                                 grid_alarm_slots_by_available_meters=None if cal_sets[c]["grid"] is None else {str(k): dict(v, rate=(v["alarm_slots"] / v["slots"]) if v["slots"] else None) for k, v in sorted(by_avail_cal[c].items())},
+                                 restriction=cal_sets[c]["restriction"],
+                                 held_out_of_training=True, splits_file=splits_files[c]) for c in calib_labels},
+        # Which calibration block each test block used
+        "block_calibration": calib_of,
+        # Era rules that matched no test block
+        "era_rules_unused": unused_rules,
         # Blocks
         "blocks": per_block,
         # Episodes

@@ -300,6 +300,23 @@ Two exploratory options exist alongside the primary procedure and write to separ
 
 The scoring procedure, both statistics and every setting above, was fixed on November 5, 2026 and has not changed since. Results scored before that date are exploratory, since the grid statistic was designed after inspection of the first test results. Runs scored after that date, new seeds and new models alike, are primary results under the same procedure.
 
+### Scoring version 2: per-era calibration
+
+Defined November 6, 2026, before any run was scored under it. Version 1 calibrates every test block on February 2025, which is held out but far from the 2023 episodes. Version 2 calibrates each test block on a held-out quiet block of its own era, through `--era-calib PREFIX=CALIB_LABEL` rules, and writes to its own file:
+
+```bash
+python main_score.py --run-dir <run> --era-calib test_events_2023=validation_2023-11-01_2023-11-14 --out score_era.json
+python main_score.py --run-dir <run> --era-calib test_events_2023=validation_2023-11-01_2023-11-14 --statistic grid --out score_grid_era.json
+```
+
+| Test block | Calibration block |
+|---|---|
+| September 15 to 19, 2023; September 24 to 28, 2023; November 24 to December 9, 2023 | November 1 to 14, 2023 (validation block 2 of `splits_v2.json`) |
+| November 11 to 15, 2024 | February 3 to 16, 2025 (no held-out 2024 quiet block exists; January 2024 is the design block) |
+| April 1 to August 31, 2025 (quiet) | February 3 to 16, 2025, unchanged |
+
+Thresholds, and the grid threshold, are computed once per calibration block and applied to the test blocks assigned to it; the grid references stay on the design block. Each test block must match exactly one rule or fall to the default; two matching rules raise, and a rule that matches nothing is reported. Every calibration block is checked against the run's training blocks, read from the block's own summary file, and an overlap raises, so version 2 only applies to runs trained with `splits_v2.json`. The output records the version and its date, the calibration block of every test block, and for every calibration block its thresholds, counts, coverage, excluded channels, and the training-split identity. Two caveats stated in the output: version 2 is retrospective, since November 2023 follows the September 2023 events and February 2025 follows the November 2024 events, so it does not show calibration that would have been available at deployment; and the quiet block's result under version 2 is the version-1 result reused as a reference, not another evaluation, so its exposure and alarm counts are never added across versions. Version 1 results are kept unchanged.
+
 ## Data facts the code relies on
 
 Established by the scripts in `checks/`, which can be rerun with `--data-dir ../data`, and by the coverage report:
@@ -349,7 +366,7 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `main_gru.py` | Train and score the no-graph GRU baseline |
 | `main_gcn.py` | Train and score the GCN, with the topology ablation options and the masked objective |
 | `socal_score.py` | Event-detection scoring method |
-| `main_score.py` | Score one run: model and persistence, primary and exploratory statistics |
+| `main_score.py` | Score one run: model and persistence, primary and exploratory statistics, scoring version 1 or 2 |
 | `merge_years.sh` | Merges two per-year download folders into one |
 | `meters.txt` | The 22 meters, one per line |
 | `requirements.txt` | Python packages |

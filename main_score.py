@@ -21,10 +21,26 @@
 #              a result can always be traced to its settings. These are
 #              residual-only detections: silence is not scored here.
 #
+#              Scoring versions. Version 1 (fixed 2026-11-05) calibrates
+#              every test block on --calib-label. Version 2 (defined
+#              2026-11-06) adds --era-calib: rules "prefix=calib_label"
+#              that give test blocks starting with a prefix their own
+#              calibration block, so each era is calibrated on a held-out
+#              quiet block of its own. The quiet block keeps the default,
+#              so its version-2 result is the version-1 result reused, not
+#              another evaluation. Version 2 is retrospective: the 2023
+#              calibration block follows the September 2023 events, and
+#              February 2025 follows the November 2024 events. Each
+#              calibration block is checked against the run's training
+#              blocks and an overlap raises. The version and freeze date
+#              are recorded in the JSON; write version 2 to its own file.
+#
 # Usage:
 #   python main_score.py --run-dir data/processed/models/gru_full_aw001
 #   python main_score.py --run-dir /content/drive/MyDrive/socal_runs/gcn_full_aw001 --events /content/features/events.csv
 #   python main_score.py --run-dir ... --modes mag ang both --alpha 1e-4 --min-meters 2
+#   Version 2, per-era calibration, on a run trained with splits_v2.json:
+#     python main_score.py --run-dir ... --era-calib test_events_2023=validation_2023-11-01_2023-11-14 --out score_era.json
 #   Options: python main_score.py --help
 #
 # Output:
@@ -98,8 +114,32 @@ def parse_args():
     parser.add_argument("--restrict-common", action="store_true", help="Sensitivity analysis: limit both statistics to channels with both a threshold and a grid reference (needs the design block)")
     # Output name
     parser.add_argument("--out", default="score.json", help="JSON file name written into the run folder")
+    # Scoring version 2: per-era calibration rules
+    parser.add_argument("--era-calib", nargs="*", default=[], metavar="PREFIX=CALIB_LABEL", help="Version 2: test blocks whose label starts with PREFIX are calibrated on CALIB_LABEL instead of --calib-label; e.g. test_events_2023=validation_2023-11-01_2023-11-14")
     # Parse
     args = parser.parse_args()
+    # Era rules: "prefix=label" pairs, non-empty, no duplicate prefix
+    rules = []
+    # Loop
+    for item in args.era_calib:
+        # Split once
+        if "=" not in item:
+            # Reject
+            parser.error(f"--era-calib rule must be PREFIX=CALIB_LABEL, got {item}")
+        # Parts
+        prefix, label = item.split("=", 1)
+        # Both parts
+        if not prefix or not label:
+            # Reject
+            parser.error(f"--era-calib rule has an empty part: {item}")
+        # Duplicate prefix
+        if any(prefix == r[0] for r in rules):
+            # Reject
+            parser.error(f"--era-calib prefix given twice: {prefix}")
+        # Keep
+        rules.append([prefix, label])
+    # Store
+    args.era_calib = rules
     # Alpha must be a proper level
     if not 0.0 < args.alpha < 1.0:
         # Reject
@@ -139,6 +179,12 @@ def parse_args():
         if args.design_label == args.calib_label:
             # Reject
             parser.error("--design-label and --calib-label must be different blocks")
+    # The design block chose models, so it is never a calibration block under either statistic
+    for prefix, label in args.era_calib:
+        # Reject
+        if label == args.design_label:
+            # Say which
+            parser.error(f"--era-calib {prefix}={label} uses the design block (model selection) as a calibration block")
     # Return
     return args
 
@@ -193,9 +239,16 @@ def main():
         "statistic": args.statistic, "design_label": args.design_label, "ref_percentile": args.ref_percentile, "ref_min_count": args.ref_min_count, "ref_floor_mag": args.ref_floor_mag, "ref_floor_ang": args.ref_floor_ang,
         # Restriction
         "restrict_common": args.restrict_common,
+        # Scoring version: 2 with era rules, else 1, with the freeze dates
+        "era_calib": args.era_calib,
+        "scoring_version": 2 if args.era_calib else 1,
+        "scoring_version_date": "2026-11-06" if args.era_calib else "2026-11-05",
+        "scoring_note": ("version 2, per-era calibration: retrospective, the calibration blocks follow the events of their era in time; the quiet block's result is the version-1 result reused" if args.era_calib else "version 1, one calibration block for every test block"),
     }
     # Results per mode
     out = {"run_dir": os.path.abspath(args.run_dir), "settings": settings, "modes": {}}
+    # Version line
+    print(f"scoring version {settings['scoring_version']} ({settings['scoring_version_date']}): {settings['scoring_note']}")
     # Statistic line
     print(f"statistic: {args.statistic}" + (" (exploratory; references from the design block, one threshold from the calibration block)" if args.statistic == "grid" else " (primary)") + ("; restricted to channels with both a threshold and a reference (sensitivity analysis)" if args.restrict_common else ""))
     # Header
@@ -210,6 +263,14 @@ def main():
         pers = ss.score_source(args.run_dir, "pers_", settings_mode, other_prefix="")
         # Keep
         out["modes"][mode] = {"model": model, "persistence": pers}
+        # Version 2: which calibration block each test block used, and rules that matched nothing, once
+        if settings["era_calib"] and mode == args.modes[0]:
+            # Resolution
+            print("  calibration per test block: " + "; ".join(f"{b['label']} <- {b['calib_label']}" for b in model["blocks"]))
+            # Unused rules
+            if model["era_rules_unused"]:
+                # Say so
+                print(f"  WARNING: era rules that matched no test block: {model['era_rules_unused']}")
         # Print
         print(line(f"model / {mode}", model))
         # Print
@@ -242,12 +303,14 @@ def main():
         if model["restriction"] is not None:
             # Print
             print("  restriction: " + "; ".join(f"{k}: {v['channels_kept']} channels kept, dropped {v['channels_dropped']}" for k, v in model["restriction"].items() if k in ("mag", "ang")))
-        # Channels without thresholds, once per mode
-        miss = model["calibration"]["channels_without_threshold"]
-        # Report if any
-        if miss["mag"] or miss["ang"]:
-            # Say so
-            print(f"  (model: no threshold for {len(miss['mag'])} mag and {len(miss['ang'])} ang channels)")
+        # Channels without thresholds, per calibration block in use
+        for c, rec in model["calibrations"].items():
+            # Missing
+            miss = rec["channels_without_threshold"]
+            # Formatter for optional numbers
+            g = lambda v, d=5: "n/a" if v is None else f"{v:.{d}f}"
+            # Report
+            print(f"  (model, calibration {c}: no threshold for {len(miss['mag'])} mag and {len(miss['ang'])} ang channels; coverage mag {g(rec['coverage_mag_mean'])} ang {g(rec['coverage_ang_mean'])}" + (f"; grid threshold {g(rec['grid_threshold'], 3)}, coverage {g(rec['grid_calibration_coverage'])}" if rec["grid_threshold"] is not None else "") + ")")
     # Path
     path = os.path.join(args.run_dir, args.out)
     # Write, with no NaN allowed so the file is standard JSON
