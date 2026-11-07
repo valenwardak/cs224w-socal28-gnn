@@ -70,6 +70,24 @@
 #              untouched history. Built for graph_meters.json, where every
 #              meter but egauge_24 has a metered neighbor one hop away.
 #
+# Time-indexed graph (added 2026-11-07 after the topology audit): --graph
+#              may name graph_meters_periods.json, written by
+#              main_metergraphs.py, which holds one meter-edge set per
+#              distinct wiring and the half-open periods each was in force.
+#              The data side then attaches a period index to every window:
+#              the period holding the window's last history slot (the
+#              pre-target rule, so no window is built with wiring it could
+#              not have seen). A time outside every period raises. The model
+#              holds every edge set and the period-to-graph table; the
+#              caller converts period indices to graph ids with
+#              model.graph_ids and passes those to forward, which builds an
+#              independent graph for each example in the batch (no edges
+#              between examples) and recomputes the GCN normalization on
+#              every call (cached=False). With a fixed graph file nothing
+#              changes: one edge set, graph_ids None, the same tensors and
+#              the same state_dict keys as before, so older checkpoints load.
+#              Masked mode with a time-indexed graph is refused for now.
+#
 # Batches:     assembled in bulk with array indexing (get_batch on the
 #              datasets, iter_batches below), not one example at a time,
 #              which was the cost in the first smoke test.
@@ -142,7 +160,9 @@
 #     iter_batches(dataset, batch_size, shuffle, rng, device)
 #                                     yield tensor batches from either dataset kind
 #   Graph
-#     load_graph(path)                graph.json
+#     load_graph(path)                graph.json, graph_meters.json, or the time-indexed file
+#     graph_kind(body)                "fixed" or "timeline", from the file's layout
+#     load_timeline(body)             validated timeline: graphs in graph.json layout, periods, period_graph
 #     meter_node_index(graph, manifest)
 #                                     (M,) node index per meter
 #     build_edges(graph, mode, weights, seed)
@@ -151,6 +171,7 @@
 #     zero_head(layer)                start a head at zero weights, for predict-delta
 #     MeterGRU                        shared meter-conditioned GRU with a forecast head
 #     GraphForecaster                 MeterGRU encoder + one GNN layer + head, with the masked mode
+#                                     and per-example edge sets for the time-indexed graph
 #     persistence_forecast(x, C)      last valid reading as the forecast, with validity
 #     draw_masks(y_valid, maskable)   one hidden meter per window for training
 #     masked_forecast(model, x, chunk)
@@ -189,6 +210,8 @@ import torch.nn as nn
 from tqdm import tqdm
 # Project: data side
 import socal_modeldata as sd
+# Project: the period lookup for the time-indexed graph
+import socal_metergraph as smg
 
 # Feature count per channel, from the data module
 F = sd.F
@@ -209,9 +232,16 @@ class GraphWindowDataset:
     A window is kept when at least min_meters meters pass the gap rule and
     have a valid target. The per-meter rule is the same one WindowDataset
     uses, so the GRU and the GNNs train on the same target slots.
+
+    With t (UTC seconds per slot) and a timeline (load_timeline), every
+    window also carries the index of the topology period holding its last
+    history slot, t[start + history - 1]. A last history slot outside
+    every period raises here, at dataset construction. The batch extra is
+    then (B, 2): target slot and period index. Without a timeline the extra
+    is (B,) target slots, as before.
     """
 
-    def __init__(self, X, mag_valid, ang_valid, history, horizon, max_gap, min_meters=1):
+    def __init__(self, X, mag_valid, ang_valid, history, horizon, max_gap, min_meters=1, t=None, timeline=None):
         # Keep the arrays
         self.X, self.history, self.horizon = X, history, horizon
         # Sizes
@@ -238,6 +268,18 @@ class GraphWindowDataset:
         self.starts = np.nonzero(usable.sum(axis=1) >= min_meters)[0]
         # Usable flags for the kept windows
         self.usable = usable[self.starts]
+        # Period per window, from the last history slot
+        self.period = None
+        # Time-indexed graph
+        if timeline is not None:
+            # Slot times are needed
+            if t is None:
+                # Raise
+                raise ValueError("a timeline needs the slot times t")
+            # Last history slot of every kept window
+            last = np.asarray(t, dtype=np.int64)[self.starts + history - 1]
+            # Period index, raises when a time lies outside every period
+            self.period = smg.period_index_at(timeline["periods"], last).astype(np.int64) if len(last) else np.zeros(0, dtype=np.int64)
 
     def __len__(self):
         """Number of windows."""
@@ -254,8 +296,10 @@ class GraphWindowDataset:
         x = self.X[s:s + self.history].reshape(self.history, self.X.shape[1], -1)
         # Validity, zeroed for meters that fail the gap rule in this window
         y_valid = self.y_valid[target] & self.usable[i][:, None, None]
+        # Extra: target slot, with the period when time-indexed
+        extra = int(target) if self.period is None else np.array([target, self.period[i]], dtype=np.int64)
         # Return
-        return x, self.y[target], y_valid, int(target)
+        return x, self.y[target], y_valid, extra
 
     def get_batch(self, idx):
         """
@@ -263,7 +307,8 @@ class GraphWindowDataset:
           x        (B, history, M, C * F)
           y        (B, M, C, 3)
           y_valid  (B, M, C, 2)
-          target   (B,) int64 target slot index
+          extra    (B,) int64 target slot index, or (B, 2) int64
+                   [target slot, period index] with a timeline
         """
         # Starts
         s = self.starts[idx]
@@ -275,15 +320,18 @@ class GraphWindowDataset:
         target = s + self.history + self.horizon - 1
         # Validity with the per-meter gap rule applied
         y_valid = self.y_valid[target] & self.usable[idx][:, :, None, None]
+        # Extra: target slot alone, or with the period index
+        extra = target.astype(np.int64) if self.period is None else np.stack([target.astype(np.int64), self.period[idx]], axis=1)
         # Return
-        return x, self.y[target], y_valid, target.astype(np.int64)
+        return x, self.y[target], y_valid, extra
 
 
 def iter_batches(dataset, batch_size, shuffle, rng, device):
     """
     Yield tensor batches (x, y, y_valid, extra) from either dataset kind,
     assembled in bulk with get_batch. extra is the meter index for the
-    per-meter dataset and the target slot for the synchronized one.
+    per-meter dataset and the target slot for the synchronized one, or
+    [target slot, period index] when the synchronized one is time-indexed.
     """
     # Example order
     order = np.arange(len(dataset))
@@ -306,7 +354,7 @@ def iter_batches(dataset, batch_size, shuffle, rng, device):
 # -----------------------------------------------------------------------------
 
 def load_graph(path):
-    """Read graph.json."""
+    """Read a graph file: graph.json, graph_meters.json, or graph_meters_periods.json. See graph_kind."""
     # Fail with the path tried
     if not os.path.exists(path):
         # Raise
@@ -315,6 +363,79 @@ def load_graph(path):
     with open(path) as f:
         # Parse
         return json.load(f)
+
+
+def graph_kind(body):
+    """
+    "fixed" for a graph.json-layout file (nodes, edges, meters), "timeline"
+    for the time-indexed file (nodes, meters, graphs, periods). Raises for
+    anything else.
+    """
+    # Time-indexed
+    if "graphs" in body and "periods" in body:
+        # Timeline
+        return "timeline"
+    # Fixed
+    if "nodes" in body and "edges" in body and "meters" in body:
+        # Plain
+        return "fixed"
+    # Unknown
+    raise ValueError("graph file is neither a fixed graph (nodes, edges, meters) nor a timeline (graphs, periods)")
+
+
+def load_timeline(body):
+    """
+    Validate a time-indexed graph file and return
+      graphs        list of graphs in graph.json layout (nodes, edges,
+                    meters), one per edge set, sharing nodes and meters
+      periods       the file's periods, each with start_utc, end_utc_exclusive, graph
+      period_graph  numpy int64 (P,) graph index per period
+    Checks: every period names an existing graph; periods are in time
+    order, half-open, contiguous, no gap or overlap; every edge joins two
+    different valid nodes; every meter has a node. Raises otherwise.
+    """
+    # Parts
+    nodes, meters, graphs, periods = body["nodes"], body["meters"], body["graphs"], body["periods"]
+    # At least one of each
+    if not graphs or not periods:
+        # Raise
+        raise ValueError("timeline has no graphs or no periods")
+    # Periods in order and contiguous
+    for a, b in zip(periods[:-1], periods[1:]):
+        # Half-open contiguity
+        if a["end_utc_exclusive"] != b["start_utc"]:
+            # Raise
+            raise ValueError(f"timeline periods {a['index']} and {b['index']} are not contiguous")
+    # Each period non-empty and naming a graph
+    for p in periods:
+        # Bounds
+        if not p["end_utc_exclusive"] > p["start_utc"]:
+            # Raise
+            raise ValueError(f"timeline period {p['index']} is empty or reversed")
+        # Graph index
+        if not 0 <= int(p["graph"]) < len(graphs):
+            # Raise
+            raise ValueError(f"timeline period {p['index']} names graph {p['graph']}, but there are {len(graphs)} graphs")
+    # Edges valid
+    for g in graphs:
+        # Loop
+        for e in g["edges"]:
+            # Ends
+            if not (0 <= e["source"] < len(nodes) and 0 <= e["target"] < len(nodes) and e["source"] != e["target"]):
+                # Raise
+                raise ValueError(f"timeline graph {g['index']} has an invalid edge {e['source']}-{e['target']}")
+    # Meters have nodes
+    for m, rec in meters.items():
+        # Node
+        if rec.get("node") is None or not 0 <= int(rec["node"]) < len(nodes):
+            # Raise
+            raise ValueError(f"timeline meter {m} has no valid node")
+    # Graphs in graph.json layout, sharing the fixed nodes and meters
+    out = [{"nodes": nodes, "edges": g["edges"], "meters": meters} for g in graphs]
+    # Period to graph
+    period_graph = np.array([int(p["graph"]) for p in periods], dtype=np.int64)
+    # Done
+    return {"graphs": out, "periods": periods, "period_graph": period_graph}
 
 
 def meter_node_index(graph, manifest):
@@ -492,11 +613,32 @@ class GraphForecaster(nn.Module):
     kind: "gcn", "gat", or "sage". Needs torch_geometric. gnn_layers is
     the number of message-passing hops; one hop does not reach a meter
     that sits two edges away behind an unmetered node.
+
+    edge_sets is a list of (edge_index, edge_weight) pairs, one per graph.
+    A fixed graph gives a list of one. Graph 0 is stored under the buffer
+    names edge_index and edge_weight, as before, so a fixed-graph model has
+    the same state_dict as it always had; graph k > 0 is stored as
+    edge_index_k and edge_weight_k. period_graph (P,) maps a topology
+    period to its graph and is a plain tensor attribute, not a buffer:
+    graph_ids converts period indices with it. forward takes graph ids,
+    never period indices.
     """
 
-    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_index, edge_weight, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None):
+    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_sets, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None, period_graph=None):
         # Base class
         super().__init__()
+        # A single pair is accepted as a list of one
+        if isinstance(edge_sets, tuple) and len(edge_sets) == 2 and torch.is_tensor(edge_sets[0]):
+            # Wrap
+            edge_sets = [edge_sets]
+        # Need at least one edge set
+        if not edge_sets:
+            # Raise
+            raise ValueError("at least one edge set is required")
+        # Masked mode is for a fixed graph only, for now
+        if masked and len(edge_sets) > 1:
+            # Raise
+            raise ValueError("masked mode with a time-indexed graph is not supported yet")
         # Masked mode: hidden meters are forecast from their neighbors, never from persistence
         self.masked = masked
         # Whether the head outputs a correction to the persistence forecast; never in masked mode
@@ -519,10 +661,26 @@ class GraphForecaster(nn.Module):
         self.encoder = MeterGRU(n_meters, n_channels, hidden, embed, layers, dropout)
         # Meter to node, fixed
         self.register_buffer("meter_node", meter_node)
-        # Edges, fixed
-        self.register_buffer("edge_index", edge_index)
-        # Weights, fixed
-        self.register_buffer("edge_weight", edge_weight)
+        # Number of edge sets
+        self.n_graphs = len(edge_sets)
+        # Edge sets as buffers: graph 0 under the old names, others numbered
+        for k, (ei, ew) in enumerate(edge_sets):
+            # Shapes must agree
+            if ei.shape[0] != 2 or ew.shape[0] != ei.shape[1]:
+                # Raise
+                raise ValueError(f"edge set {k}: edge_index {tuple(ei.shape)} and edge_weight {tuple(ew.shape)} do not match")
+            # Names
+            suffix = "" if k == 0 else f"_{k}"
+            # Edges
+            self.register_buffer(f"edge_index{suffix}", ei)
+            # Weights
+            self.register_buffer(f"edge_weight{suffix}", ew)
+        # Period to graph table; a fixed graph has one period mapping to graph 0
+        self.period_graph = torch.zeros(1, dtype=torch.long) if period_graph is None else torch.as_tensor(np.asarray(period_graph), dtype=torch.long)
+        # Every entry must name an edge set
+        if int(self.period_graph.max()) >= self.n_graphs or int(self.period_graph.min()) < 0:
+            # Raise
+            raise ValueError("period_graph names a graph that has no edge set")
         # Learned vector for nodes without a meter
         self.unmetered = nn.Parameter(torch.zeros(hidden))
         # Message passing layers, gnn_layers of them, each one hop
@@ -531,8 +689,8 @@ class GraphForecaster(nn.Module):
         for _ in range(gnn_layers):
             # By kind
             if kind == "gcn":
-                # Scalar edge weights, self-loops added by the layer
-                convs.append(GCNConv(hidden, hidden, add_self_loops=True))
+                # Scalar edge weights, self-loops added by the layer; cached=False so the normalization is recomputed for every edge set
+                convs.append(GCNConv(hidden, hidden, add_self_loops=True, cached=False))
             elif kind == "gat":
                 # Attention with the weight as a one-number edge feature
                 convs.append(GATConv(hidden, hidden, heads=heads, concat=False, edge_dim=1, add_self_loops=True))
@@ -559,16 +717,81 @@ class GraphForecaster(nn.Module):
         # Keep
         self.register_buffer("node_count", counts)
 
-    def forward(self, x, mask=None):
+    def edge_set(self, k):
+        """Edge set k as (edge_index, edge_weight)."""
+        # Names
+        suffix = "" if k == 0 else f"_{k}"
+        # Pair
+        return getattr(self, f"edge_index{suffix}"), getattr(self, f"edge_weight{suffix}")
+
+    def graph_ids(self, period_index):
+        """
+        Graph ids (B,) for period indices (B,), through the period_graph
+        table. Raises for a period outside the table. This is the only
+        place a period index becomes a graph id.
+        """
+        # Table on the right device
+        table = self.period_graph.to(period_index.device)
+        # Range check
+        if int(period_index.min()) < 0 or int(period_index.max()) >= len(table):
+            # Raise
+            raise ValueError(f"period index outside the timeline of {len(table)} periods")
+        # Map
+        return table[period_index]
+
+    def batch_edges(self, B, graph_ids, device):
+        """
+        Edges of the B stacked graphs: example b's nodes sit at offset
+        b * n_nodes and its edges come from edge set graph_ids[b], so no
+        edge joins two examples. graph_ids None means graph 0 for every
+        example. Returns (edge_index (2, sum E_b), edge_weight (sum E_b,)).
+        """
+        # Fixed graph: the old path, graph 0 repeated
+        if graph_ids is None:
+            # Offsets
+            offsets = torch.arange(B, device=device) * self.n_nodes
+            # Edge index for the stacked graphs
+            ei = torch.cat([self.edge_index + o for o in offsets], dim=1)
+            # Weights repeated
+            ew = self.edge_weight.repeat(B)
+            # Done
+            return ei, ew
+        # Per example
+        if graph_ids.shape != (B,):
+            # Raise
+            raise ValueError(f"graph_ids must have shape ({B},), got {tuple(graph_ids.shape)}")
+        # Pieces
+        eis, ews = [], []
+        # Group examples by graph id
+        for g in torch.unique(graph_ids).tolist():
+            # Examples using this graph
+            rows = torch.nonzero(graph_ids == g).squeeze(1)
+            # Its edges
+            ei, ew = self.edge_set(g)
+            # Each example's copy, offset by its position in the batch
+            eis.append((ei[:, None, :] + (rows * self.n_nodes)[None, :, None]).reshape(2, -1))
+            # Weights, one copy per example
+            ews.append(ew.repeat(len(rows)))
+        # Stack
+        return torch.cat(eis, dim=1), torch.cat(ews)
+
+    def forward(self, x, mask=None, graph_ids=None):
         """
         x (B, H, M, C * F) -> forecast (B, M, C, 3).
         mask (B, M) bool, masked mode only: True hides that meter's whole
         history from the input before anything reads it, and adds the mask
         token to its encoder state. Every other meter is forecast as usual
         in the same pass; only the hidden meters' forecasts are neighbor-based.
+        graph_ids (B,) long: the edge set each example passes messages
+        over, from graph_ids(); None uses graph 0 for every example, the
+        fixed-graph path.
         """
         # Sizes
         B, H, M, _ = x.shape
+        # Masked mode with per-example graphs is refused
+        if mask is not None and graph_ids is not None:
+            # Raise
+            raise ValueError("masked mode with per-example graphs is not supported yet")
         # Hide the masked meters before the encoder, persistence, or anything else sees x
         if mask is not None:
             # Must be in masked mode
@@ -593,12 +816,8 @@ class GraphForecaster(nn.Module):
         nodes = nodes.index_add(1, self.meter_node, own) - self.unmetered * (self.node_count > 0).float()[None, :, None]
         # Average nodes with more than one meter
         nodes = nodes / self.node_count.clamp(min=1)[None, :, None]
-        # Message passing per example: PyG works on one graph at a time, so batch by stacking graphs
-        offsets = torch.arange(B, device=x.device) * self.n_nodes
-        # Edge index for the stacked graphs
-        ei = torch.cat([self.edge_index + o for o in offsets], dim=1)
-        # Weights repeated
-        ew = self.edge_weight.repeat(B)
+        # Message passing per example: PyG works on one graph at a time, so batch by stacking independent graphs
+        ei, ew = self.batch_edges(B, graph_ids, x.device)
         # Stacked node features
         mixed = nodes.reshape(B * self.n_nodes, self.hidden)
         # Each layer is one hop, with a residual connection
@@ -718,6 +937,10 @@ def masked_forecast(model, x, chunk):
     if chunk < 1:
         # Raise
         raise ValueError(f"mask chunk must be at least 1, got {chunk}")
+    # Masked evaluation runs on the fixed graph only
+    if getattr(model, "n_graphs", 1) != 1:
+        # Raise
+        raise ValueError("masked mode with a time-indexed graph is not supported yet")
     # Sizes
     B, H, M, _ = x.shape
     # Meters to hide, in index order
@@ -804,11 +1027,14 @@ def residuals(y_hat, y, y_valid):
 # Training
 # -----------------------------------------------------------------------------
 
-def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None):
+def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None, timeline=None):
     """
     Build a model by name: "gru", "gcn", "gat", or "sage". With masked,
     maskable_meters is the list of meter names that may be hidden, fixed
-    by the caller from the true graph, not from the edges in use.
+    by the caller from the true graph, not from the edges in use. With a
+    timeline (load_timeline), graph is ignored: one edge set is built per
+    timeline graph with the same --edges control and seed, and the
+    period-to-graph table goes to the model.
     """
     # Sizes
     M, C = len(manifest["meters"]), len(manifest["channels"])
@@ -820,14 +1046,30 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
             raise ValueError("masked mode needs a graph model")
         # Build
         return MeterGRU(M, C, hidden, embed, layers, dropout, predict_delta)
-    # GNNs need the graph
-    if graph is None:
-        # Raise
-        raise ValueError("a graph is required for a GNN")
-    # Meter placement
-    meter_node = meter_node_index(graph, manifest)
-    # Edges
-    edge_index, edge_weight = build_edges(graph, edges, edge_weights, seed)
+    # Time-indexed: the graphs come from the timeline
+    if timeline is not None:
+        # Masked mode is refused with a timeline
+        if masked:
+            # Raise
+            raise ValueError("masked mode with a time-indexed graph is not supported yet")
+        # Graphs
+        graphs = timeline["graphs"]
+        # Table
+        period_graph = timeline["period_graph"]
+    # Fixed
+    else:
+        # GNNs need the graph
+        if graph is None:
+            # Raise
+            raise ValueError("a graph is required for a GNN")
+        # One graph
+        graphs = [graph]
+        # One period, graph 0
+        period_graph = None
+    # Meter placement, shared by every graph (the timeline checks guarantee one node order)
+    meter_node = meter_node_index(graphs[0], manifest)
+    # One edge set per graph, same control and seed for each
+    edge_sets = [build_edges(g, edges, edge_weights, seed) for g in graphs]
     # Maskable flags in manifest order
     maskable = None
     # Masked mode
@@ -845,7 +1087,7 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
         # Flags
         maskable = [m in maskable_meters for m in manifest["meters"]]
     # Build
-    return GraphForecaster(kind, M, C, len(graph["nodes"]), meter_node, edge_index, edge_weight, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable)
+    return GraphForecaster(kind, M, C, len(graphs[0]["nodes"]), meter_node, edge_sets, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable, period_graph)
 
 
 def new_sums():
@@ -880,6 +1122,12 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None, 
     masked = getattr(model, "masked", False)
     # Loop
     for x, y, y_valid, extra in batches:
+        # Time-indexed batch: extra is (B, 2) [target slot, period index]; convert the period to a graph id
+        graph_ids = model.graph_ids(extra[:, 1]) if (graph_mode and extra.dim() == 2) else None
+        # Masked mode never takes per-example graphs
+        if masked and graph_ids is not None:
+            # Raise
+            raise ValueError("masked mode with a time-indexed graph is not supported yet")
         # Masked training: one hidden meter per window, loss on it alone
         if masked and optimizer is not None:
             # Draw from the validity before masking
@@ -902,8 +1150,8 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None, 
             y_valid = y_valid & keep[None, :, None, None]
         # Ordinary forward
         else:
-            # Forward
-            y_hat = model(x) if graph_mode else model(x, extra)
+            # Forward, with the per-example graphs when time-indexed
+            y_hat = model(x, graph_ids=graph_ids) if graph_mode else model(x, extra)
         # Loss for the gradient step, batch-level means are fine for optimization
         loss, _, _ = masked_loss(y_hat, y, y_valid, angle_weight)
         # Train step
@@ -953,14 +1201,14 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None, 
                 sums["per_meter_n"][int(mi)] = sums["per_meter_n"].get(int(mi), 0.0) + float(n)
 
 
-def make_dataset(piece, graph_mode, history, horizon, max_gap, min_meters=1):
-    """The right dataset kind over one block-month piece, or None when it has no window."""
+def make_dataset(piece, graph_mode, history, horizon, max_gap, min_meters=1, timeline=None):
+    """The right dataset kind over one block-month piece, or None when it has no window. With a timeline, the synchronized dataset carries period indices."""
     # Unpack
-    _, _, _, X, mag_valid, ang_valid = piece
+    _, _, t, X, mag_valid, ang_valid = piece
     # Dataset
     if graph_mode:
-        # Synchronized
-        ds = GraphWindowDataset(X, mag_valid, ang_valid, history, horizon, max_gap, min_meters)
+        # Synchronized, time-indexed when a timeline is given
+        ds = GraphWindowDataset(X, mag_valid, ang_valid, history, horizon, max_gap, min_meters, t=t, timeline=timeline)
     else:
         # Per meter
         ds = sd.WindowDataset(X, mag_valid, ang_valid, history, horizon, max_gap)
@@ -968,7 +1216,7 @@ def make_dataset(piece, graph_mode, history, horizon, max_gap, min_meters=1):
     return ds if len(ds) else None
 
 
-def evaluate(model, features_dir, splits, split_name, scale, manifest, device, graph_mode, history, horizon, max_gap, batch_size, angle_weight, blocks=None, mask_chunk=7):
+def evaluate(model, features_dir, splits, split_name, scale, manifest, device, graph_mode, history, horizon, max_gap, batch_size, angle_weight, blocks=None, mask_chunk=7, timeline=None):
     """
     Pooled loss over a split, or over the listed block indices of it:
     error sums divided by valid counts, so batch sizes do not bias it.
@@ -990,7 +1238,7 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
         # Loop over pieces, with a progress bar that clears when done
         for piece in tqdm(sd.iter_blocks(features_dir, subset, split_name, scale, manifest=manifest), total=n_pieces, desc=f"{split_name} pieces", leave=False):
             # Dataset
-            ds = make_dataset(piece, graph_mode, history, horizon, max_gap)
+            ds = make_dataset(piece, graph_mode, history, horizon, max_gap, timeline=timeline)
             # Skip empty
             if ds is None:
                 # Next
@@ -1010,10 +1258,14 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
 
 
 # Options that define the experiment; a resumed run must match them
-EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id")
+EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection")
 # Keys added after the first checkpoints were written. A checkpoint without "masked" was not masked, so it
-# compares as False; the other two are compared only when the checkpoint holds them
-LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None}
+# compares as False, and a checkpoint without "graph_selection" used one fixed graph, so it compares as "fixed";
+# the other two are compared only when the checkpoint holds them. graph_selection is "fixed" (one graph for
+# every window) or "last_history_slot" (the time-indexed rule)
+LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed"}
+# Later keys whose default stands in for a missing saved value instead of skipping the comparison
+DEFAULTED_KEYS = ("masked", "graph_selection")
 
 
 def save_atomic(body, path):
@@ -1062,15 +1314,15 @@ def load_checkpoint(path, model, options, optimizer=None, device="cpu", rng=None
     body = torch.load(path, map_location=device, weights_only=False)
     # Saved options
     saved = body.get("options", {})
-    # Compare the keys that define the experiment. "masked" missing from the checkpoint means False;
-    # the other later keys are skipped when the checkpoint predates them
+    # Compare the keys that define the experiment. "masked" missing from the checkpoint means False and
+    # "graph_selection" missing means "fixed"; the other later keys are skipped when the checkpoint predates them
     diffs = {}
     # Loop
     for k in EXPERIMENT_KEYS:
         # Saved value, with the later-key defaults
         have = saved.get(k, LATER_KEYS.get(k))
-        # Skip a later key the checkpoint lacks, except "masked" which defaults to False
-        if k in LATER_KEYS and k not in saved and k != "masked":
+        # Skip a later key the checkpoint lacks, except the defaulted ones
+        if k in LATER_KEYS and k not in saved and k not in DEFAULTED_KEYS:
             # Next
             continue
         # Current value, with the same defaults, so a main script that does not set a later key (main_gru.py) still matches
@@ -1099,7 +1351,7 @@ def load_checkpoint(path, model, options, optimizer=None, device="cpu", rng=None
     return body.get("epoch", 0), body.get("best", float("inf")), body.get("stale", 0)
 
 
-def train(model, features_dir, splits, scale, manifest, device, options, checkpoint_path, log):
+def train(model, features_dir, splits, scale, manifest, device, options, checkpoint_path, log, timeline=None):
     """
     Train for options["epochs"] epochs over the train split, one block-
     month piece at a time in a shuffled order, with early stopping on
@@ -1143,7 +1395,7 @@ def train(model, features_dir, splits, scale, manifest, device, options, checkpo
                 # Next
                 continue
             # Dataset, the piece tuple needs the two label slots the function ignores
-            ds = make_dataset((None, None) + piece, graph_mode, options["history"], options["horizon"], options["max_gap"], options.get("min_meters", 1))
+            ds = make_dataset((None, None) + piece, graph_mode, options["history"], options["horizon"], options["max_gap"], options.get("min_meters", 1), timeline=timeline)
             # Skip empty
             if ds is None:
                 # Next
@@ -1157,7 +1409,7 @@ def train(model, features_dir, splits, scale, manifest, device, options, checkpo
         # Pooled training loss
         tr = pooled(sums, options["angle_weight"])
         # Validation on block 0 only, raises if empty
-        val = evaluate(model, features_dir, splits, "validation", scale, manifest, device, graph_mode, options["history"], options["horizon"], options["max_gap"], options["batch_size"], options["angle_weight"], blocks=[0], mask_chunk=options.get("mask_chunk", 7))
+        val = evaluate(model, features_dir, splits, "validation", scale, manifest, device, graph_mode, options["history"], options["horizon"], options["max_gap"], options["batch_size"], options["angle_weight"], blocks=[0], mask_chunk=options.get("mask_chunk", 7), timeline=timeline)
         # Report
         log(f"epoch {epoch + 1}: train {tr['loss']:.5f}  val {val['loss']:.5f} (mag {val['mag']:.5f} ang {val['ang']:.5f}, {int(val['mag_n'])} targets)  {time.time() - t0:.0f} s")
         # Masked mode: windows that had no eligible meter to hide
@@ -1200,7 +1452,7 @@ def train(model, features_dir, splits, scale, manifest, device, options, checkpo
 # Scoring
 # -----------------------------------------------------------------------------
 
-def score_split(model, features_dir, splits, split_name, scale, manifest, device, options, out_dir, log):
+def score_split(model, features_dir, splits, split_name, scale, manifest, device, options, out_dir, log, timeline=None):
     """
     Write one residual table per block of a split:
       <out_dir>/<label>.parquet  index t_utc, columns "<meter>|<channel>|<name>"
@@ -1228,7 +1480,7 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
         # Loop over pieces
         for label, month, t, X, mag_valid, ang_valid in sd.iter_blocks(features_dir, splits, split_name, scale, manifest=manifest):
             # Dataset, every meter kept so residuals exist wherever a meter is usable
-            ds = make_dataset((label, month, t, X, mag_valid, ang_valid), graph_mode, options["history"], options["horizon"], options["max_gap"], min_meters=1)
+            ds = make_dataset((label, month, t, X, mag_valid, ang_valid), graph_mode, options["history"], options["horizon"], options["max_gap"], min_meters=1, timeline=timeline)
             # Nothing
             if ds is None:
                 # Next
@@ -1255,18 +1507,20 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
                     y_valid = y_valid & keep[None, :, None, None]
                 # Ordinary forecast
                 else:
+                    # Per-example graphs when the batch carries period indices
+                    graph_ids = model.graph_ids(extra[:, 1]) if (graph_mode and extra.dim() == 2) else None
                     # Forward
-                    y_hat = model(x) if graph_mode else model(x, extra)
+                    y_hat = model(x, graph_ids=graph_ids) if graph_mode else model(x, extra)
                 # Residuals
                 mr, ar = residuals(y_hat, y, y_valid)
                 # Persistence residuals under its own validity
                 pmr, par = residuals(y_pers, y, p_valid)
                 # Place into the piece arrays
                 B = len(x)
-                # Graph: extra is the target slot, every meter at once
+                # Graph: extra is the target slot (first column when time-indexed), every meter at once
                 if graph_mode:
                     # Slots
-                    slots = extra.cpu().numpy()
+                    slots = (extra[:, 0] if extra.dim() == 2 else extra).cpu().numpy()
                     # Write
                     res["mag_res"][slots] = mr; res["ang_res"][slots] = ar
                     # Persistence

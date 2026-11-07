@@ -28,7 +28,35 @@
 #              each edge records the physical path it came from, so an
 #              electrical weight can be added later without rebuilding.
 #
+# Time-indexed meter graphs (graph_meters_periods.json, added 2026-11-07
+#              after the topology audit): the switch records in
+#              topology/parameter_timeseries/ change the wiring over the
+#              record, and one snapshot is wrong for the transferred
+#              periods and for the months before February 2024 when the
+#              buses of egauge_3 and egauge_4 were open. The functions
+#              below cut the record into half-open periods at the switch
+#              changes, build the meter graph inside each period, keep the
+#              distinct edge sets with graph 0 reserved for the verified
+#              reference graph, and record per period what else changes
+#              with the topology (each meter's merged bus set and
+#              component, read from the physical graph) apart from what
+#              does not (the 22 meter nodes, their order, registers, and
+#              ratings). Graphs are distinct by edge set only.
+#              period_index_at maps a time to the period in force (not to a
+#              graph index; the period names its graph), for the pre-target
+#              rule applied by the data side: a window's graph is the one
+#              in force at its last history slot.
+#
 # Functions:
+#   read_switch_records(ts_dir)        every switch's state records, collapsed
+#   build_periods(changes, start, end) half-open periods between change groups
+#   graph_signature(meter_graph)       the edge set as a sorted tuple of meter pairs
+#   topology_meta(meter_graph, physical)
+#                                      per-meter merged bus set and component, from the physical graph
+#   build_period_graphs(build_fn, periods, reference_time)
+#                                      distinct meter graphs over the periods, graph 0 the reference,
+#                                      with the topology meta of every period
+#   period_index_at(periods, t_utc)    index of the period in force at a UTC second
 #   adjacency(graph)                   neighbor sets per physical node, with
 #                                      the element that joins each pair
 #   meters_by_node(graph)              physical node index -> meter names
@@ -45,6 +73,185 @@
 
 # Standard library: breadth-first search queue
 from collections import deque
+# Standard library: CSV switch records
+import csv
+# Standard library: paths
+import os
+# Third party: timestamps
+import pandas as pd
+
+
+def read_switch_records(ts_dir):
+    """
+    Every switch's records from <switch>-tbus_status.csv in ts_dir, as a
+    dict switch -> list of (naive timestamp, state) with repeated unchanged
+    records collapsed. Times are in the files' own time base (fixed PST).
+    """
+    # Result
+    out = {}
+    # Loop over files
+    for fn in sorted(os.listdir(ts_dir)):
+        # Only status files
+        if not fn.endswith("-tbus_status.csv"):
+            # Next
+            continue
+        # Switch name
+        switch = fn[:-len("-tbus_status.csv")]
+        # Read
+        with open(os.path.join(ts_dir, fn)) as f:
+            # Rows after the header
+            rows = [r for r in csv.reader(f)][1:]
+        # Records
+        recs = []
+        # Loop
+        for t, state in rows:
+            # Collapse repeats
+            if recs and recs[-1][1] == state:
+                # Skip
+                continue
+            # Keep
+            recs.append((pd.Timestamp(t), state))
+        # Store
+        out[switch] = recs
+    # Done
+    return out
+
+
+def build_periods(records, start, end):
+    """
+    Half-open topology periods [t0, t1) in the files' time base from
+    `start` to `end`, cut at every distinct change time strictly inside
+    the record. Simultaneous changes form one group. Each period carries
+    the changes that opened it as (switch, old, new); the first is empty.
+    """
+    # Bounds in order
+    if not end > start:
+        # Raise
+        raise ValueError(f"record end {end} is not after record start {start}")
+    # Every change
+    changes = []
+    # Loop over switches
+    for switch, recs in sorted(records.items()):
+        # Pairs
+        for (t0, s0), (t1, s1) in zip(recs[:-1], recs[1:]):
+            # Keep
+            changes.append((t1, switch, s0, s1))
+    # Distinct times inside the record
+    times = sorted({t for t, *_ in changes if start < t < end})
+    # Bounds
+    bounds = [start] + times + [end]
+    # Periods
+    out = []
+    # Loop
+    for t0, t1 in zip(bounds[:-1], bounds[1:]):
+        # Group at t0
+        group = [(sw, s0, s1) for t, sw, s0, s1 in changes if t == t0]
+        # Keep
+        out.append({"start": t0, "end": t1, "changes": group})
+    # Done
+    return out
+
+
+def graph_signature(meter_graph):
+    """The edge set of a meter graph as a sorted tuple of (meter, meter) name pairs: equal signatures mean the same wiring between meters."""
+    # Names
+    names = [n["meter"] for n in meter_graph["nodes"]]
+    # Pairs
+    return tuple(sorted(tuple(sorted((names[e["source"]], names[e["target"]]))) for e in meter_graph["edges"]))
+
+
+def topology_meta(meter_graph, physical):
+    """
+    What changes with the topology, per meter: the full bus set merged into
+    the meter's physical node and that node's component id, both read from
+    the physical graph the meter graph was built from. Generated node
+    indices are not stored: they are not stable between builds.
+    """
+    # Per meter
+    out = {}
+    # Loop over meter nodes
+    for n in meter_graph["nodes"]:
+        # The physical node this meter sat on
+        pnode = physical["nodes"][n["physical_node"]]
+        # Record
+        out[n["meter"]] = {"node_buses": sorted(pnode["buses"]), "component": pnode.get("component")}
+    # Done
+    return out
+
+
+def build_period_graphs(build_fn, periods, reference_time):
+    """
+    Distinct meter graphs over the periods. build_fn(t) returns the pair
+    (meter graph, physical graph) in force at naive time t. Graph 0 is the
+    graph at reference_time, the verified reference; every period's graph
+    is built at the period's midpoint and kept only when its edge set
+    differs from every graph already kept. Returns (graphs, period_index,
+    period_topology): graphs is a list of {"signature", "edges", "built_at",
+    "nodes"}, period_index[i] is the graph index of period i, and
+    period_topology[i] is topology_meta for period i. Every graph must
+    have the same nodes in the same order as graph 0, else this raises.
+    """
+    # Reference graph
+    ref, ref_physical = build_fn(pd.Timestamp(reference_time))
+    # Kept graphs
+    graphs = [{"signature": graph_signature(ref), "edges": ref["edges"], "built_at": str(pd.Timestamp(reference_time)), "nodes": ref["nodes"]}]
+    # Period index and topology
+    index, topology = [], []
+    # Loop
+    for p in periods:
+        # Midpoint
+        mid = p["start"] + (p["end"] - p["start"]) / 2
+        # Build
+        g, physical = build_fn(mid)
+        # Nodes must match graph 0
+        if [n["meter"] for n in g["nodes"]] != [n["meter"] for n in ref["nodes"]]:
+            # Raise
+            raise ValueError(f"meter graph at {mid} has different nodes from the reference")
+        # Signature
+        sig = graph_signature(g)
+        # Known by edge set
+        known = next((i for i, k in enumerate(graphs) if k["signature"] == sig), None)
+        # New
+        if known is None:
+            # Keep
+            graphs.append({"signature": sig, "edges": g["edges"], "built_at": str(mid), "nodes": g["nodes"]})
+            # Index
+            known = len(graphs) - 1
+        # Record
+        index.append(known)
+        # Topology of this period
+        topology.append(topology_meta(g, physical))
+    # Done
+    return graphs, index, topology
+
+
+def period_index_at(periods, t_utc):
+    """
+    Index of the PERIOD in force at UTC second(s) t_utc, from a periods
+    list whose entries carry start_utc and end_utc_exclusive as seconds.
+    This is not a graph index: the graph is periods[index]["graph"].
+    Half-open: a period holds t when start_utc <= t < end_utc_exclusive.
+    Raises when a time lies outside every period. Accepts a scalar or a
+    numpy array and returns the same shape.
+    """
+    # Numpy for the vector case
+    import numpy as np
+    # Bounds
+    starts = np.array([p["start_utc"] for p in periods], dtype=np.int64)
+    # Ends
+    ends = np.array([p["end_utc_exclusive"] for p in periods], dtype=np.int64)
+    # Times
+    t = np.asarray(t_utc, dtype=np.int64)
+    # Period index: last start <= t
+    idx = np.searchsorted(starts, t, side="right") - 1
+    # Outside: before the first start or at or after the matching end
+    bad = (idx < 0) | (t >= ends[np.clip(idx, 0, len(ends) - 1)])
+    # Raise with the first offender
+    if np.any(bad):
+        # Raise
+        raise ValueError(f"time {int(np.asarray(t).reshape(-1)[np.argmax(np.asarray(bad).reshape(-1))])} s UTC lies outside every topology period")
+    # Done
+    return idx
 
 
 def adjacency(graph):

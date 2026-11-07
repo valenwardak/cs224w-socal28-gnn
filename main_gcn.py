@@ -41,6 +41,18 @@
 #              recorded in the options. The output layout is unchanged, so
 #              main_score.py scores a masked run like any other.
 #
+#              Time-indexed graph (added 2026-11-07): --graph may name
+#              graph_meters_periods.json from main_metergraphs.py instead
+#              of a fixed graph. The file's layout decides which path runs.
+#              With the timeline, every window passes messages over the
+#              wiring in force at its last history slot (the pre-target
+#              rule), the model holds one edge set per distinct wiring, and
+#              the --edges control is applied to each of them with the same
+#              seed. The run records graph_selection = "last_history_slot"
+#              (a fixed graph records "fixed") and the file's identity, so
+#              a resume or --score-only with the other kind of file is
+#              refused. --masked with a timeline is refused for now.
+#
 #              Ablations (the proposal's "does the graph help" test):
 #                --edges true     the real wiring            (default)
 #                --edges random   same number of edges, random node pairs
@@ -63,6 +75,10 @@
 #     python main_gcn.py --run-name gcn_v1 --score-only
 #   Masked model on the meter graph with the held-out 2023 block:
 #     python main_gcn.py --run-name gcn_masked --masked --graph graph_meters.json --splits splits_v2.json --angle-weight 0.01
+#   Time-indexed meter graph, smoke test on September 2023 (holds two transfers):
+#     python main_gcn.py --train-months 2023-09 --epochs 2 --hidden 16 --angle-weight 0.01 --run-name smoke_dyn --graph graph_meters_periods.json --splits splits_v2.json --score-splits validation
+#   Time-indexed meter graph, full run:
+#     python main_gcn.py --run-name gcn_dyn --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01
 #   Options: python main_gcn.py --help
 #
 # Requires torch_geometric (pip install torch_geometric) for the GCN layers.
@@ -113,7 +129,7 @@ def parse_args():
     # Splits
     parser.add_argument("--splits", default="splits.json", help="Split definition written by main_splits.py")
     # Graph: the wiring the model passes messages over, and the clamp ratings and nominal voltages behind the scale
-    parser.add_argument("--graph", default="graph.json", help="Graph file written by main_graph.py")
+    parser.add_argument("--graph", default="graph.json", help="Graph file: graph.json or graph_meters.json (fixed), or graph_meters_periods.json (time-indexed)")
     # Which edges to use, the ablation switch
     parser.add_argument("--edges", choices=["true", "random", "none"], default="true", help="true = real wiring, random = same count between random nodes, none = no edges")
     # How to weight the edges
@@ -315,8 +331,20 @@ def main():
         log(f"training restricted to months {months}: {len(splits['train'])} block pieces")
     # Identity of the training data, checked on resume
     train_blocks = [f"{b['start_utc']}/{b['end_utc_exclusive']}" for b in splits["train"]]
-    # Graph, required for a GNN, loaded before the options so its identity and maskable meters are recorded
-    graph = sm.load_graph(args.graph)
+    # Graph file, required for a GNN, loaded before the options so its identity and maskable meters are recorded
+    body = sm.load_graph(args.graph)
+    # Fixed graph or time-indexed timeline, from the file's layout
+    kind = sm.graph_kind(body)
+    # Time-indexed: validate and keep the timeline; the fixed graph is graph 0 for the scale and the report
+    timeline = sm.load_timeline(body) if kind == "timeline" else None
+    # The graph for the fixed path, or graph 0 of the timeline
+    graph = body if timeline is None else timeline["graphs"][0]
+    # How each window's graph is chosen, recorded with the run
+    graph_selection = "fixed" if timeline is None else "last_history_slot"
+    # Masked mode with a timeline is refused for now
+    if args.masked and timeline is not None:
+        # Raise
+        raise ValueError("--masked with a time-indexed graph is not supported yet; use a fixed graph file")
     # Identity of the graph file, checked on resume: its name and a hash of its contents, not its path, so Colab and local runs agree
     graph_id = graph_identity(args.graph)
     # Maskable meters, from the file as written, the same for every --edges control
@@ -341,8 +369,8 @@ def main():
         "hidden": args.hidden, "embed": args.embed, "layers": args.layers, "dropout": args.dropout, "gnn_layers": args.gnn_layers, "heads": 0, "predict_delta": predict_delta,
         # Graph options
         "edges": args.edges, "edge_weights": args.edge_weights, "min_meters": args.min_meters,
-        # Graph identity and the masked objective
-        "graph_id": graph_id, "masked": args.masked, "maskable_meters": maskable_meters, "mask_chunk": args.mask_chunk,
+        # Graph identity, how each window's graph is chosen, and the masked objective
+        "graph_id": graph_id, "graph_selection": graph_selection, "masked": args.masked, "maskable_meters": maskable_meters, "mask_chunk": args.mask_chunk,
         # Training
         "lr": args.lr, "weight_decay": args.weight_decay, "batch_size": args.batch_size, "angle_weight": args.angle_weight,
         # Stopping
@@ -373,13 +401,18 @@ def main():
         # Report
         log(f"computed scale from {int(count.sum())} valid train readings, saved to {scale_path}; nominal fallback used for {len(used)} channels" + (f": {used}" if used else ""))
     # Report the graph
-    log(f"graph {args.graph}: {len(graph['nodes'])} nodes, {len(graph['edges'])} edges, edges={args.edges}, edge_weights={args.edge_weights}")
+    if timeline is None:
+        # Fixed
+        log(f"graph {args.graph}: {len(graph['nodes'])} nodes, {len(graph['edges'])} edges, edges={args.edges}, edge_weights={args.edge_weights}, selection fixed")
+    else:
+        # Time-indexed
+        log(f"graph {args.graph}: time-indexed, {len(graph['nodes'])} nodes, {len(timeline['graphs'])} edge sets ({[len(g['edges']) for g in timeline['graphs']]} edges) over {len(timeline['periods'])} periods, edges={args.edges}, edge_weights={args.edge_weights}, selection last_history_slot")
     # Report the masked setup
     if args.masked:
         # Names
         log(f"masked objective: {len(maskable_meters)} maskable meters {maskable_meters}; not maskable: {[m for m in manifest['meters'] if m not in maskable_meters]}; {args.mask_chunk} meters per evaluation pass")
     # Model
-    model = sm.make_model("gcn", manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters).to(device)
+    model = sm.make_model("gcn", manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters, timeline=timeline).to(device)
     # Parameter count
     log(f"model gcn with {sum(p.numel() for p in model.parameters())} parameters")
     # Checkpoint path
@@ -387,7 +420,7 @@ def main():
     # Train unless scoring only
     if not args.score_only:
         # Train, best weights restored at the end
-        best = sm.train(model, args.features_dir, splits, scale, manifest, device, options, checkpoint_path, log)
+        best = sm.train(model, args.features_dir, splits, scale, manifest, device, options, checkpoint_path, log, timeline=timeline)
         # Report
         log(f"training done, best validation loss {best:.5f}")
     # Scoring only: check the saved options against the current ones, then load the best weights
@@ -419,7 +452,7 @@ def main():
         # Announce
         log(f"scoring {split_name}")
         # Write residuals
-        sm.score_split(model, args.features_dir, splits, split_name, scale, manifest, device, options, run_dir, log)
+        sm.score_split(model, args.features_dir, splits, split_name, scale, manifest, device, options, run_dir, log, timeline=timeline)
     # Done
     log("done")
 
