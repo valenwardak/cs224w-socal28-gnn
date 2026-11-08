@@ -36,8 +36,10 @@
 #              under that window's graph and a donor exists in every draw;
 #              the reference residual and the --min-windows rule use the
 #              same windows. Angle comparisons need both forecast vectors
-#              to have a norm of at least --norm-floor; the number excluded
-#              is reported. The per-meter spread of the donor medians across
+#              to have a norm of at least --norm-floor; the numbers excluded
+#              are reported separately for forecast-change and angle-error
+#              comparisons, with the usable counts. Donor counts pool the
+#              draws, so they are window-channel-draw comparisons. The per-meter spread of the donor medians across
 #              draws is printed for every meter.
 #              Controls: an unperturbed second forward must reproduce the
 #              forecast exactly; in a run trained with --edges none,
@@ -345,14 +347,16 @@ def perturb_and_measure(model, x, graph_ids, y, y_valid, y0, m, neigh_mask, wind
     keep = vm
     # Current flag per window-channel
     cur = is_current[None, :].expand_as(keep)
-    # Excluded angle comparisons among kept rows: a valid angle target whose forecasts were unusable
-    excluded = int((va & ~(ok0 & ok1) & keep).sum()) + int((~ok_change & keep).sum())
+    # Excluded forecast-change comparisons among kept rows: a forecast direction unusable before or after
+    excl_change = int((~ok_change & keep).sum())
+    # Excluded angle-error comparisons among kept rows: a valid angle target whose forecasts were unusable
+    excl_error = int((va & ~(ok0 & ok1) & keep).sum())
     # Flatten
     out = {
         "d_mag": d_mag[keep].cpu().numpy(), "d_phys": d_phys[keep].cpu().numpy(), "d_ang": d_ang[keep].cpu().numpy(),
         "e0_mag": e0_mag[keep].cpu().numpy(), "e1_mag": e1_mag[keep].cpu().numpy(),
         "e0_ang": e0_ang[keep].cpu().numpy(), "e1_ang": e1_ang[keep].cpu().numpy(),
-        "current": cur[keep].cpu().numpy(), "excluded": np.array([excluded]),
+        "current": cur[keep].cpu().numpy(), "excl_change": np.array([excl_change]), "excl_error": np.array([excl_error]),
     }
     # Done
     return out
@@ -372,7 +376,7 @@ def summarize(rows):
     chg = ~np.isnan(cat["d_ang"])
     # Summary
     return {
-        "n": int(len(cat["d_mag"])), "n_ang": int(ang.sum()), "excluded": int(cat["excluded"].sum()),
+        "n": int(len(cat["d_mag"])), "n_chg": int(chg.sum()), "excl_change": int(cat["excl_change"].sum()), "n_ang": int(ang.sum()), "excl_error": int(cat["excl_error"].sum()),
         "d_mag": float(np.median(cat["d_mag"])),
         "d_volts": float(np.median(cat["d_phys"][~cat["current"]])) if (~cat["current"]).any() else float("nan"),
         "d_amps": float(np.median(cat["d_phys"][cat["current"]])) if cat["current"].any() else float("nan"),
@@ -467,7 +471,9 @@ def main():
         # More
         print("  dang = median angle change in degrees; emag 0>1 = median magnitude error before > after, worse = share of window-channels with a larger error after;")
         # More
-        print("  eang 0>1 and worse likewise for the angle (usable directions only); n_ang = usable angle comparisons, excl = excluded for an unusable direction")
+        print("  eang 0>1 and worse likewise for the angle (usable directions only); counts are window-channel comparisons, and donor counts pool the draws, so each")
+        # More
+        print("  eligible window-channel appears once per draw; chg = usable / excluded angle-change comparisons, err = usable / excluded angle-error comparisons")
         # Skipped
         isolated, thin = [], []
         # Overall collections
@@ -527,7 +533,7 @@ def main():
             # Degree text
             deg = f"{min(degrees)}" if len(degrees) == 1 else f"{min(degrees)}-{max(degrees)}"
             # Header line for the meter
-            print(f"\n{meters[m]} nbrs {deg}, win {n_el}, ref {ref:.5f}, n_ang {sdn['n_ang']}, excl {sdn['excluded']} (donor) / {sz['excluded']} (zero)")
+            print(f"\n{meters[m]} nbrs {deg}, win {n_el}, ref {ref:.5f}; donor ({args.draws} draws): {sdn['n']} comparisons, chg {sdn['n_chg']}/{sdn['excl_change']}, err {sdn['n_ang']}/{sdn['excl_error']}; zero: {sz['n']} comparisons, chg {sz['n_chg']}/{sz['excl_change']}, err {sz['n_ang']}/{sz['excl_error']}")
             # Donor line
             print(f"  donor  dmag {sdn['d_mag']:.5f}  dV {sdn['d_volts']:.3f}  dA {sdn['d_amps']:.3f}  rel {sdn['d_mag'] / ref:.2f}  dang {sdn['d_ang']:.2f}  emag {sdn['e0_mag']:.5f}>{sdn['e1_mag']:.5f} worse {sdn['worse_mag']:.2f}  eang {sdn['e0_ang']:.2f}>{sdn['e1_ang']:.2f} worse {sdn['worse_ang']:.2f}  draws dmag {min(per_draw):.5f}-{max(per_draw):.5f}")
             # Zero line
@@ -541,7 +547,7 @@ def main():
             # Pool size
             n_tot = sum(s_["n"] for s_ in all_donor)
             # Median of per-meter medians
-            print(f"\noverall, median over {len(all_donor)} meters: donor dmag {np.median([s_['d_mag'] for s_ in all_donor]):.5f} scaled, dang {np.nanmedian([s_['d_ang'] for s_ in all_donor]):.2f} deg, worse magnitude share {np.median([s_['worse_mag'] for s_ in all_donor]):.2f}, worse angle share {np.nanmedian([s_['worse_ang'] for s_ in all_donor]):.2f}; zero dmag {np.median([s_['d_mag'] for s_ in all_zero]):.5f}, dang {np.nanmedian([s_['d_ang'] for s_ in all_zero]):.2f} deg, worse magnitude share {np.median([s_['worse_mag'] for s_ in all_zero]):.2f}; {n_tot} window-channels")
+            print(f"\noverall, median over {len(all_donor)} meters (donor counts pool the draws): donor dmag {np.median([s_['d_mag'] for s_ in all_donor]):.5f} scaled, dang {np.nanmedian([s_['d_ang'] for s_ in all_donor]):.2f} deg, worse magnitude share {np.median([s_['worse_mag'] for s_ in all_donor]):.2f}, worse angle share {np.nanmedian([s_['worse_ang'] for s_ in all_donor]):.2f}; zero dmag {np.median([s_['d_mag'] for s_ in all_zero]):.5f}, dang {np.nanmedian([s_['d_ang'] for s_ in all_zero]):.2f} deg, worse magnitude share {np.median([s_['worse_mag'] for s_ in all_zero]):.2f}; {n_tot} donor window-channel-draw comparisons")
         # Control 2: in a no-edge run, replacing or zeroing every other meter leaves the target unchanged
         if options["edges"] == "none":
             # Largest change and windows tested
