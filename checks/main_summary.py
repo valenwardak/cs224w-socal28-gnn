@@ -29,7 +29,10 @@
 #              (alpha, minimum meters, merge gap, event window, common
 #              mask, restriction, calibration mapping) with differences
 #              flagged, so rows are not read as if scored under identical
-#              rules when they were not:
+#              rules when they were not; the same settings are printed under
+#              each file in the single-run block (calibration label and era
+#              rules separately, and the grid statistic's design label,
+#              reference percentile, minimum count, and floors):
 #              one row per run and score file, with the detected episode
 #              ids and the quiet-block false alarms per day and share of
 #              slots in alarm for each mode.
@@ -77,6 +80,7 @@
 #   ids_text(pairs)           "3 (650 s), 8 (520 s)" or "none"
 #   pct(x)                    a fraction as a percent string, or "n/a"
 #   rate(x)                   a per-day rate to one decimal, or "n/a"
+#   split_of(r, name)         the per-split entry whose key starts with name
 #   split_line(r, name)       false alarms per day and share of slots in alarm for one split
 #   summarize_run(run_dir, files, modes)
 #                             print one run's summary, return rows for the table and the plots
@@ -197,11 +201,13 @@ def scope(r):
 
 def settings_line(st):
     """The scoring settings of one file that matter when comparing rows, as a dict."""
-    # Pick
+    # Pick: detection rules, calibration, and the grid statistic's references
     return {"alpha": st.get("alpha"), "min_meters": st.get("min_meters"), "merge_slots": st.get("merge_slots"),
             "before_minutes": st.get("before_minutes"), "after_minutes": st.get("after_minutes"),
             "common": st.get("common"), "restrict_common": st.get("restrict_common"),
-            "calibration": st.get("era_calib") or st.get("calib_label")}
+            "calib_label": st.get("calib_label"), "era_calib": st.get("era_calib"),
+            "design_label": st.get("design_label"), "ref_percentile": st.get("ref_percentile"), "ref_min_count": st.get("ref_min_count"),
+            "ref_floor_mag": st.get("ref_floor_mag"), "ref_floor_ang": st.get("ref_floor_ang")}
 
 
 def ids_text(pairs):
@@ -226,10 +232,22 @@ def rate(x):
     return "n/a" if x is None else f"{x:.2f}"
 
 
+def split_of(r, name):
+    """The per-split entry whose key starts with name (the score file keys splits by their table prefix, e.g. test_normal_), or None."""
+    # Scan
+    for key, val in r.get("per_split", {}).items():
+        # Match by prefix
+        if key.startswith(name):
+            # Found
+            return val
+    # None
+    return None
+
+
 def split_line(r, name):
     """False alarms per day and share of slots in alarm for one split of a result, with the longest merged span."""
     # The split
-    s = r.get("per_split", {}).get(name)
+    s = split_of(r, name)
     # Missing
     if s is None:
         # Say
@@ -272,6 +290,8 @@ def summarize_run(run_dir, files, modes):
         label = f"scoring version {st.get('scoring_version', 1)}, {st.get('statistic', 'channel')} statistic"
         # Print, with the version 2 caveat
         print(f"  {label} ({fname})" + (" (quiet block figures are the version 1 result reused, as the scoring notes)" if st.get("scoring_version", 1) == 2 else ""))
+        # The settings this file was scored with
+        print("    settings: " + ", ".join(f"{k}={v}" for k, v in settings_line(st).items() if v is not None))
         # Row, with the settings that matter for comparing rows
         row = {"run": name, "file": label, "modes": {}, "settings": settings_line(st)}
         # Loop over modes
@@ -299,7 +319,7 @@ def summarize_run(run_dir, files, modes):
             # Persistence
             print(f"      persistence detected {len(pd_)}: {ids_text(pd_)}")
             # Quiet block
-            pq = pers.get('per_split', {}).get('test_normal', {})
+            pq = split_of(pers, 'test_normal') or {}
             # Lines
             print(f"      quiet block, model: {split_line(model, 'test_normal')}; persistence {rate(pq.get('false_alarms_per_day'))} per day, {pct(pq.get('alarm_slot_fraction'))} of slots in alarm")
             # Event blocks
@@ -307,9 +327,9 @@ def summarize_run(run_dir, files, modes):
             # Pooled
             print(f"      pooled over all test blocks, model: {rate(model.get('false_alarms_per_day'))} false alarms per day")
             # Table cell
-            quiet = model.get("per_split", {}).get("test_normal", {})
+            quiet = split_of(model, "test_normal") or {}
             # Persistence quiet block
-            pquiet = pers.get("per_split", {}).get("test_normal", {})
+            pquiet = split_of(pers, "test_normal") or {}
             # Store, with what the plots need
             row["modes"][mode] = {"ids": [i for i, _ in md], "fa": quiet.get("false_alarms_per_day"), "frac": quiet.get("alarm_slot_fraction"),
                                   "model": md, "pers": pd_, "pers_fa": pquiet.get("false_alarms_per_day"), "pers_frac": pquiet.get("alarm_slot_fraction"),
