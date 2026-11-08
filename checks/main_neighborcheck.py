@@ -41,6 +41,14 @@
 #              comparisons, with the usable counts. Donor counts pool the
 #              draws, so they are window-channel-draw comparisons. The per-meter spread of the donor medians across
 #              draws is printed for every meter.
+#              Angle summary (printed before the perturbations, on the
+#              same sampled windows): quantiles of the norm of the model's
+#              (cos, sin) forecast and the fraction below --norm-floor, and
+#              quantiles of the angle error of the model and of persistence
+#              on the same valid angle targets where both directions are
+#              usable, with the exclusions counted once each by the first
+#              failing reason (target, model, persistence), so a change in
+#              the angle loss between horizons can be read.
 #              Controls: an unperturbed second forward must reproduce the
 #              forecast exactly; in a run trained with --edges none,
 #              replacing (and separately zeroing) every other meter's
@@ -78,6 +86,8 @@
 #   neighbor_sets(model, n_meters)  per edge set, the list of neighbor meters of every meter
 #   pick_donors(ds, idx, rng, span) one non-overlapping donor window per sampled window, same period
 #   circular_change(a, b, floor)    wrapped angle difference in degrees between two (cos, sin) vectors, and which are usable
+#   angle_summary(x, y, y_valid, y0, C, floor)
+#                                   forecast norm quantiles and model versus persistence angle error quantiles
 #   perturb_and_measure(...)        forecasts and errors under one perturbation, for one target meter, on the windows given
 #   summarize(rows)                 medians and shares over window-channels
 #   main()                          run the check for every run given
@@ -300,6 +310,60 @@ def circular_change(a, b, floor):
     return torch.where(ok, deg, torch.full_like(deg, float("nan"))), ok
 
 
+def angle_summary(x, y, y_valid, y0, n_channels, floor):
+    """
+    Print the quantiles (5, 25, 50, 75, 95 percent) of the norm of the
+    model's (cos, sin) forecast over valid angle targets and the fraction
+    below floor; then the angle error quantiles of the model and of
+    persistence on the same valid angle targets where the target and both
+    forecast directions are usable, with the number of targets excluded.
+    """
+    # Persistence forecast and its validity on the same windows
+    yp, vp = sm.persistence_forecast(x, n_channels)
+    # Valid angle targets
+    va = y_valid[..., 1]
+    # None at all
+    if int(va.sum()) == 0:
+        # Say and return; the rest of the diagnostic continues
+        print("angle summary on the sampled windows: no valid angle targets")
+        # Done
+        return
+    # Model forecast norm over valid angle targets
+    norm = y0[..., 1:3].norm(dim=-1)[va]
+    # Quantiles
+    q = torch.quantile(norm.float(), torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95], device=norm.device)).tolist()
+    # Print
+    print(f"angle summary on the sampled windows: model (cos, sin) norm quantiles 5/25/50/75/95 = {q[0]:.3f} {q[1]:.3f} {q[2]:.3f} {q[3]:.3f} {q[4]:.3f} over {int(va.sum())} valid angle targets; fraction below the floor {floor:g}: {float((norm < floor).float().mean()):.4f}")
+    # Direction usability of each vector on its own
+    t_ok = y[..., 1:3].norm(dim=-1) >= floor
+    # Model
+    m_ok = y0[..., 1:3].norm(dim=-1) >= floor
+    # Persistence: had an angle to copy and its norm reaches the floor
+    p_ok = vp[..., 1] & (yp[..., 1:3].norm(dim=-1) >= floor)
+    # Angle errors
+    e_model, _ = circular_change(y0[..., 1:3], y[..., 1:3], floor)
+    # Persistence
+    e_pers, _ = circular_change(yp[..., 1:3], y[..., 1:3], floor)
+    # Common usable set
+    common = va & t_ok & m_ok & p_ok
+    # Mutually exclusive exclusion reasons, in this order: target, then model, then persistence
+    ex_t = va & ~t_ok
+    # Model, target fine
+    ex_m = va & t_ok & ~m_ok
+    # Persistence, target and model fine
+    ex_p = va & t_ok & m_ok & ~p_ok
+    # Print
+    print(f"  angle error on {int(common.sum())} common targets; excluded {int((va & ~common).sum())} of the valid angle targets, by first failing reason: target direction {int(ex_t.sum())}, model direction {int(ex_m.sum())}, persistence direction or no angle to copy {int(ex_p.sum())}")
+    # Quantiles of each
+    for name, e in (("model", e_model), ("persistence", e_pers)):
+        # Values
+        v = e[common].float()
+        # Quantiles
+        qe = torch.quantile(v, torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95], device=v.device)).tolist() if len(v) else [float("nan")] * 5
+        # Print
+        print(f"  {name:12s} angle error quantiles 5/25/50/75/95 = {qe[0]:.1f} {qe[1]:.1f} {qe[2]:.1f} {qe[3]:.1f} {qe[4]:.1f} degrees")
+
+
 def perturb_and_measure(model, x, graph_ids, y, y_valid, y0, m, neigh_mask, window_mask, replacement, scale_m, is_current, norm_floor):
     """
     Forecast for target meter m after replacing the histories of the
@@ -442,6 +506,8 @@ def main():
             y0b = model(x, graph_ids=graph_ids)
         # Control 1: reproduction
         all_ok &= report("control 1: an unperturbed second forward reproduces the forecast", float((y0 - y0b).abs().max()) <= args.atol, f"max abs diff {float((y0 - y0b).abs().max()):.2e}")
+        # Angle summary before any perturbation
+        angle_summary(x, y, y_valid, y0, C, args.norm_floor)
         # Neighbor sets per edge set
         nsets = neighbor_sets(model, M)
         # Donors per draw
