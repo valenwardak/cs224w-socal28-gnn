@@ -24,7 +24,7 @@ The data is not stored in this repo. Each team member downloads it with the scri
 4. Physics baseline: `main_physics.py` runs a least-squares state estimator with no learning over any window or split and writes a residual per ten-second slot to `data/processed/physics/`.
 5. Feature tables: `main_features.py` exports the processed tables as compact monthly files in `data/features/` for training on Colab.
 6. Graph: `main_graph.py` writes the grid's electrical graph to `graph.json`, which every GNN loads. `main_metergraph.py` derives the meter graph `graph_meters.json` from it, and `main_metergraphs.py` writes the time-indexed meter graph `graph_meters_periods.json`, one edge set per distinct wiring over the record.
-7. Learned models: `main_gru.py` (no graph) and `main_gcn.py` (graph) train on Colab from `data/features/`, `graph.json`, and `splits.json`, and write a residual per slot, meter, and channel.
+7. Learned models: `main_gru.py` (no graph) and `main_gnn.py` (graph: GCN, GAT, or GraphSAGE by `--kind`; `main_gcn.py` runs it with the GCN default) train on Colab from `data/features/`, `graph.json`, and `splits.json`, and write a residual per slot, meter, and channel.
 8. Scoring: `main_score.py` turns any run's residuals into event-detection scores with one fixed procedure, for the model and for the persistence baseline alike.
 
 ## Step 1: get access (once per person)
@@ -255,7 +255,7 @@ Models:
 
 - Persistence: the forecast is the last valid reading. No parameters. Every learned model is compared with it.
 - GRU (`main_gru.py`): one GRU shared by all meters with a learned meter embedding. Each meter forecasts its next reading from its own ten-minute history. No graph.
-- GCN (`main_gcn.py`): the same GRU encodes every meter's history, the states are placed on the nodes of `graph.json` (meters sharing a node are averaged, nodes without a meter get one learned vector), GCN layers pass messages along the lines and transformers with `admittance_abs` as the edge weight, and a head reads each meter's own state together with its node's state. `--edges true|random|none` and `--edge-weights admittance|binary` are the topology ablation. GAT and GraphSAGE use the same class with the kind changed.
+- GCN (`main_gnn.py --kind gcn`, or `main_gcn.py`): the same GRU encodes every meter's history, the states are placed on the nodes of `graph.json` (meters sharing a node are averaged, nodes without a meter get one learned vector), GCN layers pass messages along the lines and transformers with `admittance_abs` as the edge weight, and a head reads each meter's own state together with its node's state. `--edges true|random|none` and `--edge-weights admittance|binary` are the topology ablation. GAT (`--kind gat`, attention over neighbors with `--heads` heads, the edge weight given as a one-number edge feature) and GraphSAGE (`--kind sage`, mean of the neighbors, weights unused) use the same class, encoder, head, loss, data path, and checkpoint rules; only the message-passing layer differs. The run records the kind, so a resume with another kind is refused. `main_gcn.py` is kept as a wrapper that runs `main_gnn.py`, whose default kind is the GCN, so every earlier command works unchanged.
 
 Every learned model forecasts the change from the last valid reading (`--predict-delta`, default on): the head's output is added to the persistence forecast, and the head starts at zero weights so the first forecast is persistence itself. The loss is squared error on the scaled magnitude plus `--angle-weight` times squared error on (cos, sin), each over its own valid targets. A window is dropped when its history holds a run of `--max-gap` absent slots (default 12, two minutes). Validation block 0 (January 2024) is for early stopping and design choices; block 1 (February 2025) is reserved for calibration and never chooses a model.
 
@@ -381,7 +381,8 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `socal_modeldata.py` | Model data side: feature loading, scale, inputs, windows |
 | `socal_models.py` | Models, persistence, loss, training loop, residual output |
 | `main_gru.py` | Train and score the no-graph GRU baseline |
-| `main_gcn.py` | Train and score the GCN, with the topology ablation options, the masked objective, and the time-indexed graph |
+| `main_gnn.py` | Train and score the graph models (GCN, GAT, GraphSAGE by `--kind`), with the topology ablation options, the masked objective, and the time-indexed graph |
+| `main_gcn.py` | Wrapper that runs `main_gnn.py`, whose default kind is the GCN, kept so earlier commands work |
 | `socal_score.py` | Event-detection scoring method |
 | `main_score.py` | Score one run: model and persistence, primary and exploratory statistics, scoring version 1 or 2 |
 | `merge_years.sh` | Merges two per-year download folders into one |
