@@ -8,6 +8,10 @@ Stanford CS224W, Fall 2026, Project Type 1 (Real-World Applications of GNNs)
 
 We test whether a graph neural network (GNN) that knows the wiring of a real distribution grid detects switching events better than the same model without the graph. The data is the SoCal 28-Bus dataset from Caltech: 28 buses, 22 metered, ten-second synchrophasor readings, time-varying topology, and operator-logged switch and breaker events used only for evaluation. The proposal PDF is in this repo.
 
+## Results so far
+
+Across three training seeds, the true-wiring GCN on the time-indexed meter graph showed no consistent overall detection advantage over the matched no-edge model. All six runs detected the same three episodes in angle mode under the original scoring procedure. The graph influenced forecasts, especially angles, but did not consistently improve detection or reduce false alarms. GAT and GraphSAGE at seed 0 gave similar forecasting losses and no clear detection advantage over the GCN. Four of the seven logged episodes were detected by no learned model.
+
 ## Dataset
 
 - Paper: https://arxiv.org/abs/2504.06588
@@ -221,7 +225,7 @@ The GRU baseline does not use the graph. Each meter forecasts from its own histo
 
 ### The meter graph
 
-24 of the 43 nodes carry no meter, and they sit between the metered ones. A reach check on `graph.json` found that with one GCN layer 13 of the 22 meters receive nothing from any other meter, only the learned vectors of unmetered nodes; the nearest other meter is three or four hops away for most of them. A model that must predict a hidden meter from its neighbors needs those neighbors one hop away, so `main_metergraph.py` writes a second graph, `graph_meters.json`, from `graph.json` without changing it:
+24 of the 43 nodes carry no meter, and they sit between the metered ones. A reach check on `graph.json` found that with one GCN layer 13 of the 22 meters receive nothing from any other meter, only the learned vectors of unmetered nodes. For eleven of the 22 meters, the nearest meter on a different physical node is three hops away. egauge_24 cannot reach another meter at all. A model that must predict a hidden meter from its neighbors needs those neighbors one hop away, so `main_metergraph.py` writes a second graph, `graph_meters.json`, from `graph.json` without changing it:
 
 ```bash
 python main_metergraph.py
@@ -265,6 +269,14 @@ python main_gcn.py --run-name gcn_full_aw001 --angle-weight 0.01 --score-splits 
 python main_gcn.py --run-name gcn_full_none --angle-weight 0.01 --edges none --score-splits validation
 python main_gcn.py --run-name gcn_full_aw001 --angle-weight 0.01 --score-only --score-splits test_events test_normal
 ```
+
+The current experiment (time-indexed meter graph, held-out 2023 calibration block) in one command, with `--edges none` for its matched control and `--seed 1`, `--seed 2` for the other seeds:
+
+```bash
+python main_gnn.py --kind gcn --run-name gcn_dyn_aw001 --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0 --score-splits validation test_events test_normal
+```
+
+Use a different `--run-name` for each seed and edge setting: a rerun into an existing run folder with different options is refused by the checkpoint check.
 
 Smoke test on one month: add `--train-months 2024-10 --epochs 2 --hidden 16`. Options: `--help`. Needs `torch`, and `torch_geometric` for the GCN.
 
@@ -313,7 +325,7 @@ Output: `score.json` in the run folder with every setting, threshold, coverage, 
 
 Two exploratory options exist alongside the primary procedure and write to separate files. `--statistic grid` replaces the per-channel thresholds with one threshold on a grid-level number per slot: each channel's residual divided by a reference scale from validation block 0 (its 99th percentile there, with a floor), the maximum over a meter's channels, then the second-largest meter score among available meters, calibrated on block 1. It calibrates the quantity that raises the alarm rather than each channel. `--restrict-common` limits both statistics to the channels that have both a threshold and a reference, so they watch the same sensors and the comparison isolates aggregation from coverage. Both were motivated by test findings and are labeled exploratory in their output.
 
-The scoring procedure, both statistics and every setting above, was fixed on November 5, 2026 and has not changed since. Results scored before that date are exploratory, since the grid statistic was designed after inspection of the first test results. Runs scored after that date, new seeds and new models alike, are primary results under the same procedure.
+The scoring procedure, both statistics and every setting above, was fixed on November 5, 2026, and version 1 has not changed since. The grid statistic was designed after inspection of the first test results, so the grid results obtained before the freeze are exploratory. Runs scored after the freeze, new seeds and new models alike, use the frozen procedure, following the course staff's guidance; the channel statistic remains the primary result and the grid statistic an exploratory companion in every output.
 
 ### Scoring version 2: per-era calibration
 
@@ -332,6 +344,14 @@ python main_score.py --run-dir <run> --era-calib test_events_2023=validation_202
 
 Thresholds, and the grid threshold, are computed once per calibration block and applied to the test blocks assigned to it; the grid references stay on the design block. Each test block must match exactly one rule or fall to the default; two matching rules raise, and a rule that matches nothing is reported. Every calibration block is checked against the run's training blocks, read from the block's own summary file, and an overlap raises, so version 2 only applies to runs trained with `splits_v2.json`. The output records the version and its date, the calibration block of every test block, and for every calibration block its thresholds, counts, coverage, excluded channels, and the training-split identity. Two caveats stated in the output: version 2 is retrospective, since November 2023 follows the September 2023 events and February 2025 follows the November 2024 events, so it does not show calibration that would have been available at deployment; and the quiet block's result under version 2 is the version-1 result reused as a reference, not another evaluation, so its exposure and alarm counts are never added across versions. Version 1 results are kept unchanged.
 
+### Coverage check
+
+The scoring reports each threshold's coverage on the block that set it, where the conformal rank fixes it near 1 minus alpha. `checks/main_coveragecheck.py` measures the empirical non-exceedance rate on every block a run has residuals for, under the thresholds and calibration mapping saved in the run's score files, which it first recomputes and verifies. It keeps three roles apart and never pools across them: the calibration block (in-sample), the design block (early stopping and grid references), and held-out blocks. Validation, event and quiet blocks are reported in separate tables with exceedance and opportunity counts beside every rate, inside and outside the scored episode windows, by month, and for the channels with the lowest coverage. Nothing is rescored.
+
+```bash
+python checks/main_coveragecheck.py --run-dir data/processed/models/gcn_full_aw001
+```
+
 ## Data facts the code relies on
 
 Established by the scripts in `checks/`, which can be rerun with `--data-dir ../data`, and by the coverage report:
@@ -349,7 +369,7 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 - Voltage channels always agree on frequency within a meter. Current channels carrying a few amps (egauge_6 at 4.5 A on 55 to 71 percent of slots, egauge_18 and egauge_20 on 2 to 10 percent, egauge_16 rarely) report a frequency 1 to 4 Hz off, a wrong FFT bin, and their angles on those slots are not usable (`main_freqcheck.py`, September 2024).
 - Float16 magnitudes in the feature files have a spacing of 0.25 V near 277 V, so a rounding error of up to about 0.125 V there; voltage readings are often identical from one slot to the next, and persistence's median voltage residual is exactly zero.
 - The angle from one slot to the next rotates by tens of degrees, since the grid frequency is never exactly 60 Hz and ten seconds of a small offset is a large angle. Persistence's median angle residual is about 47 degrees; the learned models' is about 11.
-- From July 29, 2025, egauge_3's current ran at 115 to 135 A against a usual 45 A until August 11, and egauge_20's at 42 A against a usual 4 to 7 A for a shorter time, both starting together, with readings present, angles accepted, and frequency normal (`main_channelcheck.py`). The cause is not logged. The learned models' residuals on those meters are twenty times persistence's for the whole period (`main_forecastcheck.py`), since the models forecast a return toward the usual level and persistence does not.
+- From July 29, 2025, egauge_3's current ran at 115 to 135 A against a usual 45 A until August 11, and egauge_20's at 42 A against a usual 4 to 7 A for a shorter time, both starting together, with readings present, angles accepted, and frequency normal (`main_channelcheck.py`). The cause is not logged. In the inspected GCN windows (`main_forecastcheck.py`), the forecasts pulled the elevated current toward its usual level, producing larger residuals than persistence. The cause of the sustained current change is not established.
 
 ## Files
 
@@ -389,5 +409,5 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `meters.txt` | The 22 meters, one per line |
 | `requirements.txt` | Python packages |
 | `topology/` | Caltech's network description, breaker status files, change logs |
-| `checks/` | One-off scripts, each a single file run from the repo root: the data-fact checks above; `main_physics_events.py` (physics residual against the events); `main_freqcheck.py` (channel frequency against the voltage); `main_graphcheck.py` (graph consistency and drawing); `main_metergraphcheck.py` (the meter graph against `graph.json`, and that the training code loads it); `main_residualcheck.py` (model residual distributions against persistence per channel); `main_alarmcheck.py` (where a run's alarms come from on a block); `main_channelcheck.py` (one meter day by day: current level, data quality, residuals); `main_forecastcheck.py` (what the model forecast, in physical units, over chosen windows); `main_scoreview.py` (the primary and grid score files side by side); `main_maskcheck.py` (a masked run forecasts hidden meters from their neighbors, not from their own history); `main_maskalarmcheck.py` (where a run's quiet-block exceedances come from, under its frozen thresholds); `main_topologyaudit.py` (the fixed graph against the switch records over the whole record); `main_metergraphscheck.py` (the time-indexed meter graph: periods, lookup, timing rule, blocks, rebuild); `main_dynamicgraphcheck.py` (the time-indexed graph integration in the training code); `main_neighborcheck.py` (whether a trained graph model's forecasts respond to its neighbors' histories, with an angle summary); `main_summary.py` (plain-language summary of one or more scored runs from their score files, with `--plot` figures: detection grid, quiet-block false alarms, delays) |
+| `checks/` | One-off scripts, each a single file run from the repo root: the data-fact checks above; `main_physics_events.py` (physics residual against the events); `main_freqcheck.py` (channel frequency against the voltage); `main_graphcheck.py` (graph consistency and drawing); `main_metergraphcheck.py` (the meter graph against `graph.json`, and that the training code loads it); `main_residualcheck.py` (model residual distributions against persistence per channel); `main_alarmcheck.py` (where a run's alarms come from on a block); `main_channelcheck.py` (one meter day by day: current level, data quality, residuals); `main_forecastcheck.py` (what the model forecast, in physical units, over chosen windows); `main_scoreview.py` (the primary and grid score files side by side); `main_maskcheck.py` (a masked run forecasts hidden meters from their neighbors, not from their own history); `main_maskalarmcheck.py` (where a run's quiet-block exceedances come from, under its frozen thresholds); `main_topologyaudit.py` (the fixed graph against the switch records over the whole record); `main_metergraphscheck.py` (the time-indexed meter graph: periods, lookup, timing rule, blocks, rebuild); `main_dynamicgraphcheck.py` (the time-indexed graph integration in the training code); `main_neighborcheck.py` (whether a trained graph model's forecasts respond to its neighbors' histories, with an angle summary); `main_summary.py` (plain-language summary of one or more scored runs from their score files, with `--plot` figures: detection grid, quiet-block false alarms, delays); `main_coveragecheck.py` (empirical coverage of a run's saved thresholds on every scored block, roles kept apart, counts beside every rate) |
 | `notes/` | Data notes: gaps, outages, known issues. Read before analysis. |
