@@ -90,13 +90,18 @@
 #   GAT and GraphSAGE with the same settings:
 #     python main_gnn.py --kind gat --run-name gat_dyn_aw001 --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01
 #     python main_gnn.py --kind sage --run-name sage_dyn_aw001 --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01
+#   With the physics inputs (after main_physicsfeatures.py has written <YYYY-MM>_physics.npz next to the features), the
+#   matched pair at one seed, true edges and no edges, both receiving the same four added features:
+#     python main_gnn.py --kind gcn --run-name gcn_dyn_aw001_phys --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0 --physics-dir /content/features
+#     python main_gnn.py --kind gcn --run-name gcn_dyn_aw001_none_phys --edges none --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0 --physics-dir /content/features
 #   Options: python main_gnn.py --help
 #
 # Requires torch_geometric (pip install torch_geometric) for the GCN layers.
 #
 # Output under <out_dir>/<run_name>/ (default data/processed/models/<run_name>/):
 #   scale.json          the per-channel scale used, from the train blocks, with
-#                       the channels that had no train data and got a nominal value
+#                       the channels that had no train data and got a nominal value,
+#                       and the two physics divisors when --physics-dir is given
 #   checkpoint.pt       last epoch: weights, optimizer, options, progress, random states
 #   checkpoint_best.pt  weights of the best validation epoch
 #   train_log.txt       one line per epoch, and everything printed
@@ -205,6 +210,8 @@ def parse_args():
     parser.add_argument("--score-splits", nargs="*", default=["validation", "test_events", "test_normal"], help="Splits to write residuals for")
     # Score only
     parser.add_argument("--score-only", action="store_true", help="Skip training, load the best checkpoint, and score")
+    # Physics inputs, off by default: every earlier command builds the same inputs it did before
+    parser.add_argument("--physics-dir", default=None, help="Folder with <YYYY-MM>_physics.npz and physics_manifest.json (main_physicsfeatures.py); turns the four physics input features on, for the true-edge and no-edge models alike")
     # Parse
     args = parser.parse_args()
     # GAT needs at least one head
@@ -283,6 +290,26 @@ def graph_identity(path):
     return f"{os.path.basename(path)}:{digest}"
 
 
+def physics_identity(physics_dir):
+    """
+    Identity of the physics inputs for the run's options: the physics
+    manifest's name and the first 16 hex digits of the SHA-256 of its
+    bytes, so two folders with different result settings differ.
+    """
+    # Manifest path
+    path = os.path.join(physics_dir, "physics_manifest.json")
+    # Must exist
+    if not os.path.exists(path):
+        # Raise
+        raise FileNotFoundError(f"no physics_manifest.json in {physics_dir}; run main_physicsfeatures.py first")
+    # Hash
+    with open(path, "rb") as f:
+        # Digest
+        digest = hashlib.sha256(f.read()).hexdigest()[:16]
+    # Name and digest
+    return f"physics_manifest.json:{digest}"
+
+
 def maskable_from_graph(graph):
     """
     The meters that may be hidden in masked mode: every meter whose node
@@ -328,6 +355,14 @@ def main():
             # Line
             f.write(text + "\n")
 
+    # Physics inputs on, before anything reads a month: identity recorded, scale set after it is computed or loaded
+    physics_id = "none"
+    # Asked for
+    if args.physics_dir is not None:
+        # Identity
+        physics_id = physics_identity(args.physics_dir)
+        # Turn the inputs on for this process
+        sd.configure_physics(args.physics_dir)
     # Manifest and splits
     manifest = sd.load_manifest(args.features_dir)
     # Splits, overlap checked
@@ -398,6 +433,9 @@ def main():
         "seed": args.seed,
         # Training data identity
         "train_blocks": train_blocks, "splits_file": os.path.abspath(args.splits),
+        # Physics inputs: "none", or the physics manifest's identity; the features per channel the model reads, in order;
+        # and the physics divisors, filled in below once the scale is computed or loaded (None without physics inputs)
+        "physics": physics_id, "n_features": sd.n_features(), "features": list(sd.FEATURES) + (list(sd.PHYSICS_FEATURES) if args.physics_dir is not None else []), "physics_scale": None,
     }
     # Report
     log(f"device {device}, run {run_dir}, options {options}")
@@ -407,18 +445,50 @@ def main():
     if os.path.exists(scale_path):
         # Load, checked against the manifest
         scale = sd.load_scale(scale_path, manifest)
+        # Physics divisors recorded in the file, None for a run without them
+        physics_scale = sd.load_physics_scale(scale_path)
+        # A run with physics inputs needs them, a run without must not have them
+        if (physics_scale is None) != (args.physics_dir is None):
+            # Raise
+            raise ValueError(f"{scale_path} {'has no' if physics_scale is None else 'has'} physics divisors but this run {'uses' if args.physics_dir is not None else 'does not use'} physics inputs; use a new run folder")
+        # Set
+        if physics_scale is not None:
+            # Configure with the loaded divisors
+            sd.configure_physics(args.physics_dir, physics_scale)
+            # Record them with the experiment, so a checkpoint made with other divisors is refused
+            options["physics_scale"] = [float(x) for x in physics_scale]
         # Say so
-        log(f"loaded scale from {scale_path}")
+        log(f"loaded scale from {scale_path}" + (f", physics divisors {physics_scale.tolist()}" if physics_scale is not None else ""))
     # Compute
     else:
         # From train blocks, with the nominal fallback for channels that have none
         scale, count, fallback = sd.compute_scale(args.features_dir, splits, manifest, args.graph, args.scale_percentile, args.scale_floor)
+        # Physics divisors from the train blocks, same percentile; stops if a side has no valid training value
+        physics = None
+        # With physics inputs
+        if args.physics_dir is not None:
+            # Compute
+            pscale, pcount = sd.compute_physics_scale(args.features_dir, splits, args.scale_percentile)
+            # Configure with them
+            sd.configure_physics(args.physics_dir, pscale)
+            # Record them with the experiment
+            options["physics_scale"] = [float(x) for x in pscale]
+            # For the file
+            physics = {"scale": pscale, "count": pcount, "features_dir": os.path.abspath(args.physics_dir)}
         # Save
-        sd.save_scale(scale_path, scale, count, manifest, args.scale_percentile, args.scale_floor, fallback)
+        sd.save_scale(scale_path, scale, count, manifest, args.scale_percentile, args.scale_floor, fallback, physics)
         # Say so, naming the channels that used the fallback
         used = [f"{manifest['meters'][mi]}|{manifest['channels'][ci]}" for mi, ci in zip(*np.nonzero(fallback))]
         # Report
         log(f"computed scale from {int(count.sum())} valid train readings, saved to {scale_path}; nominal fallback used for {len(used)} channels" + (f": {used}" if used else ""))
+        # Physics report
+        if physics is not None:
+            # Line
+            log(f"physics divisors (percentile {args.scale_percentile} of valid train residuals): A {float(pscale[0]):.6f} from {int(pcount[0])} values, B {float(pscale[1]):.6f} from {int(pcount[1])} values")
+    # Physics inputs report
+    if args.physics_dir is not None:
+        # Line
+        log(f"physics inputs on from {args.physics_dir} ({physics_id}): {sd.n_features()} features per channel in the order {options['features']}, divisors {options['physics_scale']}; the four physics features are shared by every meter and channel and zeroed in every masked forward")
     # Report the graph
     if timeline is None:
         # Fixed
@@ -431,7 +501,7 @@ def main():
         # Names
         log(f"masked objective: {len(maskable_meters)} maskable meters {maskable_meters}; not maskable: {[m for m in manifest['meters'] if m not in maskable_meters]}; {args.mask_chunk} meters per evaluation pass")
     # Model
-    model = sm.make_model(args.kind, manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, heads=args.heads, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters, timeline=timeline).to(device)
+    model = sm.make_model(args.kind, manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, heads=args.heads, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters, timeline=timeline, n_features=sd.n_features()).to(device)
     # Parameter count
     log(f"model {args.kind} with {sum(p.numel() for p in model.parameters())} parameters" + (f", {args.heads} attention heads" if args.kind == "gat" else ""))
     # Checkpoint path

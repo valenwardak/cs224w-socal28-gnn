@@ -173,6 +173,7 @@
 #     GraphForecaster                 MeterGRU encoder + one GNN layer + head, with the masked mode
 #                                     and per-example edge sets for the time-indexed graph
 #     persistence_forecast(x, C)      last valid reading as the forecast, with validity
+#     strip_physics(x, n_channels)    zero the physics features in masked mode, so the hidden meter does not leak through them
 #     draw_masks(y_valid, maskable)   one hidden meter per window for training
 #     masked_forecast(model, x, chunk)
 #                                     every maskable meter hidden in turn, for evaluation and scoring
@@ -542,17 +543,19 @@ class MeterGRU(nn.Module):
     encode() returns the final state for the GNNs to build on.
     """
 
-    def __init__(self, n_meters, n_channels, hidden=64, embed=8, layers=1, dropout=0.0, predict_delta=True):
+    def __init__(self, n_meters, n_channels, hidden=64, embed=8, layers=1, dropout=0.0, predict_delta=True, n_features=None):
         # Base class
         super().__init__()
+        # Features per channel: the five standard ones, or nine with the physics inputs on (see socal_modeldata)
+        self.n_features = int(n_features) if n_features is not None else sd.n_features()
         # Sizes
         self.C, self.hidden = n_channels, hidden
         # Whether the head outputs a correction to the persistence forecast
         self.predict_delta = predict_delta
         # Meter identity vectors
         self.meter_embed = nn.Embedding(n_meters, embed)
-        # Input projection
-        self.input = nn.Linear(n_channels * F + embed, hidden)
+        # Input projection, sized to the features actually in use
+        self.input = nn.Linear(n_channels * self.n_features + embed, hidden)
         # Recurrent core, batch first
         self.gru = nn.GRU(hidden, hidden, num_layers=layers, batch_first=True, dropout=dropout if layers > 1 else 0.0)
         # Magnitude head
@@ -624,9 +627,11 @@ class GraphForecaster(nn.Module):
     never period indices.
     """
 
-    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_sets, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None, period_graph=None):
+    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_sets, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None, period_graph=None, n_features=None):
         # Base class
         super().__init__()
+        # Features per channel, as for MeterGRU
+        self.n_features = int(n_features) if n_features is not None else sd.n_features()
         # A single pair is accepted as a list of one
         if isinstance(edge_sets, tuple) and len(edge_sets) == 2 and torch.is_tensor(edge_sets[0]):
             # Wrap
@@ -657,8 +662,8 @@ class GraphForecaster(nn.Module):
         from torch_geometric.nn import GCNConv, GATConv, SAGEConv
         # Sizes
         self.C, self.hidden, self.n_nodes, self.kind = n_channels, hidden, n_nodes, kind
-        # Shared encoder
-        self.encoder = MeterGRU(n_meters, n_channels, hidden, embed, layers, dropout)
+        # Shared encoder, sized to the features in use
+        self.encoder = MeterGRU(n_meters, n_channels, hidden, embed, layers, dropout, n_features=self.n_features)
         # Meter to node, fixed
         self.register_buffer("meter_node", meter_node)
         # Number of edge sets
@@ -798,6 +803,9 @@ class GraphForecaster(nn.Module):
             if not self.masked:
                 # Raise
                 raise ValueError("a mask was given to a model that is not in masked mode")
+            # The physics features were computed from every meter's readings, the hidden one included: zero them for
+            # every meter in a masked forward, so no masked prediction can depend on them (training, evaluation, scoring)
+            x = strip_physics(x, self.C)
             # Zero every feature of every channel over the whole history: magnitude, cos, sin, both validity flags
             x = x * (~mask).to(x.dtype)[:, None, :, None]
         # Every meter through the shared encoder: fold meters into the batch
@@ -867,8 +875,8 @@ def persistence_forecast(x, n_channels):
     forecast (..., C, 3) and valid (..., C, 2) bool, False where the
     history held nothing to copy.
     """
-    # Unflatten channels and features
-    xf = x.reshape(x.shape[:-1] + (n_channels, F))
+    # Unflatten channels and features; the feature count comes from the input itself (5, or 9 with physics inputs)
+    xf = x.reshape(x.shape[:-1] + (n_channels, x.shape[-1] // n_channels))
     # History length
     H = xf.shape[1]
     # Positions along the history, shaped to broadcast against (B, H, ..., C)
@@ -893,6 +901,32 @@ def persistence_forecast(x, n_channels):
     ang = torch.gather(xf[..., 1:3], 1, ia).squeeze(1)
     # Forecast
     return torch.cat([mag, ang], dim=-1), valid
+
+
+def strip_physics(x, n_channels):
+    """
+    Zero the physics features (everything past the five standard features
+    of each channel) in x of shape (B, H, M, C * F). Called by the graph
+    model's forward whenever a mask is given, so every masked prediction,
+    in training, evaluation and scoring alike, follows one rule: the
+    physics residual was computed from every meter's readings, the hidden
+    meter's included, so leaving it in would leak what the mask is meant
+    to hide. Both residuals and both validity flags are zeroed, so the
+    model sees them as absent. x without physics features is returned as
+    it is.
+    """
+    # Features per channel
+    nf = x.shape[-1] // n_channels
+    # Nothing beyond the standard features
+    if nf <= F:
+        # Unchanged
+        return x
+    # View as (B, H, M, C, nf), copy so the caller's tensor is untouched
+    xf = x.reshape(x.shape[:-1] + (n_channels, nf)).clone()
+    # Zero the physics features
+    xf[..., F:] = 0.0
+    # Back to the flat layout
+    return xf.reshape(x.shape)
 
 
 def draw_masks(y_valid, maskable):
@@ -1027,17 +1061,21 @@ def residuals(y_hat, y, y_valid):
 # Training
 # -----------------------------------------------------------------------------
 
-def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None, timeline=None):
+def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None, timeline=None, n_features=None):
     """
     Build a model by name: "gru", "gcn", "gat", or "sage". With masked,
     maskable_meters is the list of meter names that may be hidden, fixed
     by the caller from the true graph, not from the edges in use. With a
     timeline (load_timeline), graph is ignored: one edge set is built per
     timeline graph with the same --edges control and seed, and the
-    period-to-graph table goes to the model.
+    period-to-graph table goes to the model. n_features is the number of
+    input features per channel (default: what socal_modeldata builds now,
+    5 or 9 with physics inputs on); it is recorded in the run's options.
     """
     # Sizes
     M, C = len(manifest["meters"]), len(manifest["channels"])
+    # Features per channel
+    n_features = int(n_features) if n_features is not None else sd.n_features()
     # Plain GRU
     if kind == "gru":
         # No masked mode for the GRU: it has no neighbors to forecast from
@@ -1045,7 +1083,7 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
             # Raise
             raise ValueError("masked mode needs a graph model")
         # Build
-        return MeterGRU(M, C, hidden, embed, layers, dropout, predict_delta)
+        return MeterGRU(M, C, hidden, embed, layers, dropout, predict_delta, n_features=n_features)
     # Time-indexed: the graphs come from the timeline
     if timeline is not None:
         # Masked mode is refused with a timeline
@@ -1087,7 +1125,7 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
         # Flags
         maskable = [m in maskable_meters for m in manifest["meters"]]
     # Build
-    return GraphForecaster(kind, M, C, len(graphs[0]["nodes"]), meter_node, edge_sets, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable, period_graph)
+    return GraphForecaster(kind, M, C, len(graphs[0]["nodes"]), meter_node, edge_sets, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable, period_graph, n_features=n_features)
 
 
 def new_sums():
@@ -1258,14 +1296,17 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
 
 
 # Options that define the experiment; a resumed run must match them
-EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection")
+EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection", "physics", "n_features", "features", "physics_scale")
 # Keys added after the first checkpoints were written. A checkpoint without "masked" was not masked, so it
 # compares as False, and a checkpoint without "graph_selection" used one fixed graph, so it compares as "fixed";
 # the other two are compared only when the checkpoint holds them. graph_selection is "fixed" (one graph for
 # every window) or "last_history_slot" (the time-indexed rule)
-LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed"}
-# Later keys whose default stands in for a missing saved value instead of skipping the comparison
-DEFAULTED_KEYS = ("masked", "graph_selection")
+LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed", "physics": "none", "n_features": F, "features": list(sd.FEATURES), "physics_scale": None}
+# Later keys whose default stands in for a missing saved value instead of skipping the comparison. A checkpoint
+# without "physics" was trained without physics inputs ("none") on the F standard features in their standard order
+# and with no physics divisors, so a run with physics inputs can never resume from it, and the other way round; a
+# physics run whose divisors or feature order differ from the checkpoint's is refused too
+DEFAULTED_KEYS = ("masked", "graph_selection", "physics", "n_features", "features", "physics_scale")
 
 
 def save_atomic(body, path):
