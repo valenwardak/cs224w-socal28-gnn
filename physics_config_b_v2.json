@@ -1,0 +1,39 @@
+{
+  "_comment": "Reference model for the B-side physics baseline (component 0 of graph.json), version 2. Same reference time, objective, weights, node names and zero-injection assumptions as physics_config_b.json, which is kept unchanged in the repo for reproducibility. What changed: the measured current injections were tested with main_signsearch.py on two screened training-only weeks (2025-01-13 to 01-20 and 2025-01-20 to 01-27 UTC, every sixth slot, offset filter 0.5 s whole slot, rank check on, margin 1.10, support 0.80, repeat guard 10; results in data/processed/physics_b_signs/signsearch_run1.json and signsearch_run2.json, identical). Four building breakers are kept with the sign every near-best combination of both weeks agreed on; the two measurements the test could not settle are removed from the plan and NOT replaced by zero-current assumptions: line_383 (egauge_20) had usable readings on 75 and 78 percent of solved slots, below the 80 percent support rule, and read a median of 3.6 A against a 1200 A rating, so what its current channels are clamped on and at what scaling is an open question; cb_148 (egauge_8) preferred +1 in both weeks but by 7 percent, inside the 10 percent margin fixed before the run, so it is unresolved. With both removed every previously solved sampled slot of both weeks stayed determined (10,042 of 10,042 and 10,027 of 10,027). All voltage measurements of all eight meters, including egauge_20 and egauge_8, stay in the plan. The kept signs are estimates from training data under the fixed reference wiring, not field verifications.",
+  "reference_time": "2024-11-14T07:00:00",
+  "component_anchor_bus": "bus_1040",
+  "prune_nodes": [],
+  "sign_status": "estimated from training data, weeks 2025-01-13 and 2025-01-20 (main_signsearch.py); line_383 excluded for insufficient support, cb_148 excluded as unresolved under the 1.10 margin (+1 preferred by 7 percent in both weeks)",
+  "measured_injections": {
+    "bus_1075|bus_1076|bus_1077": [
+      {"element": "cb_136", "sign": -1}
+    ],
+    "bus_1088|bus_1089|bus_1090": [
+      {"element": "cb_139", "sign": -1}
+    ],
+    "bus_1100|bus_1101|bus_1102": [
+      {"element": "cb_141", "sign": -1}
+    ],
+    "bus_1112|bus_1113|bus_1114": [
+      {"element": "cb_145", "sign": -1}
+    ]
+  },
+  "excluded_measurements": [
+    {"element": "line_383", "meter": "egauge_20", "reason": "usable support 0.754 and 0.782, below 0.80; median current 3.6 A on a 1200 A rating; placement and scaling of the channels open"},
+    {"element": "cb_148", "meter": "egauge_8", "reason": "unresolved: +1 preferred in both weeks by 7 percent, inside the 1.10 margin; config v1 sign was -1"}
+  ],
+  "zero_injection_nodes": [
+    "bus_1036|bus_1047|bus_1048|bus_1049|bus_1050|bus_1051|bus_1052",
+    "bus_1060|bus_1061|bus_1062|bus_1063|bus_1064|bus_1065|bus_1085|bus_1086|bus_1087",
+    "bus_1072|bus_1073|bus_1074",
+    "bus_1094|bus_1095|bus_1096",
+    "bus_1109|bus_1110|bus_1111",
+    "bus_1121|bus_1122|bus_1123",
+    "bus_1136|bus_1137|bus_1138|bus_1148|bus_1149|bus_1150|bus_1152|bus_1153",
+    "bus_1155|bus_1158|bus_1159|bus_1171",
+    "bus_1168|bus_1169",
+    "bus_1139"
+  ],
+  "current_weight": 0.1,
+  "zero_injection_nominal": 0.1
+}
