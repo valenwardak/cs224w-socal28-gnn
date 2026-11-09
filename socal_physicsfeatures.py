@@ -271,10 +271,10 @@ def availability(features_dir, splits, episodes, before, after):
     """
     # Rows
     rows = []
-    # Each split
-    for split_name, blocks in splits.items():
+    # Each split, by the four names the model data module uses; the splits file also carries other keys (notes, version) that are not block lists
+    for split_name in ("train", "validation", "test_events", "test_normal"):
         # Each block
-        for block in blocks:
+        for block in splits.get(split_name, []):
             # Bounds in epoch seconds, as the model data module reads them
             start_s, end_s = sd.block_seconds(block)
             # Months the block touches, in the feature files' fixed-PST convention
