@@ -21,6 +21,8 @@
 #     python main_physics.py --start 2024-11-14T15:00:00 --end 2024-11-14T16:00:00
 #   One named split from splits.json, numpy solver for speed:
 #     python main_physics.py --split test_events --solver numpy
+#   B-side (component 0) with the rank safeguard, into its own folder:
+#     python main_physics.py --config physics_config_b.json --rank-check --split test_normal --splits splits_v2.json --solver numpy --out-dir data/processed/physics_b
 #   Options: python main_physics.py --help
 #
 # Output under <out_dir>:
@@ -78,6 +80,10 @@ def parse_args():
     parser.add_argument("--freq-tolerance", type=float, default=0.01, help="Hertz; a reading is dropped when its own frequency differs from the meter's voltage frequency by more (0.01 means the same FFT bin)")
     # No progress bar
     parser.add_argument("--quiet", action="store_true", help="Do not show a progress bar")
+    # Rank safeguard, off by default so earlier runs and results stay reproducible
+    parser.add_argument("--rank-check", action="store_true", help="Mark a slot 'undetermined' (no residual) when its available measurements do not determine the state; off by default")
+    # Its tolerance
+    parser.add_argument("--rank-rel-tol", type=float, default=1e-9, help="Singular values below this fraction of the largest count as zero in --rank-check")
     # Parse
     return parser.parse_args()
 
@@ -143,11 +149,12 @@ def main():
             # Next
             continue
         # Solve
-        results = sp.run_block(model, plan, table, solver=args.solver, weight=weight, step=args.step, progress=not args.quiet, freq_tolerance=args.freq_tolerance)
+        results = sp.run_block(model, plan, table, solver=args.solver, weight=weight, step=args.step, progress=not args.quiet, freq_tolerance=args.freq_tolerance, rank_check=args.rank_check, rank_rel_tol=args.rank_rel_tol)
         # Summary
         summary = sp.summarize(results)
         # Add the options used
-        summary.update({"label": label, "start_utc": start_utc, "end_utc": end_utc, "solver": args.solver, "current_weight": weight, "step": args.step, "freq_tolerance": args.freq_tolerance, "reference_time": config["reference_time"]})
+        summary.update({"label": label, "start_utc": start_utc, "end_utc": end_utc, "solver": args.solver, "current_weight": weight, "step": args.step, "freq_tolerance": args.freq_tolerance, "reference_time": config["reference_time"],
+                        "config": args.config, "rank_check": args.rank_check, "rank_rel_tol": args.rank_rel_tol if args.rank_check else None})
         # Write results
         results.to_parquet(os.path.join(args.out_dir, f"{label}.parquet"))
         # Write summary

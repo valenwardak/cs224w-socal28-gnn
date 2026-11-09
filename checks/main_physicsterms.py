@@ -51,7 +51,7 @@
 #   parse_args()                           command-line options with defaults
 #   window_from_args(args)                 (label, start_utc, end_utc) from --day or --start/--end
 #   term_labels(model, plan)               a name for every voltage, injection and zero-injection term
-#   solve_window(model, plan, table, solver, weight, step, freq_tolerance)
+#   solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_check, rank_rel_tol)
 #                                          per-slot state estimates and per-term residuals
 #   term_table(res, labels, weight)        per-term summary over the window
 #   print_hourly(res)                      total residual per hour beside the term counts
@@ -110,6 +110,10 @@ def parse_args():
     parser.add_argument("--freq-tolerance", type=float, default=0.01, help="Hertz; as in main_physics.py")
     # How many terms to print in the ranked list
     parser.add_argument("--top", type=int, default=10, help="Terms printed in the ranked list (all terms are counted)")
+    # Rank safeguard, as in main_physics.py, off by default
+    parser.add_argument("--rank-check", action="store_true", help="Mark a slot 'undetermined' (no terms) when its available measurements do not determine the state; off by default")
+    # Its tolerance
+    parser.add_argument("--rank-rel-tol", type=float, default=1e-9, help="Singular values below this fraction of the largest count as zero in --rank-check")
     # Parse
     args = parser.parse_args()
     # Window check
@@ -176,7 +180,7 @@ def term_labels(model, plan):
     return v_labels, i_labels, i_kind
 
 
-def solve_window(model, plan, table, solver, weight, step, freq_tolerance):
+def solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_check=False, rank_rel_tol=1e-9):
     """
     Solve every step-th slot and keep the per-term residuals. Returns a
     dict with t (slot times), status, total (objective per slot), count
@@ -205,6 +209,8 @@ def solve_window(model, plan, table, solver, weight, step, freq_tolerance):
            "V_ok": m["V_ok"][:, positions], "I_ok": m["I_ok"][:, positions]}
     # Solver function
     solve = sp.solve_slot_cvxpy if solver == "cvxpy" else sp.solve_slot_numpy
+    # Rank results per availability pattern
+    rank_cache = {}
     # Each slot
     for k, pos in enumerate(positions):
         # Availability
@@ -223,6 +229,20 @@ def solve_window(model, plan, table, solver, weight, step, freq_tolerance):
             out["status"].append("too_few")
             # Next
             continue
+        # Rank safeguard, the same rule as run_block
+        if rank_check:
+            # Pattern key
+            key = (v_ok.tobytes(), i_ok.tobytes())
+            # Once per pattern
+            if key not in rank_cache:
+                # Rank
+                rank_cache[key] = sp.measurement_rank(Y, m["V_idx"][v_ok], m["V_nom"][v_ok], m["I_rows"][i_ok], m["I_nom"][i_ok], weight, n_state, rank_rel_tol)[0]
+            # Deficient
+            if rank_cache[key] < n_state:
+                # Status, no terms
+                out["status"].append("undetermined")
+                # Next
+                continue
         # Solve, the same call as run_block
         V_hat = solve(Y, m["V_meas"][v_ok, pos], m["V_idx"][v_ok], m["V_nom"][v_ok], m["I_meas"][i_ok, pos], m["I_rows"][i_ok], m["I_nom"][i_ok], weight, n_state)
         # Failed
@@ -422,7 +442,11 @@ def main():
     # Labels
     v_labels, i_labels, i_kind = term_labels(model, plan)
     # Solve
-    res = solve_window(model, plan, table, args.solver, weight, args.step, args.freq_tolerance)
+    res = solve_window(model, plan, table, args.solver, weight, args.step, args.freq_tolerance, args.rank_check, args.rank_rel_tol)
+    # Rank check report on the planned measurement set with everything present
+    rank_all, tol_all, sv_all = sp.measurement_rank(model["Y"].astype(np.complex128), np.array([3 * v["node_idx"] + v["phase_idx"] for v in plan["voltages"]]), np.array([v["nominal"] for v in plan["voltages"]]), np.array([3 * inj["node_idx"] + p for inj in plan["injections"] for p in range(3)] + [3 * z + p for z in plan["zeros"] for p in range(3)]), np.array([float(np.mean([t["rating"] for t in inj["terms"]])) for inj in plan["injections"] for _ in range(3)] + [plan["zero_injection_nominal"]] * (3 * len(plan["zeros"]))), weight, 3 * model["n_nodes"], args.rank_rel_tol)
+    # Say
+    print(f"planned measurement set with everything present: rank {rank_all} of {3 * model['n_nodes']} unknowns, tolerance {tol_all:.3e}, smallest singular value {sv_all:.3e}" + ("" if rank_all == 3 * model["n_nodes"] else "  (NOT determined even with every measurement present)"))
     # Status counts
     vals, cnts = np.unique(res["status"], return_counts=True)
     # Say
@@ -438,7 +462,7 @@ def main():
         # The other solver
         other = "cvxpy" if args.solver == "numpy" else "numpy"
         # Solve again
-        res_b = solve_window(model, plan, table, other, weight, args.step, args.freq_tolerance)
+        res_b = solve_window(model, plan, table, other, weight, args.step, args.freq_tolerance, args.rank_check, args.rank_rel_tol)
         # Compare
         compare_solvers(res, res_b, args.solver, other, v_labels, i_labels, i_kind)
 

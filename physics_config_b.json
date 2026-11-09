@@ -1,0 +1,41 @@
+{
+  "_comment": "Reference model for the B-side physics baseline (component 0 of graph.json). Same reference time, objective, weights and conventions as physics_config.json. Node names are electrical nodes as Caltech's topology code builds them. The injection map mirrors Caltech's A-side map by structural analogy: the main feed line at the top node (line_383, egauge_20, meter bus on the source side behind main breaker cb_122) with sign +1, and each building's own breaker (transformer side to load side) at its 277 V node with sign -1. These signs are ESTIMATED from the analogy and are to be tested on training-only quiet weeks (64 combinations, two periods, acceptance margin fixed before running); they are not documented by Caltech. Excluded as unresolved: line_384 (egauge_18), line_402 (egauge_16), line_429 (egauge_22); egauge_16 and egauge_22 still supply voltage terms. Zero-injection nodes are the nodes with no external injection in the reference circuit: the 1,386 V switchgear node fed by tr_118 through an edge of Y (the analog of the A-side switchgear node in Caltech's zero list), the eight 1,386 V intermediate nodes, and bus_1139, the tr_130 secondary whose only other element cb_151 is normally open with no status history and which carries no load or meter. They are zero-injection because of what sits on them, not because they make the matrix full rank; the rank check is a separate safeguard.",
+  "reference_time": "2024-11-14T07:00:00",
+  "component_anchor_bus": "bus_1040",
+  "prune_nodes": [],
+  "sign_status": "estimated from the A-side analogy; sign test on training-only weeks not yet run",
+  "measured_injections": {
+    "bus_1021|bus_1022|bus_1023|bus_1026|bus_1028|bus_1035|bus_1039|bus_1040|bus_1200": [
+      {"element": "line_383", "sign": 1}
+    ],
+    "bus_1075|bus_1076|bus_1077": [
+      {"element": "cb_136", "sign": -1}
+    ],
+    "bus_1088|bus_1089|bus_1090": [
+      {"element": "cb_139", "sign": -1}
+    ],
+    "bus_1100|bus_1101|bus_1102": [
+      {"element": "cb_141", "sign": -1}
+    ],
+    "bus_1112|bus_1113|bus_1114": [
+      {"element": "cb_145", "sign": -1}
+    ],
+    "bus_1124|bus_1125|bus_1126": [
+      {"element": "cb_148", "sign": -1}
+    ]
+  },
+  "zero_injection_nodes": [
+    "bus_1036|bus_1047|bus_1048|bus_1049|bus_1050|bus_1051|bus_1052",
+    "bus_1060|bus_1061|bus_1062|bus_1063|bus_1064|bus_1065|bus_1085|bus_1086|bus_1087",
+    "bus_1072|bus_1073|bus_1074",
+    "bus_1094|bus_1095|bus_1096",
+    "bus_1109|bus_1110|bus_1111",
+    "bus_1121|bus_1122|bus_1123",
+    "bus_1136|bus_1137|bus_1138|bus_1148|bus_1149|bus_1150|bus_1152|bus_1153",
+    "bus_1155|bus_1158|bus_1159|bus_1171",
+    "bus_1168|bus_1169",
+    "bus_1139"
+  ],
+  "current_weight": 0.1,
+  "zero_injection_nominal": 0.1
+}

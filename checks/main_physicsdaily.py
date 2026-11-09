@@ -10,7 +10,8 @@
 #              the median and 99th percentile residual in percent of
 #              nominal, the largest residual, the number of slots solved,
 #              the number of slots with no answer by status (no data, too
-#              few readings, solver failed), and the median number of
+#              few readings, solver failed, undetermined under the rank
+#              safeguard), and the median number of
 #              voltage and current terms in the equations that day. The
 #              counts stand beside the residual so that a day with fewer
 #              readings is not read as a day with an electrical change.
@@ -113,6 +114,12 @@ def daily_table(res):
     99th percentile and max residual in percent (solved slots only), and
     the median voltage and current term counts over solved slots.
     """
+    # Any status this reader does not list would vanish from the table; refuse rather than hide it
+    unknown = set(res["status"].unique()) - {"ok", "no_data", "too_few", "solver_failed", "undetermined"}
+    # Refuse
+    if unknown:
+        # Stop
+        raise ValueError(f"unknown status values in the results: {sorted(unknown)}")
     # Day key
     day = pst_day(res.index)
     # Solved slots
@@ -131,7 +138,7 @@ def daily_table(res):
         st = res.loc[sel, "status"].value_counts()
         # Row
         rows.append({"day": d, "slots": int(sel.sum()), "ok": int(s.sum()),
-                     "no_data": int(st.get("no_data", 0)), "too_few": int(st.get("too_few", 0)), "failed": int(st.get("solver_failed", 0)),
+                     "no_data": int(st.get("no_data", 0)), "too_few": int(st.get("too_few", 0)), "failed": int(st.get("solver_failed", 0)), "undetermined": int(st.get("undetermined", 0)),
                      "median_pct": float(pct[s].median()) if s.any() else float("nan"),
                      "p99_pct": float(pct[s].quantile(0.99)) if s.any() else float("nan"),
                      "max_pct": float(pct[s].max()) if s.any() else float("nan"),
@@ -144,7 +151,7 @@ def daily_table(res):
 def print_daily(table, event_days):
     """Print the daily rows; a day holding a scored logged change is marked with an asterisk."""
     # Header
-    print(f"\n{'day':<12} {'slots':>6} {'ok':>6} {'no_data':>7} {'too_few':>7} {'failed':>6} {'median %':>9} {'p99 %':>8} {'max %':>8} {'nV':>5} {'nI':>5}  event")
+    print(f"\n{'day':<12} {'slots':>6} {'ok':>6} {'no_data':>7} {'too_few':>7} {'failed':>6} {'undet.':>6} {'median %':>9} {'p99 %':>8} {'max %':>8} {'nV':>5} {'nI':>5}  event")
     # Each row
     for _, r in table.iterrows():
         # Formatter for a possibly missing number
@@ -152,7 +159,7 @@ def print_daily(table, event_days):
         # Mark
         mark = "*" if r["day"] in event_days else ""
         # Line
-        print(f"{r['day']:<12} {r['slots']:>6} {r['ok']:>6} {r['no_data']:>7} {r['too_few']:>7} {r['failed']:>6} {f(r['median_pct']):>9} {f(r['p99_pct']):>8} {f(r['max_pct']):>8} {f(r['n_voltage'], 0):>5} {f(r['n_current'], 0):>5}  {mark}")
+        print(f"{r['day']:<12} {r['slots']:>6} {r['ok']:>6} {r['no_data']:>7} {r['too_few']:>7} {r['failed']:>6} {r['undetermined']:>6} {f(r['median_pct']):>9} {f(r['p99_pct']):>8} {f(r['max_pct']):>8} {f(r['n_voltage'], 0):>5} {f(r['n_current'], 0):>5}  {mark}")
     # Whole-period summary over the days
     print(f"\n{len(table)} days; median of daily medians {table['median_pct'].median():.3f} %, lowest daily median {table['median_pct'].min():.3f} %, highest daily median {table['median_pct'].max():.3f} %; solved slots {int(table['ok'].sum())} of {int(table['slots'].sum())}")
 

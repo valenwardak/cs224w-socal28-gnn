@@ -53,10 +53,15 @@
 #     aligned_phasor(table, meter, channel, tol) complex phasor shifted to slot time, off-bin readings dropped
 #   Assembling and solving
 #     assemble(model, plan, table)               measured vectors, nominals, row masks
+#     measurement_rank(Y, V_idx, V_nom, I_rows, I_nom, weight, n_state, rel_tol)
+#                                                rank of the available measurement matrix and the tolerance used
 #     solve_slot_numpy(...)                      weighted least squares, closed form
 #     solve_slot_cvxpy(...)                      Caltech's objective via cvxpy and ECOS
-#     run_block(model, plan, table, solver, weight, step, progress, freq_tolerance)
-#                                                residual per slot for one window
+#     run_block(model, plan, table, solver, weight, step, progress, freq_tolerance, rank_check, rank_rel_tol)
+#                                                residual per slot for one window; with rank_check, a slot whose
+#                                                available measurements do not determine the state is marked
+#                                                "undetermined" and gets no residual (off by default, so the
+#                                                A-side runs and results stay as they were)
 #     summarize(results)                         mean, percentiles, valid count
 # =============================================================================
 
@@ -732,6 +737,39 @@ def objective_value(Y, V_hat, V_meas, V_idx, V_nom, I_meas, I_rows, I_nom, weigh
     return float(weight * I_res.sum() + V_res.sum()), int(len(I_res) + len(V_res))
 
 
+def measurement_rank(Y, V_idx, V_nom, I_rows, I_nom, weight, n_state, rel_tol=1e-9):
+    """
+    Rank of the measurement matrix built from the rows available in a
+    slot: the current rows of Y scaled by sqrt(weight) / I_nom and the
+    voltage selection rows scaled by 1 / V_nom, the same matrix the
+    numpy solver uses. Singular values below rel_tol times the largest
+    are counted as zero. Returns (rank, tolerance_used, smallest_sv).
+    Full rank means the available equations determine a fitted state;
+    it says nothing about whether the measurements, signs or wiring
+    assumptions are right.
+    """
+    # Current block
+    A_I = (np.sqrt(weight) / I_nom)[:, None] * Y[I_rows]
+    # Voltage block
+    A_V = np.zeros((len(V_idx), n_state), dtype=np.complex128)
+    # One entry per row
+    A_V[np.arange(len(V_idx)), V_idx] = 1.0 / V_nom
+    # Stack
+    A = np.vstack([A_I, A_V])
+    # Nothing at all
+    if A.shape[0] == 0:
+        # Rank zero
+        return 0, 0.0, 0.0
+    # Singular values
+    sv = np.linalg.svd(A, compute_uv=False)
+    # Tolerance
+    tol = rel_tol * float(sv[0]) if len(sv) else 0.0
+    # Rank
+    rank = int((sv > tol).sum())
+    # Return
+    return rank, tol, float(sv[-1]) if len(sv) else 0.0
+
+
 def solve_slot_numpy(Y, V_meas, V_idx, V_nom, I_meas, I_rows, I_nom, weight, n_state):
     """
     Weighted least squares in closed form: minimize the sum of squared
@@ -786,7 +824,7 @@ def solve_slot_cvxpy(Y, V_meas, V_idx, V_nom, I_meas, I_rows, I_nom, weight, n_s
     return np.asarray(V.value).flatten()
 
 
-def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=True, freq_tolerance=0.01):
+def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=True, freq_tolerance=0.01, rank_check=False, rank_rel_tol=1e-9):
     """
     Solve every step-th slot in the table and return a DataFrame indexed
     by slot time with columns:
@@ -794,8 +832,14 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
       residual_mean   objective value divided by the number of terms
       n_voltage       voltage terms used in that slot
       n_current       current terms used in that slot (zero-injection rows included)
-      status          "ok", "no_data", "too_few", or "solver_failed"
+      status          "ok", "no_data", "too_few", "solver_failed", or, with
+                      rank_check, "undetermined"
     Slots with no usable readings are marked, never scored as zero.
+    With rank_check=True (off by default, so earlier runs are unchanged),
+    the rank of the available measurement matrix is computed once per
+    distinct availability pattern and cached; a slot whose rank is below
+    the state size is marked "undetermined" with no residual. The
+    tolerance used is attached to the DataFrame as out.attrs["rank_rel_tol"].
     """
     # Admittance matrix as complex128 for the solvers
     Y = model["Y"].astype(np.complex128)
@@ -819,6 +863,8 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
         iterator = positions
     # Output rows
     rows = []
+    # Rank results per availability pattern, filled only with rank_check
+    rank_cache = {}
     # Loop over slots
     for pos in iterator:
         # Voltage rows present
@@ -839,6 +885,20 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
             rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "status": "too_few"})
             # Next
             continue
+        # Rank safeguard
+        if rank_check:
+            # The availability pattern as a key
+            key = (v_ok.tobytes(), i_ok.tobytes())
+            # Compute once per pattern
+            if key not in rank_cache:
+                # Rank of the available matrix
+                rank_cache[key] = measurement_rank(Y, m["V_idx"][v_ok], m["V_nom"][v_ok], m["I_rows"][i_ok], m["I_nom"][i_ok], weight, n_state, rank_rel_tol)[0]
+            # Deficient
+            if rank_cache[key] < n_state:
+                # Mark, no residual
+                rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "status": "undetermined"})
+                # Next
+                continue
         # Pick the solver
         solve = solve_slot_cvxpy if solver == "cvxpy" else solve_slot_numpy
         # Solve with the rows present
@@ -857,6 +917,10 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
     out = pd.DataFrame(rows, index=times)
     # Name the index
     out.index.name = "t_utc"
+    # Record the safeguard setting
+    out.attrs["rank_check"] = bool(rank_check)
+    # And its tolerance
+    out.attrs["rank_rel_tol"] = float(rank_rel_tol) if rank_check else None
     # Return
     return out
 
