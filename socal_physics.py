@@ -69,6 +69,21 @@
 #                                                residual (both off by default, so the A-side runs and results
 #                                                stay as they were)
 #     summarize(results)                         mean, percentiles, valid count
+#   Sign search (used by main_signsearch.py; nothing above calls these)
+#     sign_combinations(n)                       every assignment of +1 / -1 to n injections
+#     plan_with_signs(plan, signs)               copy of the plan with one sign per measured injection
+#     injection_rows(plan)                       which I_meas rows belong to each measured injection
+#     slot_statuses(model, plan, m, rejected, positions, weight, rel_tol)
+#                                                the baseline's status per sampled slot, sign-independent
+#     solve_all_signs(model, m, positions, ok, row_signs, weight)
+#                                                per-term residual per slot for every sign combination at once
+#     clamp_support(m, plan, positions, ok)      usable counts and current magnitudes per injection
+#     rank_without(model, m, positions, ok, drop_rows, weight, rel_tol)
+#                                                how many sampled slots stay determined when rows are dropped
+#     near_best(medians, factor)                 indices of combinations within a factor of the best
+#     clamp_separation(signs, medians)           per injection: best median with +1, best with -1, and the gap
+#     sign_verdicts(signs, near_lists, support_ok, separation_ok)
+#                                                supported sign per injection, or why not
 # =============================================================================
 
 # Standard library: JSON for the config file
@@ -407,7 +422,7 @@ def measurement_plan(model, config):
     Returns a dictionary with:
       voltages:   list of {meter, channel, node_idx, phase_idx, nominal}
                   one per metered bus phase inside the kept component
-      injections: list of {node_idx, terms: [{meter, channel per phase, sign, rating}]}
+      injections: list of {node_idx, terms: [{element, meter, channel per phase, sign, rating}]}
                   from config["measured_injections"]
       zeros:      list of node_idx from config["zero_injection_nodes"]
       meters:     sorted list of meters the plan reads
@@ -489,7 +504,7 @@ def measurement_plan(model, config):
                 # Next
                 continue
             # Store
-            plan_terms.append({"meter": meter, "channels": channels, "sign": float(term["sign"]), "rating": float(np.mean(ratings))})
+            plan_terms.append({"element": term["element"], "meter": meter, "channels": channels, "sign": float(term["sign"]), "rating": float(np.mean(ratings))})
         # Keep nodes with at least one usable term
         if plan_terms:
             # Store
@@ -1016,3 +1031,350 @@ def summarize(results):
         # Status counts
         "status_counts": results["status"].value_counts().to_dict(),
     }
+
+
+# -----------------------------------------------------------------------------
+# Sign search
+# -----------------------------------------------------------------------------
+
+def sign_combinations(n):
+    """
+    Every assignment of +1 or -1 to n measured injections, as a list of
+    tuples, 2 to the power n of them. The first tuple is all +1.
+    """
+    # Start with the empty assignment
+    combos = [()]
+    # Add one injection at a time
+    for _ in range(n):
+        # Each existing assignment gets both signs for the new injection
+        combos = [c + (s,) for c in combos for s in (1.0, -1.0)]
+    # Return
+    return combos
+
+
+def plan_with_signs(plan, signs):
+    """
+    Copy of the plan with the term signs replaced, one sign per measured
+    injection in plan order. Refuses a plan where an injection has more
+    than one term, because the search decides one sign per clamp and a
+    multi-term node would hide that.
+    """
+    # One sign per injection
+    if len(signs) != len(plan["injections"]):
+        # Raise
+        raise ValueError(f"{len(signs)} signs given for {len(plan['injections'])} measured injections")
+    # New injection list
+    injections = []
+    # Loop over injections and their signs
+    for inj, s in zip(plan["injections"], signs):
+        # One clamp per node only
+        if len(inj["terms"]) != 1:
+            # Raise
+            raise ValueError("the sign search needs exactly one measured term per injection node")
+        # Copy the term with the new sign
+        term = dict(inj["terms"][0], sign=float(s))
+        # Store
+        injections.append({"node_idx": inj["node_idx"], "terms": [term]})
+    # Copy of the plan with the new injections
+    return dict(plan, injections=injections)
+
+
+def injection_rows(plan):
+    """
+    For each measured injection, in plan order, the three I_meas row
+    indices assemble() gives it (phases a, b, c). assemble() writes the
+    measured injections first and the zero-injection rows after them.
+    """
+    # Three rows per injection, in order
+    return [list(range(3 * k, 3 * k + 3)) for k in range(len(plan["injections"]))]
+
+
+def slot_statuses(model, plan, m, rejected, positions, weight, rel_tol=1e-9):
+    """
+    The baseline's status for each sampled slot, by the same rules and in
+    the same order as run_block: offset_rejected, no_data, too_few,
+    undetermined, ok. None of these depends on the signs, because a sign
+    only negates measured values and never changes which rows are present
+    or the matrix. Returns a list of status strings, one per position.
+    """
+    # Admittance and state size
+    Y, n_state = model["Y"].astype(np.complex128), 3 * model["n_nodes"]
+    # Rank cache by availability pattern
+    cache = {}
+    # Statuses
+    statuses = []
+    # Each sampled slot
+    for pos in positions:
+        # Availability
+        v_ok, i_ok = m["V_ok"][:, pos], m["I_ok"][:, pos]
+        # Counts
+        n_v, n_i = int(v_ok.sum()), int(i_ok.sum())
+        # Offset rule first
+        if rejected[pos]:
+            # Mark
+            statuses.append("offset_rejected")
+            # Next
+            continue
+        # No readings at all
+        if n_v == 0 and (n_i == 0 or np.all(m["I_meas"][i_ok, pos] == 0)):
+            # Mark
+            statuses.append("no_data")
+            # Next
+            continue
+        # Need a voltage
+        if n_v == 0:
+            # Mark
+            statuses.append("too_few")
+            # Next
+            continue
+        # Rank by pattern
+        key = (v_ok.tobytes(), i_ok.tobytes())
+        # Compute once
+        if key not in cache:
+            # Rank
+            cache[key] = measurement_rank(Y, m["V_idx"][v_ok], m["V_nom"][v_ok], m["I_rows"][i_ok], m["I_nom"][i_ok], weight, n_state, rel_tol)[0]
+        # Deficient
+        if cache[key] < n_state:
+            # Mark
+            statuses.append("undetermined")
+            # Next
+            continue
+        # Solvable
+        statuses.append("ok")
+    # Return
+    return statuses
+
+
+def solve_all_signs(model, m, positions, ok, row_signs, weight):
+    """
+    Solve every sign combination on every solvable sampled slot in one
+    pass. The matrix of a slot does not depend on the signs, so one least
+    squares call with one right-hand side per combination gives all the
+    fitted states at once.
+
+    m          arrays from assemble() built with every sign +1
+    positions  sampled slot positions
+    ok         boolean per position, True where the status is ok
+    row_signs  (MI, C) array: the multiplier each I_meas row gets under
+               each of the C combinations (+1 or -1 on measured injection
+               rows, +1 on zero-injection rows)
+    Returns (C, P) per-term residuals, NaN where the slot was not solved.
+    """
+    # Admittance and state size
+    Y, n_state = model["Y"].astype(np.complex128), 3 * model["n_nodes"]
+    # Number of combinations
+    C = row_signs.shape[1]
+    # Output
+    out = np.full((C, len(positions)), np.nan)
+    # Each sampled slot
+    for j, pos in enumerate(positions):
+        # Skip slots that are not solvable
+        if not ok[j]:
+            # Next
+            continue
+        # Availability
+        v_ok, i_ok = m["V_ok"][:, pos], m["I_ok"][:, pos]
+        # Rows and nominals
+        V_idx, V_nom = m["V_idx"][v_ok], m["V_nom"][v_ok]
+        # Current rows and nominals
+        I_rows, I_nom = m["I_rows"][i_ok], m["I_nom"][i_ok]
+        # Measured values
+        V_meas, I_base = m["V_meas"][v_ok, pos], m["I_meas"][i_ok, pos]
+        # Signed currents, one column per combination
+        I_all = I_base[:, None] * row_signs[i_ok, :]
+        # Current block of the matrix
+        A_I = (np.sqrt(weight) / I_nom)[:, None] * Y[I_rows]
+        # Voltage block
+        A_V = np.zeros((len(V_idx), n_state), dtype=np.complex128)
+        # Selection entries
+        A_V[np.arange(len(V_idx)), V_idx] = 1.0 / V_nom
+        # Matrix
+        A = np.vstack([A_I, A_V])
+        # Right-hand sides, one column per combination
+        B = np.vstack([np.sqrt(weight) * I_all / I_nom[:, None], np.repeat(V_meas[:, None] / V_nom[:, None], C, axis=1)])
+        # All fitted states at once
+        V_hat, *_ = np.linalg.lstsq(A, B, rcond=None)
+        # Current residuals per combination
+        I_res = np.abs(I_all - Y[I_rows] @ V_hat) / I_nom[:, None]
+        # Voltage residuals per combination
+        V_res = np.abs(V_meas[:, None] - V_hat[V_idx, :]) / V_nom[:, None]
+        # Objective per combination divided by the number of terms
+        out[:, j] = (weight * I_res.sum(axis=0) + V_res.sum(axis=0)) / (len(I_res) + len(V_res))
+    # Return
+    return out
+
+
+def clamp_support(m, plan, positions, ok):
+    """
+    Per measured injection: how many solved sampled slots have all three
+    of its clamp readings usable (the same validity as assemble(): present,
+    on the voltage frequency, aligned), the per-phase usable counts, and
+    the magnitude of the measured current in amps (median, 10th and 90th
+    percentile over the usable solved slots) next to the rating used as
+    its nominal. A present reading with almost no current says little
+    about direction, so the magnitudes are reported, not just the counts.
+    Returns a list of dictionaries in plan order.
+    """
+    # Solved positions
+    solved = np.asarray(positions)[np.asarray(ok, dtype=bool)]
+    # Rows per injection
+    rows = injection_rows(plan)
+    # Results
+    out = []
+    # Each injection
+    for inj, r in zip(plan["injections"], rows):
+        # The one term
+        term = inj["terms"][0]
+        # Usable per phase on solved slots
+        usable_phase = m["I_ok"][r][:, solved]
+        # All three usable
+        all3 = usable_phase.all(axis=0)
+        # Magnitudes where usable, the sign was +1 in this build so this is the clamp reading itself
+        mags = np.abs(m["I_meas"][r][:, solved])
+        # Keep usable values
+        vals = mags[usable_phase]
+        # Percentiles, or NaN when nothing is usable
+        pct = np.percentile(vals, [10, 50, 90]) if vals.size else np.array([np.nan, np.nan, np.nan])
+        # Store
+        out.append({"element": term["element"], "meter": term["meter"], "channels": term["channels"], "rating_a": float(term["rating"]),
+                    "solved_slots": int(len(solved)), "usable_all_phases": int(all3.sum()),
+                    "usable_per_phase": {p: int(usable_phase[i].sum()) for i, p in enumerate(PHASES)},
+                    "support_fraction": float(all3.sum() / len(solved)) if len(solved) else float("nan"),
+                    "current_a_p10": float(pct[0]), "current_a_median": float(pct[1]), "current_a_p90": float(pct[2]),
+                    "median_over_rating": float(pct[1] / term["rating"]) if term["rating"] else float("nan")})
+    # Return
+    return out
+
+
+def rank_without(model, m, positions, ok, drop_rows, weight, rel_tol=1e-9):
+    """
+    How many of the solvable sampled slots stay determined when the given
+    I_meas rows are removed from the plan. Checks the actual availability
+    pattern of every solvable slot, with the rows dropped, caching by
+    pattern. Returns (determined_count, solvable_count).
+    """
+    # Admittance and state size
+    Y, n_state = model["Y"].astype(np.complex128), 3 * model["n_nodes"]
+    # Mask of rows kept
+    keep = np.ones(m["I_meas"].shape[0], dtype=bool)
+    # Drop
+    keep[list(drop_rows)] = False
+    # Cache
+    cache = {}
+    # Count
+    determined, solvable = 0, 0
+    # Each sampled slot
+    for j, pos in enumerate(positions):
+        # Only slots that were solvable with everything
+        if not ok[j]:
+            # Next
+            continue
+        # Count
+        solvable += 1
+        # Availability with the rows dropped
+        v_ok, i_ok = m["V_ok"][:, pos], m["I_ok"][:, pos] & keep
+        # Pattern
+        key = (v_ok.tobytes(), i_ok.tobytes())
+        # Compute once
+        if key not in cache:
+            # Rank
+            cache[key] = measurement_rank(Y, m["V_idx"][v_ok], m["V_nom"][v_ok], m["I_rows"][i_ok], m["I_nom"][i_ok], weight, n_state, rel_tol)[0]
+        # Determined
+        if cache[key] >= n_state:
+            # Count
+            determined += 1
+    # Return
+    return determined, solvable
+
+
+def near_best(medians, factor):
+    """
+    Indices of the combinations whose median per-term residual is within
+    the given factor of the smallest one (best included). NaN medians
+    never qualify.
+    """
+    # As array
+    med = np.asarray(medians, dtype=float)
+    # Best value
+    best = np.nanmin(med)
+    # Within the factor
+    return [int(i) for i in np.where(med <= factor * best)[0]]
+
+
+def clamp_separation(signs, medians):
+    """
+    Per injection: the best (smallest) median among the combinations
+    carrying +1 for it, the best among those carrying -1, the preferred
+    sign (the side with the smaller best) and the gap between the two.
+    This is the separation that matters for one clamp's direction: how
+    much worse the best combination with the opposite sign does. A tie
+    on another clamp does not shrink it. Returns a list of dictionaries
+    in plan order.
+    """
+    # As array
+    med = np.asarray(medians, dtype=float)
+    # Number of injections
+    n = len(signs[0]) if signs else 0
+    # Results
+    out = []
+    # Each injection
+    for k in range(n):
+        # Signs of this injection across the combinations
+        sk = np.array([s[k] for s in signs])
+        # Best with +1
+        plus = float(np.nanmin(med[sk > 0])) if np.any(sk > 0) else float("nan")
+        # Best with -1
+        minus = float(np.nanmin(med[sk < 0])) if np.any(sk < 0) else float("nan")
+        # Preferred side
+        preferred = 1.0 if plus < minus else (-1.0 if minus < plus else 0.0)
+        # Gap
+        out.append({"best_plus": plus, "best_minus": minus, "preferred": preferred, "gap": float(abs(plus - minus))})
+    # Return
+    return out
+
+
+def sign_verdicts(signs, near_lists, support_ok, separation_ok):
+    """
+    One verdict per injection from the near-best lists of all weeks.
+
+    signs          list of sign tuples, one per combination
+    near_lists     one list of near-best combination indices per week
+    support_ok     per injection, True when its usable support passed in
+                   every week
+    separation_ok  per injection, True when its own separation (see
+                   clamp_separation) exceeded the repeat guard in every
+                   week
+    An injection's sign is "supported" when every near-best combination
+    of every week carries the same sign for it; a near tie caused by a
+    different clamp does not erase that. Otherwise "unresolved". An
+    injection whose support failed is "insufficient support", and one
+    whose separation is within the repeat noise is "margin not
+    resolvable", whatever the lists say. Returns {verdict, sign} per
+    injection in plan order.
+    """
+    # Union of near-best combinations over the weeks
+    pool = sorted({i for lst in near_lists for i in lst})
+    # Verdicts
+    out = []
+    # Each injection
+    for k, (ok, sep) in enumerate(zip(support_ok, separation_ok)):
+        # Signs this injection takes across the pool
+        values = {signs[i][k] for i in pool}
+        # Support failed
+        if not ok:
+            # Verdict
+            out.append({"verdict": "insufficient support", "sign": None})
+        # Separation within the repeat noise
+        elif not sep:
+            # Verdict
+            out.append({"verdict": "margin not resolvable", "sign": None})
+        # One sign throughout the pool
+        elif len(values) == 1:
+            # Verdict
+            out.append({"verdict": "supported", "sign": float(values.pop())})
+        # Both signs appear
+        else:
+            # Verdict
+            out.append({"verdict": "unresolved", "sign": None})
+    # Return
+    return out
