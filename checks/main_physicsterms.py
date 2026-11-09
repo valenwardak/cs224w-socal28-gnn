@@ -46,13 +46,15 @@
 #   python checks/main_physicsterms.py --day 2025-06-12
 #   python checks/main_physicsterms.py --day 2025-08-10 --compare-solvers --step 60
 #   python checks/main_physicsterms.py --start 2025-07-29T08:00:00 --end 2025-07-29T20:00:00 --top 12
+#   python checks/main_physicsterms.py --day 2025-08-10 --rank-check --offset-threshold 0.5
 #
 # Functions:
 #   parse_args()                           command-line options with defaults
 #   window_from_args(args)                 (label, start_utc, end_utc) from --day or --start/--end
 #   term_labels(model, plan)               a name for every voltage, injection and zero-injection term
-#   solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_check, rank_rel_tol)
-#                                          per-slot state estimates and per-term residuals
+#   solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_check, rank_rel_tol, offset_threshold)
+#                                          per-slot state estimates and per-term residuals; the same status
+#                                          rules as run_block, including the offset rule when a threshold is given
 #   term_table(res, labels, weight)        per-term summary over the window
 #   print_hourly(res)                      total residual per hour beside the term counts
 #   print_terms(table, top)                the ranked per-term lines
@@ -114,8 +116,14 @@ def parse_args():
     parser.add_argument("--rank-check", action="store_true", help="Mark a slot 'undetermined' (no terms) when its available measurements do not determine the state; off by default")
     # Its tolerance
     parser.add_argument("--rank-rel-tol", type=float, default=1e-9, help="Singular values below this fraction of the largest count as zero in --rank-check")
+    # Offset filter, as in main_physics.py, off by default
+    parser.add_argument("--offset-threshold", type=float, default=None, help="Seconds; mark a slot 'offset_rejected' (no terms) when any meter the plan uses captured this far or farther from the slot time, whole slot; off by default")
     # Parse
     args = parser.parse_args()
+    # A threshold must be positive
+    if args.offset_threshold is not None and args.offset_threshold <= 0:
+        # Refuse
+        parser.error("--offset-threshold must be a positive number of seconds")
     # Window check
     if args.day is None and not (args.start and args.end):
         # Refuse
@@ -180,7 +188,7 @@ def term_labels(model, plan):
     return v_labels, i_labels, i_kind
 
 
-def solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_check=False, rank_rel_tol=1e-9):
+def solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_check=False, rank_rel_tol=1e-9, offset_threshold=None):
     """
     Solve every step-th slot and keep the per-term residuals. Returns a
     dict with t (slot times), status, total (objective per slot), count
@@ -194,6 +202,8 @@ def solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_
     n_state = 3 * model["n_nodes"]
     # Measurement arrays
     m = sp.assemble(model, plan, table, freq_tolerance)
+    # Slots rejected by the offset rule, the same function run_block uses; none when the rule is off
+    rejected = sp.offset_rejected(table, plan["meters"], offset_threshold) if offset_threshold is not None else np.zeros(len(table), dtype=bool)
     # Slot positions
     positions = np.arange(len(table))[::step]
     # Times
@@ -217,6 +227,12 @@ def solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_
         v_ok, i_ok = m["V_ok"][:, pos], m["I_ok"][:, pos]
         # Counts
         n_v, n_i = int(v_ok.sum()), int(i_ok.sum())
+        # Offset rule first, as run_block decides it
+        if rejected[pos]:
+            # Status, no terms
+            out["status"].append("offset_rejected")
+            # Next
+            continue
         # No data at all, as run_block decides it
         if n_v == 0 and (n_i == 0 or np.all(m["I_meas"][i_ok, pos] == 0)):
             # Status
@@ -430,7 +446,7 @@ def main():
     # Window
     label, start_utc, end_utc = window_from_args(args)
     # Say
-    print(f"window {label}: {start_utc} to {end_utc} UTC; solver {args.solver}, step {args.step}, current weight {weight}")
+    print(f"window {label}: {start_utc} to {end_utc} UTC; solver {args.solver}, step {args.step}, current weight {weight}; offset rule " + (f"on, threshold {args.offset_threshold} s, whole slot, meters {plan['meters']}" if args.offset_threshold is not None else "off"))
     # Data
     table = sp.load_block(args.processed_dir, plan["meters"], start_utc, end_utc)
     # Empty
@@ -442,7 +458,7 @@ def main():
     # Labels
     v_labels, i_labels, i_kind = term_labels(model, plan)
     # Solve
-    res = solve_window(model, plan, table, args.solver, weight, args.step, args.freq_tolerance, args.rank_check, args.rank_rel_tol)
+    res = solve_window(model, plan, table, args.solver, weight, args.step, args.freq_tolerance, args.rank_check, args.rank_rel_tol, args.offset_threshold)
     # Rank check report on the planned measurement set with everything present
     rank_all, tol_all, sv_all = sp.measurement_rank(model["Y"].astype(np.complex128), np.array([3 * v["node_idx"] + v["phase_idx"] for v in plan["voltages"]]), np.array([v["nominal"] for v in plan["voltages"]]), np.array([3 * inj["node_idx"] + p for inj in plan["injections"] for p in range(3)] + [3 * z + p for z in plan["zeros"] for p in range(3)]), np.array([float(np.mean([t["rating"] for t in inj["terms"]])) for inj in plan["injections"] for _ in range(3)] + [plan["zero_injection_nominal"]] * (3 * len(plan["zeros"]))), weight, 3 * model["n_nodes"], args.rank_rel_tol)
     # Say
@@ -462,7 +478,7 @@ def main():
         # The other solver
         other = "cvxpy" if args.solver == "numpy" else "numpy"
         # Solve again
-        res_b = solve_window(model, plan, table, other, weight, args.step, args.freq_tolerance, args.rank_check, args.rank_rel_tol)
+        res_b = solve_window(model, plan, table, other, weight, args.step, args.freq_tolerance, args.rank_check, args.rank_rel_tol, args.offset_threshold)
         # Compare
         compare_solvers(res, res_b, args.solver, other, v_labels, i_labels, i_kind)
 

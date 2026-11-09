@@ -11,10 +11,12 @@
 #              nominal, the largest residual, the number of slots solved,
 #              the number of slots with no answer by status (no data, too
 #              few readings, solver failed, undetermined under the rank
-#              safeguard), and the median number of
+#              safeguard, rejected by the offset rule), and the median number of
 #              voltage and current terms in the equations that day. The
 #              counts stand beside the residual so that a day with fewer
-#              readings is not read as a day with an electrical change.
+#              readings is not read as a day with an electrical change,
+#              and a day with many rejected slots is read as lost coverage,
+#              not as a quiet day.
 #              With --compare, two result folders holding the same block
 #              (for example the cvxpy and numpy solvers) are read side by
 #              side and the per-slot differences are summarized. Reading
@@ -115,7 +117,7 @@ def daily_table(res):
     the median voltage and current term counts over solved slots.
     """
     # Any status this reader does not list would vanish from the table; refuse rather than hide it
-    unknown = set(res["status"].unique()) - {"ok", "no_data", "too_few", "solver_failed", "undetermined"}
+    unknown = set(res["status"].unique()) - {"ok", "no_data", "too_few", "solver_failed", "undetermined", "offset_rejected"}
     # Refuse
     if unknown:
         # Stop
@@ -138,7 +140,7 @@ def daily_table(res):
         st = res.loc[sel, "status"].value_counts()
         # Row
         rows.append({"day": d, "slots": int(sel.sum()), "ok": int(s.sum()),
-                     "no_data": int(st.get("no_data", 0)), "too_few": int(st.get("too_few", 0)), "failed": int(st.get("solver_failed", 0)), "undetermined": int(st.get("undetermined", 0)),
+                     "no_data": int(st.get("no_data", 0)), "too_few": int(st.get("too_few", 0)), "failed": int(st.get("solver_failed", 0)), "undetermined": int(st.get("undetermined", 0)), "offset": int(st.get("offset_rejected", 0)),
                      "median_pct": float(pct[s].median()) if s.any() else float("nan"),
                      "p99_pct": float(pct[s].quantile(0.99)) if s.any() else float("nan"),
                      "max_pct": float(pct[s].max()) if s.any() else float("nan"),
@@ -151,7 +153,7 @@ def daily_table(res):
 def print_daily(table, event_days):
     """Print the daily rows; a day holding a scored logged change is marked with an asterisk."""
     # Header
-    print(f"\n{'day':<12} {'slots':>6} {'ok':>6} {'no_data':>7} {'too_few':>7} {'failed':>6} {'undet.':>6} {'median %':>9} {'p99 %':>8} {'max %':>8} {'nV':>5} {'nI':>5}  event")
+    print(f"\n{'day':<12} {'slots':>6} {'ok':>6} {'no_data':>7} {'too_few':>7} {'failed':>6} {'undet.':>6} {'offset':>6} {'median %':>9} {'p99 %':>8} {'max %':>8} {'nV':>5} {'nI':>5}  event")
     # Each row
     for _, r in table.iterrows():
         # Formatter for a possibly missing number
@@ -159,9 +161,9 @@ def print_daily(table, event_days):
         # Mark
         mark = "*" if r["day"] in event_days else ""
         # Line
-        print(f"{r['day']:<12} {r['slots']:>6} {r['ok']:>6} {r['no_data']:>7} {r['too_few']:>7} {r['failed']:>6} {r['undetermined']:>6} {f(r['median_pct']):>9} {f(r['p99_pct']):>8} {f(r['max_pct']):>8} {f(r['n_voltage'], 0):>5} {f(r['n_current'], 0):>5}  {mark}")
-    # Whole-period summary over the days
-    print(f"\n{len(table)} days; median of daily medians {table['median_pct'].median():.3f} %, lowest daily median {table['median_pct'].min():.3f} %, highest daily median {table['median_pct'].max():.3f} %; solved slots {int(table['ok'].sum())} of {int(table['slots'].sum())}")
+        print(f"{r['day']:<12} {r['slots']:>6} {r['ok']:>6} {r['no_data']:>7} {r['too_few']:>7} {r['failed']:>6} {r['undetermined']:>6} {r['offset']:>6} {f(r['median_pct']):>9} {f(r['p99_pct']):>8} {f(r['max_pct']):>8} {f(r['n_voltage'], 0):>5} {f(r['n_current'], 0):>5}  {mark}")
+    # Whole-period summary over the days, with the slots lost to the offset rule
+    print(f"\n{len(table)} days; median of daily medians {table['median_pct'].median():.3f} %, lowest daily median {table['median_pct'].min():.3f} %, highest daily median {table['median_pct'].max():.3f} %; solved slots {int(table['ok'].sum())} of {int(table['slots'].sum())}; offset-rejected slots {int(table['offset'].sum())}")
 
 
 def compare(a, b):

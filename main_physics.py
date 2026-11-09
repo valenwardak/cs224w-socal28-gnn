@@ -23,12 +23,15 @@
 #     python main_physics.py --split test_events --solver numpy
 #   B-side (component 0) with the rank safeguard, into its own folder:
 #     python main_physics.py --config physics_config_b.json --rank-check --split test_normal --splits splits_v2.json --solver numpy --out-dir data/processed/physics_b
+#   With the Caltech-inspired offset filter (whole slot dropped when any planned meter captured 0.5 s or more from the slot time), into its own folder:
+#     python main_physics.py --rank-check --offset-threshold 0.5 --solver numpy --split test_normal --splits splits_v2.json --out-dir data/processed/physics_offset05
 #   Options: python main_physics.py --help
 #
 # Output under <out_dir>:
 #   <label>.parquet   residual per slot: residual, residual_mean, n_voltage,
 #                     n_current, status
-#   <label>.json      summary numbers and the options used
+#   <label>.json      summary numbers and the options used, including the
+#                     offset rule's threshold, policy and meters when it is on
 #
 # Functions:
 #   parse_args()                 command-line options with defaults
@@ -84,8 +87,16 @@ def parse_args():
     parser.add_argument("--rank-check", action="store_true", help="Mark a slot 'undetermined' (no residual) when its available measurements do not determine the state; off by default")
     # Its tolerance
     parser.add_argument("--rank-rel-tol", type=float, default=1e-9, help="Singular values below this fraction of the largest count as zero in --rank-check")
+    # Offset filter, off by default; Caltech's produce_phasors_matrix uses 0.5 s measured from the synchronized request time, ours is measured from the ten-second slot
+    parser.add_argument("--offset-threshold", type=float, default=None, help="Seconds; mark a slot 'offset_rejected' (no residual) when any meter the plan uses captured this far or farther from the slot time, whole slot, as Caltech's 0.5 s rule does per timestamp; off by default")
     # Parse
-    return parser.parse_args()
+    args = parser.parse_args()
+    # A threshold must be positive
+    if args.offset_threshold is not None and args.offset_threshold <= 0:
+        # Refuse
+        parser.error("--offset-threshold must be a positive number of seconds")
+    # Done
+    return args
 
 
 def blocks_from_args(args):
@@ -149,12 +160,13 @@ def main():
             # Next
             continue
         # Solve
-        results = sp.run_block(model, plan, table, solver=args.solver, weight=weight, step=args.step, progress=not args.quiet, freq_tolerance=args.freq_tolerance, rank_check=args.rank_check, rank_rel_tol=args.rank_rel_tol)
+        results = sp.run_block(model, plan, table, solver=args.solver, weight=weight, step=args.step, progress=not args.quiet, freq_tolerance=args.freq_tolerance, rank_check=args.rank_check, rank_rel_tol=args.rank_rel_tol, offset_threshold=args.offset_threshold)
         # Summary
         summary = sp.summarize(results)
-        # Add the options used
+        # Add the options used, the offset rule's settings copied from the results so the file records what was applied
         summary.update({"label": label, "start_utc": start_utc, "end_utc": end_utc, "solver": args.solver, "current_weight": weight, "step": args.step, "freq_tolerance": args.freq_tolerance, "reference_time": config["reference_time"],
-                        "config": args.config, "rank_check": args.rank_check, "rank_rel_tol": args.rank_rel_tol if args.rank_check else None})
+                        "config": args.config, "rank_check": args.rank_check, "rank_rel_tol": args.rank_rel_tol if args.rank_check else None,
+                        "offset_threshold": results.attrs["offset_threshold"], "offset_policy": results.attrs["offset_policy"], "offset_meters": results.attrs["offset_meters"]})
         # Write results
         results.to_parquet(os.path.join(args.out_dir, f"{label}.parquet"))
         # Write summary

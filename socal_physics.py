@@ -51,17 +51,23 @@
 #                                                one table of the needed columns
 #     meter_frequency(table, meter)              grid frequency per slot from the voltage channels
 #     aligned_phasor(table, meter, channel, tol) complex phasor shifted to slot time, off-bin readings dropped
+#     offset_rejected(table, meters, threshold)  slots where any listed meter captured too far from the slot time
+#                                                (Caltech-inspired offset filter measured from the ten-second slot)
 #   Assembling and solving
 #     assemble(model, plan, table)               measured vectors, nominals, row masks
 #     measurement_rank(Y, V_idx, V_nom, I_rows, I_nom, weight, n_state, rel_tol)
 #                                                rank of the available measurement matrix and the tolerance used
 #     solve_slot_numpy(...)                      weighted least squares, closed form
 #     solve_slot_cvxpy(...)                      Caltech's objective via cvxpy and ECOS
-#     run_block(model, plan, table, solver, weight, step, progress, freq_tolerance, rank_check, rank_rel_tol)
+#     run_block(model, plan, table, solver, weight, step, progress, freq_tolerance, rank_check, rank_rel_tol,
+#               offset_threshold)
 #                                                residual per slot for one window; with rank_check, a slot whose
 #                                                available measurements do not determine the state is marked
-#                                                "undetermined" and gets no residual (off by default, so the
-#                                                A-side runs and results stay as they were)
+#                                                "undetermined" and gets no residual; with offset_threshold, a
+#                                                slot where any planned meter captured that many seconds or more
+#                                                from the slot time is marked "offset_rejected" and gets no
+#                                                residual (both off by default, so the A-side runs and results
+#                                                stay as they were)
 #     summarize(results)                         mean, percentiles, valid count
 # =============================================================================
 
@@ -650,6 +656,44 @@ def aligned_phasor(table, meter, channel, freq_tolerance):
     return np.where(agree, rms * np.exp(1j * np.deg2rad(ang_slot)), np.nan + 0j)
 
 
+def offset_rejected(table, meters, threshold):
+    """
+    Slots to reject because a meter captured too far from the slot time.
+    Returns a boolean array, one value per slot, True where any meter in
+    the list has a capture offset (toff, seconds) whose absolute value is
+    at or above the threshold.
+
+    Caltech's align_phasors() keeps a timestamp only when every included
+    device is strictly less than delta_t_threshold (0.5 s in their
+    produce_phasors_matrix) from the synchronized request time, and
+    discards the whole timestamp otherwise. We do not have the request
+    times, so this is a Caltech-inspired offset filter measured from the
+    ten-second slot, applied to the meters the plan uses, whole slot.
+    A meter with no reading in the slot has no offset and cannot reject
+    the slot; it is simply absent, as the other status values record.
+    The angle rotation itself is unchanged; this only decides which slots
+    are solved.
+    """
+    # Nothing rejected until a meter says otherwise
+    rejected = np.zeros(len(table), dtype=bool)
+    # Loop over the meters the plan uses
+    for meter in meters:
+        # Offset column
+        col = f"{meter}{SEP}{TOFF}"
+        # A meter with no offset column is absent everywhere
+        if col not in table.columns:
+            # Next
+            continue
+        # Offsets, NaN where the meter has no reading
+        toff = table[col].to_numpy(dtype=np.float64)
+        # Present and at or beyond the threshold
+        far = np.isfinite(toff) & (np.abs(toff) >= threshold)
+        # Any far meter rejects the slot
+        rejected |= far
+    # Return
+    return rejected
+
+
 # -----------------------------------------------------------------------------
 # Assembling and solving
 # -----------------------------------------------------------------------------
@@ -824,7 +868,7 @@ def solve_slot_cvxpy(Y, V_meas, V_idx, V_nom, I_meas, I_rows, I_nom, weight, n_s
     return np.asarray(V.value).flatten()
 
 
-def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=True, freq_tolerance=0.01, rank_check=False, rank_rel_tol=1e-9):
+def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=True, freq_tolerance=0.01, rank_check=False, rank_rel_tol=1e-9, offset_threshold=None):
     """
     Solve every step-th slot in the table and return a DataFrame indexed
     by slot time with columns:
@@ -833,13 +877,21 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
       n_voltage       voltage terms used in that slot
       n_current       current terms used in that slot (zero-injection rows included)
       status          "ok", "no_data", "too_few", "solver_failed", or, with
-                      rank_check, "undetermined"
+                      rank_check, "undetermined", or, with offset_threshold,
+                      "offset_rejected"
     Slots with no usable readings are marked, never scored as zero.
     With rank_check=True (off by default, so earlier runs are unchanged),
     the rank of the available measurement matrix is computed once per
     distinct availability pattern and cached; a slot whose rank is below
     the state size is marked "undetermined" with no residual. The
     tolerance used is attached to the DataFrame as out.attrs["rank_rel_tol"].
+    With offset_threshold set (seconds; off by default), a slot where any
+    meter the plan uses captured at or beyond that many seconds from the
+    slot time is marked "offset_rejected" with no residual, before any
+    other test, following Caltech's whole-timestamp rule (see
+    offset_rejected). The threshold, the policy and the meters checked
+    are attached as out.attrs["offset_threshold"], ["offset_policy"] and
+    ["offset_meters"]. A rejected slot is lost coverage, not a low residual.
     """
     # Admittance matrix as complex128 for the solvers
     Y = model["Y"].astype(np.complex128)
@@ -847,6 +899,8 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
     n_state = 3 * model["n_nodes"]
     # Arrays, readings with an off-bin frequency dropped
     m = assemble(model, plan, table, freq_tolerance)
+    # Slots rejected by the offset rule, none when the rule is off
+    rejected = offset_rejected(table, plan["meters"], offset_threshold) if offset_threshold is not None else np.zeros(len(table), dtype=bool)
     # Slot times
     times = table.index[::step]
     # Row positions
@@ -873,6 +927,12 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
         i_ok = m["I_ok"][:, pos]
         # Counts
         n_v, n_i = int(v_ok.sum()), int(i_ok.sum())
+        # Offset rule first: a meter captured too far from the slot time
+        if rejected[pos]:
+            # Mark, no residual
+            rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "status": "offset_rejected"})
+            # Next
+            continue
         # No readings at all
         if n_v == 0 and (n_i == 0 or np.all(m["I_meas"][i_ok, pos] == 0)):
             # Mark
@@ -921,6 +981,12 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
     out.attrs["rank_check"] = bool(rank_check)
     # And its tolerance
     out.attrs["rank_rel_tol"] = float(rank_rel_tol) if rank_check else None
+    # Record the offset rule's threshold, None when off
+    out.attrs["offset_threshold"] = float(offset_threshold) if offset_threshold is not None else None
+    # Its policy: the whole slot is dropped, as Caltech drops the whole timestamp
+    out.attrs["offset_policy"] = "whole_slot" if offset_threshold is not None else None
+    # The meters it checked
+    out.attrs["offset_meters"] = list(plan["meters"]) if offset_threshold is not None else None
     # Return
     return out
 
@@ -929,10 +995,10 @@ def summarize(results):
     """Return a small dictionary of summary numbers for a results table."""
     # Scored slots
     ok = results[results["status"] == "ok"]
-    # Nothing scored
+    # Nothing scored: still say why, so a block lost to rejections or missing data explains itself
     if ok.empty:
-        # Empty summary
-        return {"slots": int(len(results)), "scored": 0}
+        # Counts without residual figures
+        return {"slots": int(len(results)), "scored": 0, "status_counts": results["status"].value_counts().to_dict()}
     # Summary
     return {
         # All slots
