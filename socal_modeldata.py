@@ -24,6 +24,15 @@
 #
 # Model input, per slot, meter, channel, F = 5 numbers:
 #              [ magnitude / scale,  cos(angle),  sin(angle),  mag_valid,  ang_valid ]
+#              With physics inputs turned on (configure_physics), four more
+#              numbers follow, the same for every meter and channel of the
+#              slot, F = 9:
+#              [ A residual / scale_A, A valid, B residual / scale_B, B valid ]
+#              from <YYYY-MM>_physics.npz (main_physicsfeatures.py). Where a
+#              valid flag is 0 the residual before it is 0: a missing
+#              physics value never looks like a perfect fit. Physics inputs
+#              are off unless a main script turns them on, so every earlier
+#              command builds exactly the inputs it did before.
 #              The two flags are the validity flags, not the raw presence mask:
 #              mag_valid is present and finite, ang_valid is angle_ok and
 #              finite and mag_valid. Where a flag is 0 the values before it
@@ -84,8 +93,14 @@
 #                                            (M, C) nominal scale for channels with no train data
 #     compute_scale(features_dir, splits, manifest, graph_path, percentile, floor, allow_missing)
 #                                            (M, C) scale from train blocks, plus counts
-#     save_scale(path, ...)                  write scale.json atomically
+#     save_scale(path, ...)                  write scale.json atomically, with the physics divisors when given
 #     load_scale(path, manifest)             read scale.json, checked against the manifest
+#     load_physics_scale(path)               the physics divisors from scale.json, or None
+#   Physics inputs (optional)
+#     configure_physics(features_dir, scale) turn the four physics features on for this process
+#     n_features()                           5, or 9 with physics on
+#     compute_physics_scale(features_dir, splits, percentile, allow_missing)
+#                                            per side: the percentile of valid residuals over the train blocks
 #   Model inputs
 #     build_features(arrays, scale)          X (T, M, C, F) float32, plus target validity
 #     window_starts(present_any, history, horizon, max_gap, target_valid)
@@ -110,8 +125,14 @@ import pandas as pd
 
 # Feature names per channel, in order
 FEATURES = ("mag", "cos", "sin", "mag_valid", "ang_valid")
-# Number of features per channel
+# Number of features per channel without physics inputs
 F = len(FEATURES)
+# The physics features, appended after the five above when physics inputs are on
+PHYSICS_FEATURES = ("phys_a", "phys_a_valid", "phys_b", "phys_b_valid")
+# The two sides in array order
+PHYSICS_SIDES = ("a", "b")
+# Physics configuration for this process: None (off) or {"features_dir", "scale" (2,) float32 or None}
+PHYSICS = None
 # Seconds per slot
 SLOT_SECONDS = 10
 # The feature files follow the preprocessing grid: fixed Pacific Standard
@@ -285,8 +306,34 @@ def load_month(features_dir, month, allow_missing=False, manifest=None):
     ang_valid = angle_ok & np.isfinite(ang) & mag_valid
     # Zero where not valid
     ang = np.where(ang_valid, ang, 0.0).astype(np.float32)
+    # Arrays
+    out = {"t": t, "rms": rms, "ang": ang, "present": present, "mag_valid": mag_valid, "ang_valid": ang_valid}
+    # Physics inputs, when turned on for this process
+    if PHYSICS is not None:
+        # Physics file of the month, required: a month without one cannot be trained or scored with physics inputs
+        ppath = os.path.join(PHYSICS["features_dir"], f"{month}_physics.npz")
+        # Missing
+        if not os.path.exists(ppath):
+            # Raise
+            raise FileNotFoundError(f"physics inputs are on but {ppath} is missing; run main_physicsfeatures.py")
+        # Load
+        with np.load(ppath) as data:
+            # Times must be the feature month's times, slot for slot
+            if not np.array_equal(data["t"].astype(np.int64), t):
+                # Raise
+                raise ValueError(f"{ppath}: slot times differ from {path}")
+            # Residual per side, (T, 2)
+            r = np.stack([data[f"r_{side}"].astype(np.float32) for side in PHYSICS_SIDES], axis=1)
+            # Valid per side, (T, 2)
+            v = np.stack([data[f"valid_{side}"].astype(bool) for side in PHYSICS_SIDES], axis=1)
+        # A valid residual must be finite; zero where not valid, whatever the file holds
+        v &= np.isfinite(r)
+        # Zero where not valid
+        r = np.where(v, r, 0.0).astype(np.float32)
+        # Store
+        out["phys_r"], out["phys_valid"] = r, v
     # Return
-    return {"t": t, "rms": rms, "ang": ang, "present": present, "mag_valid": mag_valid, "ang_valid": ang_valid}
+    return out
 
 
 def slice_block(arrays, start_s, end_s):
@@ -461,8 +508,13 @@ def compute_scale(features_dir, splits, manifest, graph_path=None, percentile=95
     return scale.astype(np.float32), count, used_fallback
 
 
-def save_scale(path, scale, count, manifest, percentile, floor, fallback=None):
-    """Write scale.json with the numbers, the counts, which channels used the fallback, and how they were made."""
+def save_scale(path, scale, count, manifest, percentile, floor, fallback=None, physics=None):
+    """
+    Write scale.json with the numbers, the counts, which channels used the
+    fallback, and how they were made. physics, when given, is
+    {"scale": (2,), "count": (2,), "features_dir": str} and is stored under
+    "physics" so a run with physics inputs records its divisors.
+    """
     # Body
     body = {
         # How
@@ -473,6 +525,8 @@ def save_scale(path, scale, count, manifest, percentile, floor, fallback=None):
         "scale": scale.tolist(), "count": count.tolist(),
         # Channels with no train data, scaled by their nominal value
         "fallback": fallback.tolist() if fallback is not None else None,
+        # Physics divisors, None for a run without physics inputs
+        "physics": {"sides": list(PHYSICS_SIDES), "scale": [float(x) for x in physics["scale"]], "count": [int(x) for x in physics["count"]], "features_dir": physics["features_dir"]} if physics is not None else None,
     }
     # Write to a temporary file first, then rename, so a crash never leaves a half file
     tmp = path + ".tmp"
@@ -512,6 +566,138 @@ def load_scale(path, manifest):
     return scale
 
 
+def load_physics_scale(path):
+    """
+    Read the "physics" section of scale.json: the (2,) divisor array, or
+    None when the file has none (a run without physics inputs). Checks the
+    side order and that the values are finite and positive.
+    """
+    # Read
+    with open(path) as f:
+        # Parse
+        body = json.load(f)
+    # Section
+    phys = body.get("physics")
+    # None recorded
+    if phys is None:
+        # None
+        return None
+    # Side order
+    if list(phys.get("sides", [])) != list(PHYSICS_SIDES):
+        # Raise
+        raise ValueError(f"{path}: physics sides {phys.get('sides')} differ from {list(PHYSICS_SIDES)}")
+    # Array
+    scale = np.asarray(phys["scale"], dtype=np.float32)
+    # Values
+    if scale.shape != (len(PHYSICS_SIDES),) or not np.all(np.isfinite(scale)) or not np.all(scale > 0):
+        # Raise
+        raise ValueError(f"{path}: physics scale values must be {len(PHYSICS_SIDES)} finite positive numbers")
+    # Return
+    return scale
+
+
+# -----------------------------------------------------------------------------
+# Physics inputs (optional)
+# -----------------------------------------------------------------------------
+
+def configure_physics(features_dir, scale=None):
+    """
+    Turn the physics inputs on for this process: load_month() then reads
+    <month>_physics.npz from features_dir and build_features() appends the
+    four physics features. scale is the (2,) array of per-side divisors
+    (compute_physics_scale or the scale file); it may be set later by
+    calling again with the same folder. Pass features_dir None to turn the
+    inputs off again. Nothing is on unless a main script calls this.
+    """
+    # Module state
+    global PHYSICS
+    # Off
+    if features_dir is None:
+        # Clear
+        PHYSICS = None
+        # Done
+        return
+    # Scale, checked when given
+    if scale is not None:
+        # Array
+        scale = np.asarray(scale, dtype=np.float32).reshape(-1)
+        # Two finite positive values
+        if scale.shape != (len(PHYSICS_SIDES),) or not np.all(np.isfinite(scale)) or not np.all(scale > 0):
+            # Raise
+            raise ValueError(f"physics scale must be {len(PHYSICS_SIDES)} finite positive values, got {scale}")
+    # Set
+    PHYSICS = {"features_dir": features_dir, "scale": scale}
+
+
+def n_features():
+    """Number of features per channel in the model input: F, or F plus the physics features when they are on."""
+    # Count
+    return F + (len(PHYSICS_FEATURES) if PHYSICS is not None else 0)
+
+
+def compute_physics_scale(features_dir, splits, percentile=95.0, allow_missing=False):
+    """
+    Per side, the given percentile of the valid physics residuals over the
+    train blocks only, the same rule compute_scale() applies to magnitudes.
+    Returns (scale (2,) float32, count (2,) int64). Stops with a clear
+    message when a side has no valid training value or its scale is zero
+    or not finite: a side that cannot be scaled cannot be an input.
+    Physics inputs must be on (configure_physics) so load_month reads them.
+    """
+    # Must be on
+    if PHYSICS is None:
+        # Raise
+        raise ValueError("physics inputs are off; call configure_physics first")
+    # Samples per side, thinned like the magnitude scale
+    samples = [[] for _ in PHYSICS_SIDES]
+    # True counts
+    count = np.zeros(len(PHYSICS_SIDES), dtype=np.int64)
+    # Train blocks
+    for block in splits["train"]:
+        # Bounds
+        start_s, end_s = block_seconds(block)
+        # Months
+        for month in months_in_block(block):
+            # Load with the physics arrays
+            arrays = load_month(features_dir, month, allow_missing)
+            # Missing when allowed
+            if arrays is None:
+                # Next
+                continue
+            # Rows in the block
+            part = slice_block(arrays, start_s, end_s)
+            # Empty
+            if part is None:
+                # Next
+                continue
+            # Each side
+            for k in range(len(PHYSICS_SIDES)):
+                # Valid values
+                v = part["phys_r"][:, k][part["phys_valid"][:, k]]
+                # Count
+                count[k] += len(v)
+                # Keep every tenth
+                if len(v):
+                    # Store
+                    samples[k].append(v[::10].copy())
+    # Scale per side
+    scale = np.zeros(len(PHYSICS_SIDES), dtype=np.float32)
+    # Each side
+    for k, side in enumerate(PHYSICS_SIDES):
+        # Nothing valid in training
+        if not samples[k]:
+            # Stop
+            raise ValueError(f"physics side {side} has no valid value in the train blocks; it cannot be scaled or used as an input")
+        # Percentile
+        scale[k] = float(np.percentile(np.concatenate(samples[k]), percentile))
+        # Must be positive and finite
+        if not np.isfinite(scale[k]) or scale[k] <= 0:
+            # Stop
+            raise ValueError(f"physics side {side} scale is {scale[k]} (percentile {percentile} of {int(count[k])} training values); it cannot be used as an input")
+    # Return
+    return scale, count
+
+
 # -----------------------------------------------------------------------------
 # Model inputs
 # -----------------------------------------------------------------------------
@@ -523,13 +709,16 @@ def build_features(arrays, scale):
       X[..., 0] = rms / scale, zero where not valid
       X[..., 1] = cos(angle), X[..., 2] = sin(angle), zero where not valid
       X[..., 3] = mag_valid as 0/1, X[..., 4] = ang_valid as 0/1
+    With physics inputs on, four more features follow, identical over
+    meters and channels: X[..., 5] = A residual / scale_A (0 where not
+    valid), X[..., 6] = A valid, X[..., 7] and X[..., 8] the same for B.
     Returns (X float32, mag_valid bool (T, M, C), ang_valid bool (T, M, C)),
     the same two validity arrays that sit in X, used for targets and loss.
     """
     # Sizes
     T, M, C = arrays["rms"].shape
-    # Output
-    X = np.zeros((T, M, C, F), dtype=np.float32)
+    # Output, F or F plus the physics features
+    X = np.zeros((T, M, C, n_features()), dtype=np.float32)
     # Scaled magnitude, already zero where not valid
     X[..., 0] = arrays["rms"] / scale[None, :, :]
     # Angle in radians, already zero where not valid
@@ -542,6 +731,22 @@ def build_features(arrays, scale):
     X[..., 3] = arrays["mag_valid"]
     # Angle validity flag
     X[..., 4] = arrays["ang_valid"]
+    # Physics features, when on
+    if PHYSICS is not None:
+        # The arrays must be there
+        if "phys_r" not in arrays:
+            # Raise
+            raise ValueError("physics inputs are on but the month arrays carry no physics values")
+        # A scale is needed to build inputs
+        if PHYSICS["scale"] is None:
+            # Raise
+            raise ValueError("physics inputs are on but no physics scale is set; compute or load it first")
+        # Each side: scaled residual then flag, broadcast over meters and channels
+        for k in range(len(PHYSICS_SIDES)):
+            # Scaled residual, already zero where not valid
+            X[..., F + 2 * k] = (arrays["phys_r"][:, k] / PHYSICS["scale"][k])[:, None, None]
+            # Valid flag
+            X[..., F + 2 * k + 1] = arrays["phys_valid"][:, k][:, None, None]
     # Validity for targets
     return X, arrays["mag_valid"].copy(), arrays["ang_valid"].copy()
 
