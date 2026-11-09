@@ -211,13 +211,15 @@ The GRU baseline does not use the graph. Each meter forecasts from its own histo
 
 ## Step 9: learned models
 
-Two helper modules and two thin main scripts. `socal_modeldata.py` is the data side: it reads the monthly feature files, checks them against `manifest.json`, cuts them to the blocks in `splits.json`, computes the per-channel scale from the train blocks (95th percentile of valid magnitudes, with a floor from the clamp ratings in `graph.json`, and the bus nominal voltage or a tenth of the clamp rating for a channel with no train readings), builds the model input (scaled magnitude, cos and sin of the angle, two validity flags per channel), and makes training windows. `socal_models.py` is the model side: the models, the persistence baseline, the loss, the training loop with checkpoints, and the scoring output.
+Two helper modules and thin main scripts. `socal_modeldata.py` is the data side: it reads the monthly feature files, checks them against `manifest.json`, cuts them to the blocks in `splits.json`, computes the per-channel scale from the train blocks (95th percentile of valid magnitudes, with a floor from the clamp ratings in `graph.json`, and the bus nominal voltage or a tenth of the clamp rating for a channel with no train readings), builds the model input (scaled magnitude, cos and sin of the angle, two validity flags per channel), and makes training windows. `socal_models.py` is the model side: the models, the persistence baseline, the loss, the training loop with checkpoints, and the scoring output.
 
 Models:
 
 - Persistence: the forecast is the last valid reading. No parameters. Every learned model is compared with it.
 - GRU (`main_gru.py`): one GRU shared by all meters with a learned meter embedding. Each meter forecasts its next reading from its own ten-minute history. No graph.
-- GCN (`main_gcn.py`): the same GRU encodes every meter's history, the states are placed on the nodes of `graph.json` (meters sharing a node are averaged, nodes without a meter get one learned vector), GCN layers pass messages along the lines and transformers with `admittance_abs` as the edge weight, and a head reads each meter's own state together with its node's state. `--edges true|random|none` and `--edge-weights admittance|binary` are the topology ablation. GAT and GraphSAGE use the same class with the kind changed.
+- GCN (`main_gcn.py`): the same GRU encodes every meter's history, the states are placed on the nodes of `graph.json` (meters sharing a node are averaged, nodes without a meter get one learned vector), GCN layers pass messages along the lines and transformers with `admittance_abs` as the edge weight, and a head reads each meter's own state together with its node's state. `--edges true|random|none` and `--edge-weights admittance|binary` are the topology ablation. GAT and GraphSAGE use the same class with the kind changed. GAT uses `--heads`; GCN does not.
+- RGCN (`main_rgcn.py`): the same placement, with Line vs Transformer as two relations instead of a single weighted edge type. `--edge-weights` is kept for checkpoint compatibility but unused.
+- HGT (`main_hgt.py`): the same Line vs Transformer relations as RGCN, with type-specific multi-head attention (`--heads`, default 4; `--hidden` must be divisible by it). Attention replaces the scalar admittance weight.
 
 Every learned model forecasts the change from the last valid reading (`--predict-delta`, default on): the head's output is added to the persistence forecast, and the head starts at zero weights so the first forecast is persistence itself. The loss is squared error on the scaled magnitude plus `--angle-weight` times squared error on (cos, sin), each over its own valid targets. A window is dropped when its history holds a run of `--max-gap` absent slots (default 12, two minutes). Validation block 0 (January 2024) is for early stopping and design choices; block 1 (February 2025) is reserved for calibration and never chooses a model.
 
@@ -226,9 +228,10 @@ python main_gru.py --run-name gru_full_aw001 --angle-weight 0.01 --score-splits 
 python main_gcn.py --run-name gcn_full_aw001 --angle-weight 0.01 --score-splits validation
 python main_gcn.py --run-name gcn_full_none --angle-weight 0.01 --edges none --score-splits validation
 python main_gcn.py --run-name gcn_full_aw001 --angle-weight 0.01 --score-only --score-splits test_events test_normal
+python main_hgt.py --train-months 2024-10 --epochs 2 --hidden 16 --run-name smoke_hgt --score-splits validation
 ```
 
-Smoke test on one month: add `--train-months 2024-10 --epochs 2 --hidden 16`. Options: `--help`. Needs `torch`, and `torch_geometric` for the GCN.
+Smoke test on one month: add `--train-months 2024-10 --epochs 2 --hidden 16`. Options: `--help`. Needs `torch`, and `torch_geometric` for the GNN models.
 
 Output under `data/processed/models/<run_name>/`:
 
@@ -305,6 +308,8 @@ Established by the scripts in `checks/`, which can be rerun with `--data-dir ../
 | `socal_models.py` | Models, persistence, loss, training loop, residual output |
 | `main_gru.py` | Train and score the no-graph GRU baseline |
 | `main_gcn.py` | Train and score the GCN, with the topology ablation options |
+| `main_rgcn.py` | Train and score the RGCN (Line vs Transformer relations) |
+| `main_hgt.py` | Train and score the Heterogeneous Graph Transformer |
 | `socal_score.py` | Event-detection scoring method |
 | `main_score.py` | Score one run: model and persistence, primary and exploratory statistics |
 | `merge_years.sh` | Merges two per-year download folders into one |

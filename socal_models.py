@@ -6,12 +6,13 @@
 # Created:     2026-10-22
 #
 # Purpose:     The learned models and everything around them: the shared
-#              meter-conditioned GRU, the three GNNs built on top of it
-#              (GCN, GAT, GraphSAGE, RGCN), the persistence baseline, the loss,
-#              the training loop with checkpoints, and the scoring that
+#              meter-conditioned GRU, the GNNs built on top of it
+#              (GCN, GAT, GraphSAGE, RGCN, HGT), the persistence baseline, the
+#              loss, the training loop with checkpoints, and the scoring that
 #              writes a residual per slot, meter, and channel. The data
 #              side lives in socal_modeldata.py. Imported by the thin main
-#              scripts main_gru.py, main_gcn.py, main_gat.py, main_sage.py.
+#              scripts main_gru.py, main_gcn.py, main_rgcn.py, main_hgt.py,
+#              main_gat.py, main_sage.py.
 #
 # How the models relate:
 #              GRU baseline   each meter's own history -> GRU -> forecast.
@@ -54,7 +55,9 @@
 #              undirected, stored in both directions. GCN uses the scalar
 #              admittance_abs as the edge weight, GAT takes it as a one-
 #              number edge feature, GraphSAGE ignores weights (mean of
-#              neighbors), RGCN uses Line vs Transformer as two relations.
+#              neighbors), RGCN uses Line vs Transformer as two relations,
+#              HGT uses the same two relations with type-specific multi-head
+#              attention (and ignores scalar admittance, like RGCN).
 #              --edges none|random|true and --edge-weights
 #              binary|admittance give the topology ablation. Two limits of
 #              that ablation, stated so nobody over-reads it: with "none",
@@ -475,10 +478,13 @@ class GraphForecaster(nn.Module):
     grid graph, and a head that reads each meter's own state together with
     its node's mixed state.
 
-    kind: "gcn", "gat", "sage", or "rgcn". Needs torch_geometric. gnn_layers is
+    kind: "gcn", "gat", "sage", "rgcn", or "hgt". Needs torch_geometric. gnn_layers is
     the number of message-passing hops; one hop does not reach a meter
     that sits two edges away behind an unmetered node.
     """
+
+    # One node type and the two relations from build_edges: Line = 0, Transformer = 1
+    HGT_METADATA = (["bus"], [("bus", "line", "bus"), ("bus", "transformer", "bus")])
 
     def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_index, edge_weight, n_relations, edge_type, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True):
         # Base class
@@ -486,7 +492,7 @@ class GraphForecaster(nn.Module):
         # Whether the head outputs a correction to the persistence forecast
         self.predict_delta = predict_delta
         # Layers from PyTorch Geometric, imported here so the GRU runs without it
-        from torch_geometric.nn import GCNConv, GATConv, SAGEConv, RGCNConv
+        from torch_geometric.nn import GCNConv, GATConv, SAGEConv, RGCNConv, HGTConv
         # Sizes
         self.C, self.hidden, self.n_nodes, self.kind = n_channels, hidden, n_nodes, kind
         # Shared encoder
@@ -501,6 +507,10 @@ class GraphForecaster(nn.Module):
         self.register_buffer("edge_type", edge_type)
         # Learned vector for nodes without a meter
         self.unmetered = nn.Parameter(torch.zeros(hidden))
+        # HGT splits the hidden size across attention heads
+        if kind == "hgt" and hidden % heads != 0:
+            # Raise
+            raise ValueError(f"HGT hidden size {hidden} must be divisible by heads {heads}")
         # Message passing layers, gnn_layers of them, each one hop
         convs = []
         # Build
@@ -518,6 +528,9 @@ class GraphForecaster(nn.Module):
             elif kind == "rgcn":
                 # Separate weights per relation
                 convs.append(RGCNConv(hidden, hidden, n_relations))
+            elif kind == "hgt":
+                # Type-specific multi-head attention over Line vs Transformer
+                convs.append(HGTConv(hidden, hidden, self.HGT_METADATA, heads=heads))
             else:
                 # Unknown
                 raise ValueError(f"unknown GNN kind: {kind}")
@@ -549,6 +562,18 @@ class GraphForecaster(nn.Module):
         ei = (self.edge_index.unsqueeze(1) + offsets.view(1, -1, 1)).reshape(2, -1)
         # Weights and types repeated in the same copy order
         return ei, self.edge_weight.repeat(B), self.edge_type.repeat(B)
+
+    def _hgt_edge_dict(self, ei, et):
+        """
+        Split a homogeneous edge_index by relation id into the dict HGTConv
+        expects. Both Line and Transformer keys are always present; a type
+        with no edges (including --edges none) gets a (2, 0) tensor.
+        """
+        # Line = 0, Transformer = 1, matching build_edges
+        return {
+            ("bus", "line", "bus"): ei[:, et == 0],
+            ("bus", "transformer", "bus"): ei[:, et == 1],
+        }
 
     def forward(self, x):
         """
@@ -584,6 +609,9 @@ class GraphForecaster(nn.Module):
             elif self.kind == "rgcn":
                 # Typed
                 out = conv(mixed, ei, edge_type=et)
+            elif self.kind == "hgt":
+                # Heterogeneous attention over Line vs Transformer
+                out = conv({"bus": mixed}, self._hgt_edge_dict(ei, et))["bus"]
             else:
                 # Unweighted
                 out = conv(mixed, ei)
@@ -711,7 +739,7 @@ def residuals(y_hat, y, y_valid):
 # -----------------------------------------------------------------------------
 
 def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True):
-    """Build a model by name: "gru", "gcn", "gat", "sage", or "rgcn"."""
+    """Build a model by name: "gru", "gcn", "gat", "sage", "rgcn", or "hgt"."""
     # Sizes
     M, C = len(manifest["meters"]), len(manifest["channels"])
     # Plain GRU
