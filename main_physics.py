@@ -25,11 +25,13 @@
 #     python main_physics.py --config physics_config_b.json --rank-check --split test_normal --splits splits_v2.json --solver numpy --out-dir data/processed/physics_b
 #   With the Caltech-inspired offset filter (whole slot dropped when any planned meter captured 0.5 s or more from the slot time), into its own folder:
 #     python main_physics.py --rank-check --offset-threshold 0.5 --solver numpy --split test_normal --splits splits_v2.json --out-dir data/processed/physics_offset05
+#   Per-meter variant (only the late meter's rows dropped, the rest solved if it still determines the state):
+#     python main_physics.py --rank-check --offset-threshold 0.5 --offset-policy per_meter --solver numpy --split test_events --splits splits_v2.json --out-dir data/processed/physics_permeter05
 #   Options: python main_physics.py --help
 #
 # Output under <out_dir>:
 #   <label>.parquet   residual per slot: residual, residual_mean, n_voltage,
-#                     n_current, status
+#                     n_current, v_dropped, i_dropped, status
 #   <label>.json      summary numbers and the options used, including the
 #                     offset rule's threshold, policy and meters when it is on
 #
@@ -89,12 +91,18 @@ def parse_args():
     parser.add_argument("--rank-rel-tol", type=float, default=1e-9, help="Singular values below this fraction of the largest count as zero in --rank-check")
     # Offset filter, off by default; Caltech's produce_phasors_matrix uses 0.5 s measured from the synchronized request time, ours is measured from the ten-second slot
     parser.add_argument("--offset-threshold", type=float, default=None, help="Seconds; mark a slot 'offset_rejected' (no residual) when any meter the plan uses captured this far or farther from the slot time, whole slot, as Caltech's 0.5 s rule does per timestamp; off by default")
+    # Policy of the offset filter
+    parser.add_argument("--offset-policy", choices=["whole_slot", "per_meter"], default="whole_slot", help="whole_slot: any late planned meter rejects the slot (Caltech's rule); per_meter: only the late meter's voltage and current rows are dropped and the rest is solved if it still determines the state (needs --rank-check)")
     # Parse
     args = parser.parse_args()
     # A threshold must be positive
     if args.offset_threshold is not None and args.offset_threshold <= 0:
         # Refuse
         parser.error("--offset-threshold must be a positive number of seconds")
+    # The per-meter policy needs the rank check
+    if args.offset_threshold is not None and args.offset_policy == "per_meter" and not args.rank_check:
+        # Refuse
+        parser.error("--offset-policy per_meter requires --rank-check")
     # Done
     return args
 
@@ -160,7 +168,7 @@ def main():
             # Next
             continue
         # Solve
-        results = sp.run_block(model, plan, table, solver=args.solver, weight=weight, step=args.step, progress=not args.quiet, freq_tolerance=args.freq_tolerance, rank_check=args.rank_check, rank_rel_tol=args.rank_rel_tol, offset_threshold=args.offset_threshold)
+        results = sp.run_block(model, plan, table, solver=args.solver, weight=weight, step=args.step, progress=not args.quiet, freq_tolerance=args.freq_tolerance, rank_check=args.rank_check, rank_rel_tol=args.rank_rel_tol, offset_threshold=args.offset_threshold, offset_policy=args.offset_policy)
         # Summary
         summary = sp.summarize(results)
         # Add the options used, the offset rule's settings copied from the results so the file records what was applied

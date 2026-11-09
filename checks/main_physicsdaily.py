@@ -112,7 +112,8 @@ def pst_day(index):
 
 def daily_table(res):
     """
-    One row per day: slots, solved, slots by failure status, median and
+    One row per day: slots, solved, slots by failure status, readings
+    dropped by the per-meter offset policy (0 for other runs), median and
     99th percentile and max residual in percent (solved slots only), and
     the median voltage and current term counts over solved slots.
     """
@@ -141,6 +142,7 @@ def daily_table(res):
         # Row
         rows.append({"day": d, "slots": int(sel.sum()), "ok": int(s.sum()),
                      "no_data": int(st.get("no_data", 0)), "too_few": int(st.get("too_few", 0)), "failed": int(st.get("solver_failed", 0)), "undetermined": int(st.get("undetermined", 0)), "offset": int(st.get("offset_rejected", 0)),
+                     "dropped": int(res.loc[sel, "v_dropped"].sum() + res.loc[sel, "i_dropped"].sum()) if "v_dropped" in res.columns else 0,
                      "median_pct": float(pct[s].median()) if s.any() else float("nan"),
                      "p99_pct": float(pct[s].quantile(0.99)) if s.any() else float("nan"),
                      "max_pct": float(pct[s].max()) if s.any() else float("nan"),
@@ -153,7 +155,7 @@ def daily_table(res):
 def print_daily(table, event_days):
     """Print the daily rows; a day holding a scored logged change is marked with an asterisk."""
     # Header
-    print(f"\n{'day':<12} {'slots':>6} {'ok':>6} {'no_data':>7} {'too_few':>7} {'failed':>6} {'undet.':>6} {'offset':>6} {'median %':>9} {'p99 %':>8} {'max %':>8} {'nV':>5} {'nI':>5}  event")
+    print(f"\n{'day':<12} {'slots':>6} {'ok':>6} {'no_data':>7} {'too_few':>7} {'failed':>6} {'undet.':>6} {'offset':>6} {'dropped':>7} {'median %':>9} {'p99 %':>8} {'max %':>8} {'nV':>5} {'nI':>5}  event")
     # Each row
     for _, r in table.iterrows():
         # Formatter for a possibly missing number
@@ -161,9 +163,9 @@ def print_daily(table, event_days):
         # Mark
         mark = "*" if r["day"] in event_days else ""
         # Line
-        print(f"{r['day']:<12} {r['slots']:>6} {r['ok']:>6} {r['no_data']:>7} {r['too_few']:>7} {r['failed']:>6} {r['undetermined']:>6} {r['offset']:>6} {f(r['median_pct']):>9} {f(r['p99_pct']):>8} {f(r['max_pct']):>8} {f(r['n_voltage'], 0):>5} {f(r['n_current'], 0):>5}  {mark}")
+        print(f"{r['day']:<12} {r['slots']:>6} {r['ok']:>6} {r['no_data']:>7} {r['too_few']:>7} {r['failed']:>6} {r['undetermined']:>6} {r['offset']:>6} {r['dropped']:>7} {f(r['median_pct']):>9} {f(r['p99_pct']):>8} {f(r['max_pct']):>8} {f(r['n_voltage'], 0):>5} {f(r['n_current'], 0):>5}  {mark}")
     # Whole-period summary over the days, with the slots lost to the offset rule
-    print(f"\n{len(table)} days; median of daily medians {table['median_pct'].median():.3f} %, lowest daily median {table['median_pct'].min():.3f} %, highest daily median {table['median_pct'].max():.3f} %; solved slots {int(table['ok'].sum())} of {int(table['slots'].sum())}; offset-rejected slots {int(table['offset'].sum())}")
+    print(f"\n{len(table)} days; median of daily medians {table['median_pct'].median():.3f} %, lowest daily median {table['median_pct'].min():.3f} %, highest daily median {table['median_pct'].max():.3f} %; solved slots {int(table['ok'].sum())} of {int(table['slots'].sum())}; offset-rejected slots {int(table['offset'].sum())}; readings dropped by the per-meter policy {int(table['dropped'].sum())}")
 
 
 def compare(a, b):

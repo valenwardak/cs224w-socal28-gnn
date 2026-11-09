@@ -51,8 +51,10 @@
 #                                                one table of the needed columns
 #     meter_frequency(table, meter)              grid frequency per slot from the voltage channels
 #     aligned_phasor(table, meter, channel, tol) complex phasor shifted to slot time, off-bin readings dropped
+#     late_meters(table, meters, threshold)      per meter and slot, whether its capture offset is at or beyond the threshold
 #     offset_rejected(table, meters, threshold)  slots where any listed meter captured too far from the slot time
 #                                                (Caltech-inspired offset filter measured from the ten-second slot)
+#     row_meters(plan)                           which meter(s) each voltage row and each current row read from
 #   Assembling and solving
 #     assemble(model, plan, table)               measured vectors, nominals, row masks
 #     measurement_rank(Y, V_idx, V_nom, I_rows, I_nom, weight, n_state, rel_tol)
@@ -60,14 +62,17 @@
 #     solve_slot_numpy(...)                      weighted least squares, closed form
 #     solve_slot_cvxpy(...)                      Caltech's objective via cvxpy and ECOS
 #     run_block(model, plan, table, solver, weight, step, progress, freq_tolerance, rank_check, rank_rel_tol,
-#               offset_threshold)
+#               offset_threshold, offset_policy)
 #                                                residual per slot for one window; with rank_check, a slot whose
 #                                                available measurements do not determine the state is marked
 #                                                "undetermined" and gets no residual; with offset_threshold, a
 #                                                slot where any planned meter captured that many seconds or more
 #                                                from the slot time is marked "offset_rejected" and gets no
-#                                                residual (both off by default, so the A-side runs and results
-#                                                stay as they were)
+#                                                residual under the "whole_slot" policy, or, under the
+#                                                "per_meter" policy (rank check required), only that meter's
+#                                                voltage and current rows are dropped from the slot and the rest
+#                                                is solved if it still determines the state (all off by default,
+#                                                so the A-side runs and results stay as they were)
 #     summarize(results)                         mean, percentiles, valid count
 #   Sign search (used by main_signsearch.py; nothing above calls these)
 #     sign_combinations(n)                       every assignment of +1 / -1 to n injections
@@ -671,6 +676,49 @@ def aligned_phasor(table, meter, channel, freq_tolerance):
     return np.where(agree, rms * np.exp(1j * np.deg2rad(ang_slot)), np.nan + 0j)
 
 
+def late_meters(table, meters, threshold):
+    """
+    Per meter (rows, in the given order) and slot (columns): True where
+    the meter has a reading whose capture offset toff is at or beyond the
+    threshold in seconds. A meter with no reading has no offset and is
+    never late; a meter with no offset column is absent everywhere.
+    """
+    # Flags
+    late = np.zeros((len(meters), len(table)), dtype=bool)
+    # Each meter
+    for k, meter in enumerate(meters):
+        # Offset column
+        col = f"{meter}{SEP}{TOFF}"
+        # Absent meter
+        if col not in table.columns:
+            # Next
+            continue
+        # Offsets, NaN where absent
+        toff = table[col].to_numpy(dtype=np.float64)
+        # Present and at or beyond the threshold
+        late[k] = np.isfinite(toff) & (np.abs(toff) >= threshold)
+    # Return
+    return late
+
+
+def row_meters(plan):
+    """
+    Which meter each voltage row reads from, and which meter(s) each
+    current row reads from, in assemble()'s row order. Zero-injection
+    rows read from no meter (empty set), so dropping a late meter never
+    touches them: an assumed zero stays an assumption and a dropped
+    measured current never becomes one.
+    """
+    # Voltage rows
+    v_meters = [v["meter"] for v in plan["voltages"]]
+    # Measured injection rows: three per node, the meters of its terms
+    i_meters = [set(t["meter"] for t in inj["terms"]) for inj in plan["injections"] for _ in range(3)]
+    # Zero rows: no meter
+    i_meters += [set() for _ in plan["zeros"] for _ in range(3)]
+    # Return
+    return v_meters, i_meters
+
+
 def offset_rejected(table, meters, threshold):
     """
     Slots to reject because a meter captured too far from the slot time.
@@ -883,7 +931,7 @@ def solve_slot_cvxpy(Y, V_meas, V_idx, V_nom, I_meas, I_rows, I_nom, weight, n_s
     return np.asarray(V.value).flatten()
 
 
-def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=True, freq_tolerance=0.01, rank_check=False, rank_rel_tol=1e-9, offset_threshold=None):
+def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=True, freq_tolerance=0.01, rank_check=False, rank_rel_tol=1e-9, offset_threshold=None, offset_policy="whole_slot"):
     """
     Solve every step-th slot in the table and return a DataFrame indexed
     by slot time with columns:
@@ -891,6 +939,8 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
       residual_mean   objective value divided by the number of terms
       n_voltage       voltage terms used in that slot
       n_current       current terms used in that slot (zero-injection rows included)
+      v_dropped       voltage rows removed from the slot by the per-meter offset policy
+      i_dropped       measured current rows removed the same way (zero rows are never dropped)
       status          "ok", "no_data", "too_few", "solver_failed", or, with
                       rank_check, "undetermined", or, with offset_threshold,
                       "offset_rejected"
@@ -904,18 +954,42 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
     meter the plan uses captured at or beyond that many seconds from the
     slot time is marked "offset_rejected" with no residual, before any
     other test, following Caltech's whole-timestamp rule (see
-    offset_rejected). The threshold, the policy and the meters checked
-    are attached as out.attrs["offset_threshold"], ["offset_policy"] and
+    offset_rejected); that is offset_policy "whole_slot". Under
+    offset_policy "per_meter" only the late meter's voltage rows and the
+    measured current rows that read from it are dropped from the slot
+    (zero-injection rows are never touched), the drop counts are written
+    to v_dropped and i_dropped, and the slot goes through the usual tests
+    with what remains; rank_check must be on, since the remaining rows
+    may not determine the state. A slot whose every planned meter is late
+    ends as no_data or too_few, not offset_rejected. The threshold, the
+    policy and the meters checked are attached as
+    out.attrs["offset_threshold"], ["offset_policy"] and
     ["offset_meters"]. A rejected slot is lost coverage, not a low residual.
     """
+    # The per-meter policy needs the rank check
+    if offset_threshold is not None and offset_policy == "per_meter" and not rank_check:
+        # Refuse
+        raise ValueError("offset_policy per_meter requires rank_check, since the remaining rows may not determine the state")
+    # Only the two policies exist
+    if offset_policy not in ("whole_slot", "per_meter"):
+        # Refuse
+        raise ValueError(f"unknown offset_policy {offset_policy}")
     # Admittance matrix as complex128 for the solvers
     Y = model["Y"].astype(np.complex128)
     # State size
     n_state = 3 * model["n_nodes"]
     # Arrays, readings with an off-bin frequency dropped
     m = assemble(model, plan, table, freq_tolerance)
-    # Slots rejected by the offset rule, none when the rule is off
-    rejected = offset_rejected(table, plan["meters"], offset_threshold) if offset_threshold is not None else np.zeros(len(table), dtype=bool)
+    # Per-meter lateness, none when the rule is off
+    late = late_meters(table, plan["meters"], offset_threshold) if offset_threshold is not None else np.zeros((len(plan["meters"]), len(table)), dtype=bool)
+    # Whole-slot policy: any late meter rejects the slot
+    rejected = late.any(axis=0) if offset_policy == "whole_slot" else np.zeros(len(table), dtype=bool)
+    # Per-meter policy: which rows each late meter takes with it
+    v_meters, i_meters = row_meters(plan)
+    # Row-to-meter masks: (MV, M) and (MI, M), True where the row reads from that meter
+    v_from = np.array([[vm == mt for mt in plan["meters"]] for vm in v_meters], dtype=bool).reshape(len(v_meters), len(plan["meters"]))
+    # Current rows
+    i_from = np.array([[mt in im for mt in plan["meters"]] for im in i_meters], dtype=bool).reshape(len(i_meters), len(plan["meters"]))
     # Slot times
     times = table.index[::step]
     # Row positions
@@ -937,27 +1011,41 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
     # Loop over slots
     for pos in iterator:
         # Voltage rows present
-        v_ok = m["V_ok"][:, pos]
+        v_ok = m["V_ok"][:, pos].copy()
         # Current rows present
-        i_ok = m["I_ok"][:, pos]
-        # Counts
+        i_ok = m["I_ok"][:, pos].copy()
+        # Rows dropped by the per-meter policy
+        v_drop, i_drop = 0, 0
+        # Per-meter policy: remove the late meters' rows before anything else
+        if offset_policy == "per_meter" and late[:, pos].any():
+            # Voltage rows reading from a late meter
+            v_late = v_from[:, late[:, pos]].any(axis=1)
+            # Current rows reading from a late meter
+            i_late = i_from[:, late[:, pos]].any(axis=1)
+            # Count what was present and is now dropped
+            v_drop, i_drop = int((v_ok & v_late).sum()), int((i_ok & i_late).sum())
+            # Drop
+            v_ok &= ~v_late
+            # Drop
+            i_ok &= ~i_late
+        # Counts after any drop
         n_v, n_i = int(v_ok.sum()), int(i_ok.sum())
-        # Offset rule first: a meter captured too far from the slot time
+        # Whole-slot policy: a meter captured too far from the slot time rejects the slot
         if rejected[pos]:
             # Mark, no residual
-            rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "status": "offset_rejected"})
+            rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "v_dropped": 0, "i_dropped": 0, "status": "offset_rejected"})
             # Next
             continue
         # No readings at all
         if n_v == 0 and (n_i == 0 or np.all(m["I_meas"][i_ok, pos] == 0)):
             # Mark
-            rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "status": "no_data"})
+            rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "v_dropped": v_drop, "i_dropped": i_drop, "status": "no_data"})
             # Next
             continue
         # Need at least one voltage to pin the magnitude scale
         if n_v == 0:
             # Mark
-            rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "status": "too_few"})
+            rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "v_dropped": v_drop, "i_dropped": i_drop, "status": "too_few"})
             # Next
             continue
         # Rank safeguard
@@ -971,7 +1059,7 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
             # Deficient
             if rank_cache[key] < n_state:
                 # Mark, no residual
-                rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "status": "undetermined"})
+                rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "v_dropped": v_drop, "i_dropped": i_drop, "status": "undetermined"})
                 # Next
                 continue
         # Pick the solver
@@ -981,13 +1069,13 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
         # Solver failure
         if V_hat is None:
             # Mark
-            rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "status": "solver_failed"})
+            rows.append({"residual": np.nan, "residual_mean": np.nan, "n_voltage": n_v, "n_current": n_i, "v_dropped": v_drop, "i_dropped": i_drop, "status": "solver_failed"})
             # Next
             continue
         # Objective at the solution, same formula for both solvers
         value, count = objective_value(Y, V_hat, m["V_meas"][v_ok, pos], m["V_idx"][v_ok], m["V_nom"][v_ok], m["I_meas"][i_ok, pos], m["I_rows"][i_ok], m["I_nom"][i_ok], weight)
         # Store
-        rows.append({"residual": value, "residual_mean": value / count, "n_voltage": n_v, "n_current": n_i, "status": "ok"})
+        rows.append({"residual": value, "residual_mean": value / count, "n_voltage": n_v, "n_current": n_i, "v_dropped": v_drop, "i_dropped": i_drop, "status": "ok"})
     # Table
     out = pd.DataFrame(rows, index=times)
     # Name the index
@@ -998,8 +1086,8 @@ def run_block(model, plan, table, solver="cvxpy", weight=0.1, step=1, progress=T
     out.attrs["rank_rel_tol"] = float(rank_rel_tol) if rank_check else None
     # Record the offset rule's threshold, None when off
     out.attrs["offset_threshold"] = float(offset_threshold) if offset_threshold is not None else None
-    # Its policy: the whole slot is dropped, as Caltech drops the whole timestamp
-    out.attrs["offset_policy"] = "whole_slot" if offset_threshold is not None else None
+    # Its policy: "whole_slot" drops the slot as Caltech drops the whole timestamp, "per_meter" drops only the late meter's rows
+    out.attrs["offset_policy"] = offset_policy if offset_threshold is not None else None
     # The meters it checked
     out.attrs["offset_meters"] = list(plan["meters"]) if offset_threshold is not None else None
     # Return
@@ -1013,7 +1101,8 @@ def summarize(results):
     # Nothing scored: still say why, so a block lost to rejections or missing data explains itself
     if ok.empty:
         # Counts without residual figures
-        return {"slots": int(len(results)), "scored": 0, "status_counts": results["status"].value_counts().to_dict()}
+        return {"slots": int(len(results)), "scored": 0, "status_counts": results["status"].value_counts().to_dict(),
+                "readings_dropped": {"voltage": int(results["v_dropped"].sum()) if "v_dropped" in results else 0, "current": int(results["i_dropped"].sum()) if "i_dropped" in results else 0}}
     # Summary
     return {
         # All slots
@@ -1030,6 +1119,8 @@ def summarize(results):
         "residual_p99_per_term_percent": float(100.0 * ok["residual_mean"].quantile(0.99)),
         # Status counts
         "status_counts": results["status"].value_counts().to_dict(),
+        # Readings removed by the per-meter offset policy over the block (0 under the other settings)
+        "readings_dropped": {"voltage": int(results["v_dropped"].sum()) if "v_dropped" in results else 0, "current": int(results["i_dropped"].sum()) if "i_dropped" in results else 0},
     }
 
 

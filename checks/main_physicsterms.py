@@ -52,7 +52,8 @@
 #   parse_args()                           command-line options with defaults
 #   window_from_args(args)                 (label, start_utc, end_utc) from --day or --start/--end
 #   term_labels(model, plan)               a name for every voltage, injection and zero-injection term
-#   solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_check, rank_rel_tol, offset_threshold)
+#   solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_check, rank_rel_tol, offset_threshold,
+#                offset_policy)
 #                                          per-slot state estimates and per-term residuals; the same status
 #                                          rules as run_block, including the offset rule when a threshold is given
 #   term_table(res, labels, weight)        per-term summary over the window
@@ -117,13 +118,19 @@ def parse_args():
     # Its tolerance
     parser.add_argument("--rank-rel-tol", type=float, default=1e-9, help="Singular values below this fraction of the largest count as zero in --rank-check")
     # Offset filter, as in main_physics.py, off by default
-    parser.add_argument("--offset-threshold", type=float, default=None, help="Seconds; mark a slot 'offset_rejected' (no terms) when any meter the plan uses captured this far or farther from the slot time, whole slot; off by default")
+    parser.add_argument("--offset-threshold", type=float, default=None, help="Seconds; a meter is late when it captured this far or farther from the slot time; off by default")
+    # Policy, as in main_physics.py
+    parser.add_argument("--offset-policy", choices=["whole_slot", "per_meter"], default="whole_slot", help="whole_slot: a late meter rejects the slot; per_meter: only its rows are dropped (needs --rank-check)")
     # Parse
     args = parser.parse_args()
     # A threshold must be positive
     if args.offset_threshold is not None and args.offset_threshold <= 0:
         # Refuse
         parser.error("--offset-threshold must be a positive number of seconds")
+    # The per-meter policy needs the rank check
+    if args.offset_threshold is not None and args.offset_policy == "per_meter" and not args.rank_check:
+        # Refuse
+        parser.error("--offset-policy per_meter requires --rank-check")
     # Window check
     if args.day is None and not (args.start and args.end):
         # Refuse
@@ -188,7 +195,7 @@ def term_labels(model, plan):
     return v_labels, i_labels, i_kind
 
 
-def solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_check=False, rank_rel_tol=1e-9, offset_threshold=None):
+def solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_check=False, rank_rel_tol=1e-9, offset_threshold=None, offset_policy="whole_slot"):
     """
     Solve every step-th slot and keep the per-term residuals. Returns a
     dict with t (slot times), status, total (objective per slot), count
@@ -202,8 +209,16 @@ def solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_
     n_state = 3 * model["n_nodes"]
     # Measurement arrays
     m = sp.assemble(model, plan, table, freq_tolerance)
-    # Slots rejected by the offset rule, the same function run_block uses; none when the rule is off
-    rejected = sp.offset_rejected(table, plan["meters"], offset_threshold) if offset_threshold is not None else np.zeros(len(table), dtype=bool)
+    # Per-meter lateness, the same function run_block uses; none when the rule is off
+    late = sp.late_meters(table, plan["meters"], offset_threshold) if offset_threshold is not None else np.zeros((len(plan["meters"]), len(table)), dtype=bool)
+    # Whole-slot policy: any late meter rejects the slot
+    rejected = late.any(axis=0) if offset_policy == "whole_slot" else np.zeros(len(table), dtype=bool)
+    # Per-meter policy: row-to-meter masks, as in run_block
+    v_meters, i_meters = sp.row_meters(plan)
+    # Voltage rows by meter
+    v_from = np.array([[vm == mt for mt in plan["meters"]] for vm in v_meters], dtype=bool).reshape(len(v_meters), len(plan["meters"]))
+    # Current rows by meter
+    i_from = np.array([[mt in im for mt in plan["meters"]] for im in i_meters], dtype=bool).reshape(len(i_meters), len(plan["meters"]))
     # Slot positions
     positions = np.arange(len(table))[::step]
     # Times
@@ -216,7 +231,7 @@ def solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_
            "V_meas_abs": np.full((MV, len(positions)), np.nan), "V_fit_abs": np.full((MV, len(positions)), np.nan),
            "I_meas_abs": np.full((MI, len(positions)), np.nan), "I_fit_abs": np.full((MI, len(positions)), np.nan),
            "V_diff": np.full((MV, len(positions)), np.nan), "I_diff": np.full((MI, len(positions)), np.nan),
-           "V_ok": m["V_ok"][:, positions], "I_ok": m["I_ok"][:, positions]}
+           "V_ok": m["V_ok"][:, positions].copy(), "I_ok": m["I_ok"][:, positions].copy()}
     # Solver function
     solve = sp.solve_slot_cvxpy if solver == "cvxpy" else sp.solve_slot_numpy
     # Rank results per availability pattern
@@ -224,10 +239,20 @@ def solve_window(model, plan, table, solver, weight, step, freq_tolerance, rank_
     # Each slot
     for k, pos in enumerate(positions):
         # Availability
-        v_ok, i_ok = m["V_ok"][:, pos], m["I_ok"][:, pos]
+        v_ok, i_ok = m["V_ok"][:, pos].copy(), m["I_ok"][:, pos].copy()
+        # Per-meter policy: drop the late meters' rows, as run_block does
+        if offset_policy == "per_meter" and late[:, pos].any():
+            # Drop
+            v_ok &= ~v_from[:, late[:, pos]].any(axis=1)
+            # Drop
+            i_ok &= ~i_from[:, late[:, pos]].any(axis=1)
+            # The dropped rows are unavailable in this slot's outputs too
+            out["V_ok"][:, k] = v_ok
+            # Same for currents
+            out["I_ok"][:, k] = i_ok
         # Counts
         n_v, n_i = int(v_ok.sum()), int(i_ok.sum())
-        # Offset rule first, as run_block decides it
+        # Whole-slot rule first, as run_block decides it
         if rejected[pos]:
             # Status, no terms
             out["status"].append("offset_rejected")
@@ -446,7 +471,7 @@ def main():
     # Window
     label, start_utc, end_utc = window_from_args(args)
     # Say
-    print(f"window {label}: {start_utc} to {end_utc} UTC; solver {args.solver}, step {args.step}, current weight {weight}; offset rule " + (f"on, threshold {args.offset_threshold} s, whole slot, meters {plan['meters']}" if args.offset_threshold is not None else "off"))
+    print(f"window {label}: {start_utc} to {end_utc} UTC; solver {args.solver}, step {args.step}, current weight {weight}; offset rule " + (f"on, threshold {args.offset_threshold} s, policy {args.offset_policy}, meters {plan['meters']}" if args.offset_threshold is not None else "off"))
     # Data
     table = sp.load_block(args.processed_dir, plan["meters"], start_utc, end_utc)
     # Empty
@@ -458,7 +483,7 @@ def main():
     # Labels
     v_labels, i_labels, i_kind = term_labels(model, plan)
     # Solve
-    res = solve_window(model, plan, table, args.solver, weight, args.step, args.freq_tolerance, args.rank_check, args.rank_rel_tol, args.offset_threshold)
+    res = solve_window(model, plan, table, args.solver, weight, args.step, args.freq_tolerance, args.rank_check, args.rank_rel_tol, args.offset_threshold, args.offset_policy)
     # Rank check report on the planned measurement set with everything present
     rank_all, tol_all, sv_all = sp.measurement_rank(model["Y"].astype(np.complex128), np.array([3 * v["node_idx"] + v["phase_idx"] for v in plan["voltages"]]), np.array([v["nominal"] for v in plan["voltages"]]), np.array([3 * inj["node_idx"] + p for inj in plan["injections"] for p in range(3)] + [3 * z + p for z in plan["zeros"] for p in range(3)]), np.array([float(np.mean([t["rating"] for t in inj["terms"]])) for inj in plan["injections"] for _ in range(3)] + [plan["zero_injection_nominal"]] * (3 * len(plan["zeros"]))), weight, 3 * model["n_nodes"], args.rank_rel_tol)
     # Say
@@ -478,7 +503,7 @@ def main():
         # The other solver
         other = "cvxpy" if args.solver == "numpy" else "numpy"
         # Solve again
-        res_b = solve_window(model, plan, table, other, weight, args.step, args.freq_tolerance, args.rank_check, args.rank_rel_tol, args.offset_threshold)
+        res_b = solve_window(model, plan, table, other, weight, args.step, args.freq_tolerance, args.rank_check, args.rank_rel_tol, args.offset_threshold, args.offset_policy)
         # Compare
         compare_solvers(res, res_b, args.solver, other, v_labels, i_labels, i_kind)
 
