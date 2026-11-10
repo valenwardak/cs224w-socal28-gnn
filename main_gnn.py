@@ -444,6 +444,16 @@ def main():
         angdiff_settings = sd.configure_angdiff(args.angdiff_dir, body, manifest, args.angdiff_min_resultant, args.late_threshold)
         # The graph identity is part of the feature's identity
         angdiff_settings["graph_id"] = graph_id
+        # Refuse to train on all-zero columns: counted inside the history inputs of the training windows the
+        # selection would retain (history, horizon, gap rule, minimum meters, --train-months), here before the scale
+        # is computed or loaded from scale.json, so neither path can skip the check
+        ang_valid, ang_slots, ang_windows = sd.angdiff_training_valid(args.features_dir, splits["train"], manifest, args.history, args.horizon, args.max_gap, args.min_meters)
+        # Nothing valid inside the retained histories is a configuration fault, not an experiment
+        if ang_valid == 0:
+            # Raise
+            raise ValueError(f"the neighbor angle feature is valid in none of the {ang_slots} history slots of the {ang_windows} training windows that would be retained; check the late files, the graph periods and the phase map (main_latefeatures.py --table-only) before training")
+        # Say
+        log(f"neighbor angle feature valid in {ang_valid} meter-channel values of the {ang_slots} history slots of the {ang_windows} retained training windows")
     # Maskable meters, from the file as written, the same for every --edges control
     maskable_meters = maskable_from_graph(graph) if args.masked else None
     # Masked mode forecasts the absolute value, never a correction to persistence

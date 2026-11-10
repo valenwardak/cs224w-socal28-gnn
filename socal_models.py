@@ -232,7 +232,9 @@ class GraphWindowDataset:
                                      history fails the gap rule in this window
     A window is kept when at least min_meters meters pass the gap rule and
     have a valid target. The per-meter rule is the same one WindowDataset
-    uses, so the GRU and the GNNs train on the same target slots.
+    uses, so the GRU and the GNNs train on the same target slots; the
+    selection lives in socal_modeldata.retained_starts, shared with the
+    training guard for added inputs.
 
     With t (UTC seconds per slot) and a timeline (load_timeline), every
     window also carries the index of the topology period holding its last
@@ -251,24 +253,9 @@ class GraphWindowDataset:
         self.y = X[..., 0:3]
         # Target validity
         self.y_valid = np.stack([mag_valid, ang_valid], axis=-1)
-        # Candidate starts
-        span = history + horizon
-        # Number of starts
-        n_starts = max(T - span + 1, 0)
-        # Usable flag per start and meter
-        usable = np.zeros((n_starts, M), dtype=bool)
-        # Loop over meters
-        for mi in range(M):
-            # Any reading in the slot
-            present_any = mag_valid[:, mi, :].any(axis=1)
-            # Usable starts for this meter
-            starts = sd.window_starts(present_any, history, horizon, max_gap, present_any)
-            # Mark
-            usable[starts, mi] = True
-        # Keep windows with enough meters
-        self.starts = np.nonzero(usable.sum(axis=1) >= min_meters)[0]
-        # Usable flags for the kept windows
-        self.usable = usable[self.starts]
+        # Kept window starts and their per-meter usability, by the one selection rule shared with the data module
+        # (socal_modeldata.retained_starts), so the training guard for added inputs counts exactly these windows
+        self.starts, self.usable = sd.retained_starts(mag_valid, history, horizon, max_gap, min_meters)
         # Period per window, from the last history slot
         self.period = None
         # Time-indexed graph

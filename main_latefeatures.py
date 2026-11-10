@@ -20,8 +20,11 @@
 #              prints where it is available: per block, inside and outside
 #              the scored episode windows, with the reasons for loss, and
 #              per meter and voltage channel, so a meter that never
-#              receives the feature is visible. The table is read before
-#              any training.
+#              receives the feature is visible. Before the table it prints
+#              the structural eligibility: which meters the wiring and the
+#              phase map alone rule out in which edge sets, separately from
+#              what the data then allows. The table is read before any
+#              training.
 #
 # Usage (from the repo root):
 #   python main_latefeatures.py
@@ -128,12 +131,20 @@ def main():
     episodes = ss.load_episodes(args.events)
     # Window lengths
     before, after = pd.Timedelta(minutes=args.before_minutes), pd.Timedelta(minutes=args.after_minutes)
+    # Structural eligibility first: what the wiring and the phase map allow before any data
+    elig = sa.structural_eligibility(timeline, timeline["meters"], manifest["meters"], manifest["channels"])
+    # Print
+    sa.print_eligibility(elig, manifest["meters"])
     # Rows
     rows = sa.availability(args.features_dir, splits, episodes, before, after, timeline, manifest, settings)
     # Print
     sa.print_availability(rows, manifest)
     # Save
     spath = sa.save_availability(args.features_dir, rows, settings)
+    # Nothing valid anywhere is a fault in the inputs, not a result: stop with a clear error
+    if sum(r.get("valid", 0) for r in rows) == 0:
+        # Raise
+        raise ValueError(f"the neighbor angle feature is valid in no block; the table is saved to {spath} for inspection, but training must not start on all-zero columns")
     # Note
     print(f"\nneighbor angle difference: equal-weight neighbor mean from {args.graph} (phase map {phase_id}), late threshold {args.late_threshold} s, minimum resultant {args.min_resultant}; episode windows as the scoring's; table saved to {spath}")
 

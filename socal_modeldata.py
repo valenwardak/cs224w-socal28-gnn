@@ -115,6 +115,10 @@
 #     configure_angdiff(features_dir, graph_body, manifest, min_resultant, late_threshold)
 #                                            turn the three neighbor angle features on for this process
 #     extra_features()                       names of the added features, in order, or []
+#     retained_starts(mag_valid, history, horizon, max_gap, min_meters)
+#                                            the graph training set's window selection, shared with socal_models
+#     angdiff_training_valid(features_dir, blocks, manifest, history, horizon, max_gap, min_meters)
+#                                            valid neighbor angle features inside retained training histories, for the stop-on-empty check
 #     compute_physics_scale(features_dir, splits, percentile, allow_missing)
 #                                            per side: the percentile of valid residuals over the train blocks
 #   Model inputs
@@ -668,6 +672,98 @@ def n_features():
     """Number of features per channel in the model input: F plus the added features that are on."""
     # Count
     return F + len(extra_features())
+
+
+def retained_starts(mag_valid, history, horizon, max_gap, min_meters=1):
+    """
+    The window starts the graph training set keeps from one piece, and
+    the per-meter usability of each kept window. This is the selection
+    rule of socal_models.GraphWindowDataset, kept here so the training set
+    and the neighbor-angle training guard use one definition: per meter,
+    window_starts() (no run of max_gap absent slots inside the history,
+    valid target); a window is kept when at least min_meters meters pass.
+    Returns (starts (W,) int64, usable (W, M) bool).
+    """
+    # Sizes
+    T, M = mag_valid.shape[0], mag_valid.shape[1]
+    # Slots a window spans
+    span = history + horizon
+    # Candidate starts
+    n_starts = max(T - span + 1, 0)
+    # Per-meter usability of each candidate
+    usable = np.zeros((n_starts, M), dtype=bool)
+    # Each meter
+    for mi in range(M):
+        # The meter has a reading in the slot
+        present_any = mag_valid[:, mi, :].any(axis=1)
+        # Its usable starts
+        starts = window_starts(present_any, history, horizon, max_gap, present_any)
+        # Mark
+        usable[starts, mi] = True
+    # Kept: enough meters pass
+    kept = np.nonzero(usable.sum(axis=1) >= min_meters)[0]
+    # Return
+    return kept, usable[kept]
+
+
+def angdiff_training_valid(features_dir, blocks, manifest, history, horizon, max_gap, min_meters=1):
+    """
+    Valid neighbor angle features inside the history inputs of the
+    training windows that would be retained, counted per training block
+    piece (the pieces after any --train-months restriction) with the
+    training set's own selection rule (retained_starts: history length,
+    horizon, gap rule, minimum meters). Only history slots of retained
+    windows count, so values that appear only on target rows, or only in
+    windows the selection discards, do not make the count positive.
+    Returns (valid count, history slots counted, windows retained).
+    Independent of the scale: a main script calls it before training
+    whether scale.json is computed or loaded. Raises when the inputs are
+    off.
+    """
+    # Must be on
+    if ANGDIFF is None:
+        # Raise
+        raise ValueError("angdiff_training_valid called with the neighbor angle inputs off")
+    # Counts
+    valid, slots, windows = 0, 0, 0
+    # Each block piece
+    for block in blocks:
+        # Bounds
+        start_s, end_s = block_seconds(block)
+        # Each month it touches
+        for month in months_in_block(block):
+            # Month, with the feature computed
+            arrays = load_month(features_dir, month, allow_missing=True, manifest=manifest)
+            # Missing month
+            if arrays is None:
+                # Next
+                continue
+            # Rows inside the piece
+            part = slice_block(arrays, start_s, end_s)
+            # None
+            if part is None:
+                # Next
+                continue
+            # Windows the training set would keep
+            starts, _ = retained_starts(part["mag_valid"], history, horizon, max_gap, min_meters)
+            # None kept
+            if len(starts) == 0:
+                # Next
+                continue
+            # History slots of the kept windows
+            covered = np.zeros(len(part["t"]), dtype=bool)
+            # Each window
+            for s in starts:
+                # Its history
+                covered[s:s + history] = True
+            # Count valid features on those slots, every meter and channel
+            valid += int(part["nb_valid"][covered].sum())
+            # Slots
+            slots += int(covered.sum())
+            # Windows
+            windows += int(len(starts))
+    # Return
+    return valid, slots, windows
 
 
 def extra_features():

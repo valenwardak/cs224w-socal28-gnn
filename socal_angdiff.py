@@ -59,6 +59,7 @@
 #                                       (M, 3) channel index per meter and phase, -1 where none
 #     phase_map_identity(meter_records, meters)
 #                                       short hash of the phase map, for the run's options
+#     period_seconds(value)             a period bound as epoch seconds (integer seconds as stored, or a timestamp)
 #     timeline_from_graph(body)         periods and graphs from a fixed or time-indexed graph file
 #     adjacency_matrices(timeline, meter_records, meters)
 #                                       one (M, M) equal-weight adjacency per edge set
@@ -77,6 +78,10 @@
 #   The feature
 #     neighbor_differences(ang, ang_valid, late, phase_idx, adjacency, graph_slot, min_resultant)
 #                                       (nb_cos, nb_sin, nb_valid) each (T, M, C), plus reason counts
+#   Structural eligibility (wiring and phase map only, no data)
+#     structural_eligibility(timeline, meter_records, meters, channels)
+#                                       per meter and edge set: mapped, has an eligible neighbor
+#     print_eligibility(elig, meters)   table of structurally ineligible meters per edge set
 #   Availability
 #     availability(features_dir, splits, episodes, before, after, timeline, manifest, settings)
 #                                       rows per block with counts per meter and voltage channel
@@ -158,17 +163,56 @@ def phase_map_identity(meter_records, meters):
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
+def period_seconds(value):
+    """
+    A period bound as epoch seconds. The time-indexed graph file stores
+    start_utc and end_utc_exclusive as integer seconds (socal_metergraph
+    writes and reads them that way); a text timestamp is accepted too. A
+    number is taken as seconds, never as nanoseconds, and must lie
+    between 2000-01-01 and 2100-01-01 as seconds: that refuses the
+    collapse to second 1 of a seconds value misread as nanoseconds, and
+    refuses millisecond, microsecond and nanosecond values, which all land
+    after 2100. It cannot tell seconds from a wrong value that happens to
+    fall in that century.
+    """
+    # Number: seconds
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Whole seconds
+        seconds = int(value)
+    # Text: parse
+    elif isinstance(value, str):
+        # Timestamp
+        seconds = int(pd.Timestamp(value).timestamp())
+    # Anything else
+    else:
+        # Raise
+        raise ValueError(f"period bound {value!r} is neither seconds nor a timestamp")
+    # Plausible: between 2000-01-01 and 2100-01-01
+    if not 946684800 <= seconds < 4102444800:
+        # Raise
+        raise ValueError(f"period bound {value!r} read as seconds lies outside 2000-01-01 to 2100-01-01; the file's period bounds must be epoch seconds or timestamps (a millisecond or nanosecond value is refused)")
+    # Return
+    return seconds
+
+
 def timeline_from_graph(body):
     """
     Periods and graphs from a graph file: a time-indexed file gives its own
     periods and edge sets; a fixed file becomes one edge set in force for
     all time. Returns {"graphs": [...], "periods": [...], "meters": {...}}
-    with each period holding start_s, end_s (epoch seconds) and graph.
+    with each period holding start_s, end_s (epoch seconds, see
+    period_seconds) and graph.
     """
     # Time-indexed layout
     if "periods" in body and "graphs" in body:
         # Periods with epoch bounds
-        periods = [{"start_s": int(pd.Timestamp(p["start_utc"]).timestamp()), "end_s": int(pd.Timestamp(p["end_utc_exclusive"]).timestamp()), "graph": int(p["graph"])} for p in body["periods"]]
+        periods = [{"start_s": period_seconds(p["start_utc"]), "end_s": period_seconds(p["end_utc_exclusive"]), "graph": int(p["graph"])} for p in body["periods"]]
+        # Each period must be non-empty
+        for p in periods:
+            # Check
+            if not p["end_s"] > p["start_s"]:
+                # Raise
+                raise ValueError(f"timeline period from {p['start_s']} to {p['end_s']} is empty or reversed")
         # Edge lists
         graphs = [{"edges": g["edges"]} for g in body["graphs"]]
         # Return
@@ -500,6 +544,96 @@ def neighbor_differences(ang, ang_valid, late, phase_idx, adjacency, graph_slot,
             nb_valid[:, mi, ci] = valid[:, mi]
     # Return
     return nb_cos, nb_sin, nb_valid, reasons
+
+
+# -----------------------------------------------------------------------------
+# Structural eligibility
+# -----------------------------------------------------------------------------
+
+def structural_eligibility(timeline, meter_records, meters, channels):
+    """
+    What the wiring and the phase map alone allow, before any data: for
+    every meter and every edge set, whether the meter has a phase-to-
+    neutral voltage channel (mapped) and whether it has at least one
+    neighbor that is mapped (an eligible neighbor). A meter fails for one
+    of three structural reasons: not mapped (line-to-line voltage or no
+    phase map), no edges in that edge set, or every neighbor unmapped.
+    Returns {"mapped": (M,) bool, "eligible": (K, M) bool, "reason": list
+    of K lists of M strings ("" when eligible)}. Observed availability is a
+    separate question: an eligible meter can still lose every slot to
+    timing or angle validity.
+    """
+    # Phase map
+    phase_idx = phase_channel_index(meter_records, meters, channels)
+    # Mapped meters: any phase has a channel
+    mapped = (phase_idx >= 0).any(axis=1)
+    # Adjacency
+    adjacency = adjacency_matrices(timeline, meter_records, meters)
+    # Outputs
+    eligible = np.zeros((len(adjacency), len(meters)), dtype=bool)
+    # Reasons
+    reasons = []
+    # Each edge set
+    for k, A in enumerate(adjacency):
+        # Degree
+        degree = A.sum(axis=1)
+        # Eligible neighbors: mapped ones
+        eligible_nb = (A * mapped[None, :].astype(np.float32)).sum(axis=1)
+        # Row of reasons
+        row = []
+        # Each meter
+        for mi in range(len(meters)):
+            # Reason
+            if not mapped[mi]:
+                # Not comparable
+                row.append("not a phase-to-neutral voltage meter")
+            elif degree[mi] == 0:
+                # Isolated
+                row.append("no edges")
+            elif eligible_nb[mi] == 0:
+                # Only excluded neighbors
+                row.append("every neighbor excluded")
+            else:
+                # Eligible
+                row.append("")
+                # Mark
+                eligible[k, mi] = True
+        # Keep
+        reasons.append(row)
+    # Return
+    return {"mapped": mapped, "eligible": eligible, "reason": reasons}
+
+
+def print_eligibility(elig, meters):
+    """Print, per meter, the edge sets (0-based) in which it is structurally ineligible and why; then the always-ineligible meters."""
+    # Header
+    print("\nstructural eligibility (wiring and phase map only, no data; edge sets numbered from 0):")
+    # Always ineligible
+    never = []
+    # Each meter
+    for mi, meter in enumerate(meters):
+        # Edge sets where ineligible
+        bad = [k for k in range(elig["eligible"].shape[0]) if not elig["eligible"][k, mi]]
+        # Eligible everywhere
+        if not bad:
+            # Next
+            continue
+        # Reasons by edge set, grouped
+        groups = {}
+        # Each
+        for k in bad:
+            # Group
+            groups.setdefault(elig["reason"][k][mi], []).append(k)
+        # Text
+        text = "; ".join(f"{r} in edge sets {ks}" if len(ks) < elig["eligible"].shape[0] else f"{r} in all {len(ks)} edge sets" for r, ks in groups.items())
+        # Print
+        print(f"  {meter:<10} {text}")
+        # Never
+        if len(bad) == elig["eligible"].shape[0]:
+            # Keep
+            never.append(meter)
+    # Summary
+    print(f"  structurally ineligible in every edge set: {never if never else 'none'}; eligible meters per edge set: {elig['eligible'].sum(axis=1).tolist()}")
 
 
 # -----------------------------------------------------------------------------
