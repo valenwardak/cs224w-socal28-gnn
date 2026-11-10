@@ -94,6 +94,11 @@
 #   matched pair at one seed, true edges and no edges, both receiving the same four added features:
 #     python main_gnn.py --kind gcn --run-name gcn_dyn_aw001_phys --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0 --physics-dir /content/features
 #     python main_gnn.py --kind gcn --run-name gcn_dyn_aw001_none_phys --edges none --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0 --physics-dir /content/features
+#   With the neighbor angle inputs (experiment 2; after main_latefeatures.py has written <YYYY-MM>_late.npz next to the
+#   features), the matched pair at one seed, physics off, both arms receiving the same three added features computed
+#   from the true neighbors:
+#     python main_gnn.py --kind gcn --run-name gcn_dyn_aw001_ang --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0 --angdiff-dir /content/features
+#     python main_gnn.py --kind gcn --run-name gcn_dyn_aw001_none_ang --edges none --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0 --angdiff-dir /content/features
 #   Options: python main_gnn.py --help
 #
 # Requires torch_geometric (pip install torch_geometric) for the GCN layers.
@@ -132,6 +137,8 @@ import pandas as pd
 import torch
 # Project: data side
 import socal_modeldata as sd
+# Project: the neighbor angle helpers, for the defaults
+import socal_angdiff as sa
 # Project: models and training
 import socal_models as sm
 
@@ -212,6 +219,12 @@ def parse_args():
     parser.add_argument("--score-only", action="store_true", help="Skip training, load the best checkpoint, and score")
     # Physics inputs, off by default: every earlier command builds the same inputs it did before
     parser.add_argument("--physics-dir", default=None, help="Folder with <YYYY-MM>_physics.npz and physics_manifest.json (main_physicsfeatures.py); turns the four physics input features on, for the true-edge and no-edge models alike")
+    # Neighbor angle inputs
+    parser.add_argument("--angdiff-dir", default=None, help="Folder with <YYYY-MM>_late.npz and late_manifest.json (main_latefeatures.py); turns the three neighbor angle difference inputs on, computed from the true neighbors of --graph for the true-edge and no-edge models alike; exclusive with --physics-dir")
+    # Resultant cutoff
+    parser.add_argument("--angdiff-min-resultant", type=float, default=sa.MIN_RESULTANT, help="Minimum mean resultant length of the neighbor mean for the direction to count")
+    # Late threshold, recorded; the late files were written with their own threshold, which must agree
+    parser.add_argument("--late-threshold", type=float, default=sa.LATE_THRESHOLD, help="Capture-offset cutoff in seconds the late files must have been written with")
     # Parse
     args = parser.parse_args()
     # GAT needs at least one head
@@ -290,6 +303,22 @@ def graph_identity(path):
     return f"{os.path.basename(path)}:{digest}"
 
 
+def angdiff_identity(angdiff_dir, late_threshold):
+    """
+    Identity of the neighbor angle inputs for the run's options: the late
+    manifest's name and the first 16 hex digits of the SHA-256 of its
+    bytes. The manifest's threshold must be present, finite, positive and
+    equal to --late-threshold, so a run cannot silently use late files
+    written with another cutoff or with none recorded.
+    """
+    # Read and validate: threshold present, finite, positive and equal to --late-threshold; meter list present
+    _, raw = sa.read_late_manifest(angdiff_dir, late_threshold)
+    # Digest
+    digest = hashlib.sha256(raw).hexdigest()[:16]
+    # Name and digest
+    return f"late_manifest.json:{digest}"
+
+
 def physics_identity(physics_dir):
     """
     Identity of the physics inputs for the run's options: the physics
@@ -355,6 +384,10 @@ def main():
             # Line
             f.write(text + "\n")
 
+    # Not both kinds of added input
+    if args.physics_dir is not None and args.angdiff_dir is not None:
+        # Raise
+        raise ValueError("--physics-dir and --angdiff-dir cannot both be given")
     # Physics inputs on, before anything reads a month: identity recorded, scale set after it is computed or loaded
     physics_id = "none"
     # Asked for
@@ -401,6 +434,16 @@ def main():
         raise ValueError("--masked with a time-indexed graph is not supported yet; use a fixed graph file")
     # Identity of the graph file, checked on resume: its name and a hash of its contents, not its path, so Colab and local runs agree
     graph_id = graph_identity(args.graph)
+    # Neighbor angle inputs on, before anything reads a month; the graph body gives the neighbors and the phase map
+    angdiff_id, angdiff_settings = "none", None
+    # Asked for
+    if args.angdiff_dir is not None:
+        # Identity, threshold checked against the late manifest
+        angdiff_id = angdiff_identity(args.angdiff_dir, args.late_threshold)
+        # Turn the inputs on for this process
+        angdiff_settings = sd.configure_angdiff(args.angdiff_dir, body, manifest, args.angdiff_min_resultant, args.late_threshold)
+        # The graph identity is part of the feature's identity
+        angdiff_settings["graph_id"] = graph_id
     # Maskable meters, from the file as written, the same for every --edges control
     maskable_meters = maskable_from_graph(graph) if args.masked else None
     # Masked mode forecasts the absolute value, never a correction to persistence
@@ -435,7 +478,9 @@ def main():
         "train_blocks": train_blocks, "splits_file": os.path.abspath(args.splits),
         # Physics inputs: "none", or the physics manifest's identity; the features per channel the model reads, in order;
         # and the physics divisors, filled in below once the scale is computed or loaded (None without physics inputs)
-        "physics": physics_id, "n_features": sd.n_features(), "features": list(sd.FEATURES) + (list(sd.PHYSICS_FEATURES) if args.physics_dir is not None else []), "physics_scale": None,
+        "physics": physics_id, "n_features": sd.n_features(), "features": list(sd.FEATURES) + sd.extra_features(), "physics_scale": None,
+        # Neighbor angle inputs: "none", or the late manifest's identity, and the settings (cutoffs, phase map, graph identity)
+        "angdiff": angdiff_id, "angdiff_settings": angdiff_settings,
     }
     # Report
     log(f"device {device}, run {run_dir}, options {options}")
@@ -489,6 +534,10 @@ def main():
     if args.physics_dir is not None:
         # Line
         log(f"physics inputs on from {args.physics_dir} ({physics_id}): {sd.n_features()} features per channel in the order {options['features']}, divisors {options['physics_scale']}; the four physics features are shared by every meter and channel and zeroed in every masked forward")
+    # Neighbor angle inputs report
+    if args.angdiff_dir is not None:
+        # Line
+        log(f"neighbor angle inputs on from {args.angdiff_dir} ({angdiff_id}): {sd.n_features()} features per channel in the order {options['features']}; equal-weight neighbor mean from {args.graph} (phase map {angdiff_settings['phase_map']}), each slot's own period, late threshold {args.late_threshold} s, minimum resultant {args.angdiff_min_resultant}; the three added features are zeroed in every masked forward")
     # Report the graph
     if timeline is None:
         # Fixed

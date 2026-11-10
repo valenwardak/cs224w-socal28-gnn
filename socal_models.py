@@ -173,7 +173,7 @@
 #     GraphForecaster                 MeterGRU encoder + one GNN layer + head, with the masked mode
 #                                     and per-example edge sets for the time-indexed graph
 #     persistence_forecast(x, C)      last valid reading as the forecast, with validity
-#     strip_physics(x, n_channels)    zero the physics features in masked mode, so the hidden meter does not leak through them
+#     strip_extra(x, n_channels)      zero the added features (physics or neighbor angles) in masked mode, so the hidden meter does not leak through them
 #     draw_masks(y_valid, maskable)   one hidden meter per window for training
 #     masked_forecast(model, x, chunk)
 #                                     every maskable meter hidden in turn, for evaluation and scoring
@@ -546,7 +546,7 @@ class MeterGRU(nn.Module):
     def __init__(self, n_meters, n_channels, hidden=64, embed=8, layers=1, dropout=0.0, predict_delta=True, n_features=None):
         # Base class
         super().__init__()
-        # Features per channel: the five standard ones, or nine with the physics inputs on (see socal_modeldata)
+        # Features per channel: the five standard ones, nine with the physics inputs on, eight with the neighbor angle inputs on (see socal_modeldata)
         self.n_features = int(n_features) if n_features is not None else sd.n_features()
         # Sizes
         self.C, self.hidden = n_channels, hidden
@@ -803,9 +803,10 @@ class GraphForecaster(nn.Module):
             if not self.masked:
                 # Raise
                 raise ValueError("a mask was given to a model that is not in masked mode")
-            # The physics features were computed from every meter's readings, the hidden one included: zero them for
-            # every meter in a masked forward, so no masked prediction can depend on them (training, evaluation, scoring)
-            x = strip_physics(x, self.C)
+            # The added features (physics residuals, neighbor angle differences) were computed from other meters'
+            # readings, the hidden one included: zero them for every meter in a masked forward, so no masked
+            # prediction can depend on them (training, evaluation, scoring)
+            x = strip_extra(x, self.C)
             # Zero every feature of every channel over the whole history: magnitude, cos, sin, both validity flags
             x = x * (~mask).to(x.dtype)[:, None, :, None]
         # Every meter through the shared encoder: fold meters into the batch
@@ -875,7 +876,7 @@ def persistence_forecast(x, n_channels):
     forecast (..., C, 3) and valid (..., C, 2) bool, False where the
     history held nothing to copy.
     """
-    # Unflatten channels and features; the feature count comes from the input itself (5, or 9 with physics inputs)
+    # Unflatten channels and features; the feature count comes from the input itself (5, 9 with physics inputs, 8 with neighbor angle inputs)
     xf = x.reshape(x.shape[:-1] + (n_channels, x.shape[-1] // n_channels))
     # History length
     H = xf.shape[1]
@@ -903,17 +904,17 @@ def persistence_forecast(x, n_channels):
     return torch.cat([mag, ang], dim=-1), valid
 
 
-def strip_physics(x, n_channels):
+def strip_extra(x, n_channels):
     """
-    Zero the physics features (everything past the five standard features
-    of each channel) in x of shape (B, H, M, C * F). Called by the graph
-    model's forward whenever a mask is given, so every masked prediction,
-    in training, evaluation and scoring alike, follows one rule: the
-    physics residual was computed from every meter's readings, the hidden
-    meter's included, so leaving it in would leak what the mask is meant
-    to hide. Both residuals and both validity flags are zeroed, so the
-    model sees them as absent. x without physics features is returned as
-    it is.
+    Zero the added features (everything past the five standard features
+    of each channel: the physics four or the neighbor angle three) in x of
+    shape (B, H, M, C * F). Called by the graph model's forward whenever a
+    mask is given, so every masked prediction, in training, evaluation and
+    scoring alike, follows one rule: those features were computed from
+    other meters' readings, the hidden meter's included, so leaving them
+    in would leak what the mask is meant to hide. Values and validity
+    flags are zeroed alike, so the model sees them as absent. x without
+    added features is returned as it is.
     """
     # Features per channel
     nf = x.shape[-1] // n_channels
@@ -923,7 +924,7 @@ def strip_physics(x, n_channels):
         return x
     # View as (B, H, M, C, nf), copy so the caller's tensor is untouched
     xf = x.reshape(x.shape[:-1] + (n_channels, nf)).clone()
-    # Zero the physics features
+    # Zero the added features
     xf[..., F:] = 0.0
     # Back to the flat layout
     return xf.reshape(x.shape)
@@ -1296,17 +1297,18 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
 
 
 # Options that define the experiment; a resumed run must match them
-EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection", "physics", "n_features", "features", "physics_scale")
+EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings")
 # Keys added after the first checkpoints were written. A checkpoint without "masked" was not masked, so it
 # compares as False, and a checkpoint without "graph_selection" used one fixed graph, so it compares as "fixed";
 # the other two are compared only when the checkpoint holds them. graph_selection is "fixed" (one graph for
 # every window) or "last_history_slot" (the time-indexed rule)
-LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed", "physics": "none", "n_features": F, "features": list(sd.FEATURES), "physics_scale": None}
+LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed", "physics": "none", "n_features": F, "features": list(sd.FEATURES), "physics_scale": None, "angdiff": "none", "angdiff_settings": None}
 # Later keys whose default stands in for a missing saved value instead of skipping the comparison. A checkpoint
 # without "physics" was trained without physics inputs ("none") on the F standard features in their standard order
 # and with no physics divisors, so a run with physics inputs can never resume from it, and the other way round; a
-# physics run whose divisors or feature order differ from the checkpoint's is refused too
-DEFAULTED_KEYS = ("masked", "graph_selection", "physics", "n_features", "features", "physics_scale")
+# physics run whose divisors or feature order differ from the checkpoint's is refused too. The same holds for the
+# neighbor angle inputs ("angdiff", the late files' identity, and "angdiff_settings", the cutoffs and phase map)
+DEFAULTED_KEYS = ("masked", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings")
 
 
 def save_atomic(body, path):

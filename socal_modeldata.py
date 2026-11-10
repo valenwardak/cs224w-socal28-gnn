@@ -33,6 +33,18 @@
 #              physics value never looks like a perfect fit. Physics inputs
 #              are off unless a main script turns them on, so every earlier
 #              command builds exactly the inputs it did before.
+#              With the neighbor angle inputs turned on (configure_angdiff,
+#              experiment 2, exclusive with physics), three more numbers
+#              follow the five standard ones, F = 8:
+#              [ cos d, sin d, valid ] where d is the meter's voltage angle
+#              minus the equal-weight circular mean of its wired neighbors'
+#              angles on the same physical phase, computed at load time by
+#              socal_angdiff.neighbor_differences from the month's angles,
+#              <YYYY-MM>_late.npz (main_latefeatures.py) and the meter
+#              graph's period in force at each slot. Current channels and
+#              channels without a phase-to-neutral phase carry zeros with
+#              the flag 0. Only history slots ever reach the model, as for
+#              every other input.
 #              The two flags are the validity flags, not the raw presence mask:
 #              mag_valid is present and finite, ang_valid is angle_ok and
 #              finite and mag_valid. Where a flag is 0 the values before it
@@ -98,7 +110,11 @@
 #     load_physics_scale(path)               the physics divisors from scale.json, or None
 #   Physics inputs (optional)
 #     configure_physics(features_dir, scale) turn the four physics features on for this process
-#     n_features()                           5, or 9 with physics on
+#     n_features()                           5, or 9 with physics on, or 8 with neighbor angle inputs on
+#   Neighbor angle inputs (optional)
+#     configure_angdiff(features_dir, graph_body, manifest, min_resultant, late_threshold)
+#                                            turn the three neighbor angle features on for this process
+#     extra_features()                       names of the added features, in order, or []
 #     compute_physics_scale(features_dir, splits, percentile, allow_missing)
 #                                            per side: the percentile of valid residuals over the train blocks
 #   Model inputs
@@ -123,6 +139,9 @@ import numpy as np
 # Third party: timestamps for month labels
 import pandas as pd
 
+# The neighbor angle difference helpers (experiment 2)
+import socal_angdiff as sa
+
 # Feature names per channel, in order
 FEATURES = ("mag", "cos", "sin", "mag_valid", "ang_valid")
 # Number of features per channel without physics inputs
@@ -133,6 +152,8 @@ PHYSICS_FEATURES = ("phys_a", "phys_a_valid", "phys_b", "phys_b_valid")
 PHYSICS_SIDES = ("a", "b")
 # Physics configuration for this process: None (off) or {"features_dir", "scale" (2,) float32 or None}
 PHYSICS = None
+# Neighbor angle configuration for this process: None (off) or {"features_dir", "timeline", "phase_idx", "adjacency", "min_resultant", "late_threshold", "phase_map"}
+ANGDIFF = None
 # Seconds per slot
 SLOT_SECONDS = 10
 # The feature files follow the preprocessing grid: fixed Pacific Standard
@@ -332,6 +353,16 @@ def load_month(features_dir, month, allow_missing=False, manifest=None):
         r = np.where(v, r, 0.0).astype(np.float32)
         # Store
         out["phys_r"], out["phys_valid"] = r, v
+    # Neighbor angle inputs, when turned on for this process
+    if ANGDIFF is not None:
+        # Late flags of the month: slot times, shape and meter order checked against the manifest
+        late = sa.load_late(ANGDIFF["features_dir"], month, t, ANGDIFF["meters"])
+        # Edge set per slot, from the period in force at that slot
+        gs = sa.graph_per_slot(t, ANGDIFF["timeline"])
+        # The feature
+        nb_cos, nb_sin, nb_valid, _ = sa.neighbor_differences(ang, ang_valid, late, ANGDIFF["phase_idx"], ANGDIFF["adjacency"], gs, ANGDIFF["min_resultant"])
+        # Store
+        out["nb_cos"], out["nb_sin"], out["nb_valid"] = nb_cos, nb_sin, nb_valid
     # Return
     return out
 
@@ -625,14 +656,80 @@ def configure_physics(features_dir, scale=None):
         if scale.shape != (len(PHYSICS_SIDES),) or not np.all(np.isfinite(scale)) or not np.all(scale > 0):
             # Raise
             raise ValueError(f"physics scale must be {len(PHYSICS_SIDES)} finite positive values, got {scale}")
+    # Not both
+    if ANGDIFF is not None:
+        # Raise
+        raise ValueError("physics inputs and neighbor angle inputs cannot both be on")
     # Set
     PHYSICS = {"features_dir": features_dir, "scale": scale}
 
 
 def n_features():
-    """Number of features per channel in the model input: F, or F plus the physics features when they are on."""
+    """Number of features per channel in the model input: F plus the added features that are on."""
     # Count
-    return F + (len(PHYSICS_FEATURES) if PHYSICS is not None else 0)
+    return F + len(extra_features())
+
+
+def extra_features():
+    """Names of the features appended after the five standard ones, in order: the physics four, the neighbor angle three, or none."""
+    # Physics
+    if PHYSICS is not None:
+        # Four
+        return list(PHYSICS_FEATURES)
+    # Neighbor angles
+    if ANGDIFF is not None:
+        # Three
+        return list(sa.ANGDIFF_FEATURES)
+    # None
+    return []
+
+
+def configure_angdiff(features_dir, graph_body=None, manifest=None, min_resultant=sa.MIN_RESULTANT, late_threshold=sa.LATE_THRESHOLD):
+    """
+    Turn the neighbor angle inputs on for this process: load_month() then
+    reads <month>_late.npz from features_dir and computes the three
+    features from the month's angles and the meter graph (graph_body, a
+    fixed or time-indexed graph file already parsed; its phase map gives
+    each meter's channels per physical phase). Exclusive with the physics
+    inputs. Pass features_dir None to turn the inputs off again. Returns
+    the settings recorded with a run.
+    """
+    # Module state
+    global ANGDIFF
+    # Off
+    if features_dir is None:
+        # Clear
+        ANGDIFF = None
+        # Done
+        return None
+    # Not both
+    if PHYSICS is not None:
+        # Raise
+        raise ValueError("physics inputs and neighbor angle inputs cannot both be on")
+    # Needed
+    if graph_body is None or manifest is None:
+        # Raise
+        raise ValueError("configure_angdiff needs the graph file body and the manifest")
+    # Periods and edge sets
+    timeline = sa.timeline_from_graph(graph_body)
+    # Meters and channels
+    meters, channels = list(manifest["meters"]), list(manifest["channels"])
+    # Phase map
+    phase_idx = sa.phase_channel_index(timeline["meters"], meters, channels)
+    # No meter mapped at all is a configuration error
+    if not (phase_idx >= 0).any():
+        # Raise
+        raise ValueError("no meter in the graph file has a phase-to-neutral voltage channel; the phase map is missing")
+    # Adjacency per edge set
+    adjacency = sa.adjacency_matrices(timeline, timeline["meters"], meters)
+    # Cutoffs must make sense
+    if not (0.0 < float(min_resultant) <= 1.0) or not np.isfinite(late_threshold) or late_threshold <= 0:
+        # Raise
+        raise ValueError(f"min_resultant must be in (0, 1] and late_threshold positive, got {min_resultant} and {late_threshold}")
+    # Set
+    ANGDIFF = {"features_dir": features_dir, "timeline": timeline, "phase_idx": phase_idx, "adjacency": adjacency, "min_resultant": float(min_resultant), "late_threshold": float(late_threshold), "phase_map": sa.phase_map_identity(timeline["meters"], meters), "meters": meters}
+    # Settings for the run's options
+    return {"min_resultant": float(min_resultant), "late_threshold": float(late_threshold), "phase_map": ANGDIFF["phase_map"], "weights": "equal", "period_rule": "each slot's own period", "n_edge_sets": len(adjacency)}
 
 
 def compute_physics_scale(features_dir, splits, percentile=95.0, allow_missing=False):
@@ -712,6 +809,9 @@ def build_features(arrays, scale):
     With physics inputs on, four more features follow, identical over
     meters and channels: X[..., 5] = A residual / scale_A (0 where not
     valid), X[..., 6] = A valid, X[..., 7] and X[..., 8] the same for B.
+    With neighbor angle inputs on instead, three follow per channel:
+    X[..., 5] = cos d, X[..., 6] = sin d, X[..., 7] = valid, zero where
+    not valid.
     Returns (X float32, mag_valid bool (T, M, C), ang_valid bool (T, M, C)),
     the same two validity arrays that sit in X, used for targets and loss.
     """
@@ -747,6 +847,18 @@ def build_features(arrays, scale):
             X[..., F + 2 * k] = (arrays["phys_r"][:, k] / PHYSICS["scale"][k])[:, None, None]
             # Valid flag
             X[..., F + 2 * k + 1] = arrays["phys_valid"][:, k][:, None, None]
+    # Neighbor angle features, when on
+    if ANGDIFF is not None:
+        # The arrays must be there
+        if "nb_cos" not in arrays:
+            # Raise
+            raise ValueError("neighbor angle inputs are on but the month arrays carry no neighbor angle values")
+        # Cos of the difference, zero where not valid
+        X[..., F] = arrays["nb_cos"]
+        # Sin
+        X[..., F + 1] = arrays["nb_sin"]
+        # Flag
+        X[..., F + 2] = arrays["nb_valid"]
     # Validity for targets
     return X, arrays["mag_valid"].copy(), arrays["ang_valid"].copy()
 
