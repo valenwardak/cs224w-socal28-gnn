@@ -48,16 +48,51 @@
 #              how many edge sets, boundaries and reach cases it exercised.
 #              Needs torch and torch_geometric. It writes nothing.
 #
-#              Status: written against the repository at commit 898fe63
-#              (constructor and method signatures read from socal_models.py:
+#              Important: the project starts the forecast heads at zero
+#              (zero_head) so that the first forecast under predict_delta is
+#              persistence; a freshly built model therefore ignores every
+#              node state. The first execution of this check (Step 77,
+#              commit 2a3c381) showed exactly that: no response to a
+#              neighbor, and forecast invariances that held trivially. The
+#              check now (1) prints the zero-head lines it finds in the
+#              checked-out socal_models.py, (2) gives every diagnostic
+#              model's two heads controlled nonzero parameters before any
+#              forecast-based case, (3) reads the learned correction, the
+#              forecast minus the persistence base (sm.persistence_forecast
+#              with the model's own keep rule), instead of the full
+#              forecast, so persistence alone cannot produce a change, and
+#              (4) runs positive controls that must respond: the correction
+#              changes when the meter's own earlier history changes with the
+#              base held fixed (main model, every fixture model, no-edge
+#              model), a fixture meter's correction changes when a connected
+#              neighbor's history changes, and on the real graph at least
+#              one connected meter's correction responds to a neighbor in
+#              the same model and input used for the isolated-meter cases,
+#              per edge set. The positive controls attempted and the
+#              positive controls responding are printed as separate counts,
+#              with the number of real-graph neighbor pairs tried.
+#
+#              Test inputs: all-valid synthetic inputs. Every random input
+#              has its validity flags (features 3 and 4 of each channel) set
+#              to 1.0. Real inputs contain validity flags of 0 or 1.
+#              The model reads a reading as valid when its flag is above
+#              0.5, and persistence copies the last valid slot. With random
+#              flags the last slot is rarely valid on every channel, so the
+#              persistence base would come from earlier slots and could not
+#              be held fixed. With flags of 1.0 the base is the last slot.
+#
+#              Status: the first version was executed once on Colab (Step
+#              77, commit 2a3c381, exit 1, the neighbor response case
+#              failed for the reason above). This revision is
+#              syntax-checked only. The parts that need torch have not been
+#              executed, so its next Colab run is their first execution.
+#              Signatures were read from socal_models.py:
 #              GraphWindowDataset(X, mag_valid, ang_valid, history, horizon,
 #              max_gap, min_meters=1, t=None, timeline=None); make_model(kind,
 #              manifest, graph=None, edges=..., edge_weights=..., ..., seed=0,
 #              ..., timeline=None); GraphForecaster.forward(x, mask=None,
-#              graph_ids=None); edge_set(k); batch_edges(B, graph_ids, device)),
-#              syntax-checked, NOT yet executed in the project environment.
-#              Its first execution tests the diagnostic's own compatibility
-#              with the environment as well as graph delivery.
+#              graph_ids=None); edge_set(k); batch_edges(B, graph_ids, device);
+#              persistence_forecast(x, n_channels).
 #
 # Usage (from the repo root):
 #   python checks/main_graphdelivery.py --features-dir /content/features
@@ -69,8 +104,16 @@
 #   lookup_period(periods, t)        independent period lookup: linear scan over [start, end)
 #   aligned_grid(c, history)         aligned ten-second slots around a change time
 #   fixture_manifest_and_timeline()  three-meter path fixture a - b - c
+#   zero_head_lines(root)            line numbers of the zero-head calls in the checked-out model code
+#   randomize_heads(model, seed)     controlled nonzero forecast heads, since the project starts them at zero
 #   forecasts(model, x, gid)         forecast for a batch under one graph id per example
+#   correction(model, x, gid)        the learned correction: forecast minus the persistence base the model adds
 #   max_change(a, b)                 largest absolute difference
+#   valid_flags(x, C)                set the validity flags of a test input to 1.0
+#   draw_inputs(shape, C)            a random test input with valid flags
+#   redraw(x, C)                     new random values of the same shape with valid flags
+#   own_history_control(model, x, gid, b, m)
+#                                    positive control: change a meter's earlier history, base held fixed
 #   main()                           run every case, exit 0 when all pass
 # =============================================================================
 
@@ -159,6 +202,42 @@ def fixture_manifest_and_timeline(F):
     return manifest, body, sm.load_timeline(body)
 
 
+def zero_head_lines(root):
+    """Line numbers in the checked-out socal_models.py where the heads are zeroed, and the definition of zero_head."""
+    # Read
+    with open(os.path.join(root, "socal_models.py")) as f:
+        # Lines
+        lines = f.readlines()
+    # Matches
+    return [(i + 1, line.strip()) for i, line in enumerate(lines) if "zero_head(" in line and ("self.head" in line or line.strip().startswith("def zero_head"))]
+
+
+def randomize_heads(model, seed):
+    """
+    Give the model's forecast heads random weights. The project starts the
+    heads at zero on purpose (zero_head, so the first forecast under
+    predict_delta is persistence itself), which makes a freshly built
+    model's forecast independent of every encoder state, its own and its
+    neighbors'. A delivery check on such a model would pass every
+    invariance case trivially and fail every response case, so the heads
+    are randomized here before any forecast is compared.
+    """
+    # Deterministic
+    g = torch.Generator().manual_seed(seed)
+    # Both heads
+    for head in (model.head_mag, model.head_ang):
+        # No gradients
+        with torch.no_grad():
+            # Random weights
+            head.weight.copy_(torch.randn(head.weight.shape, generator=g) * 0.1)
+            # Random bias
+            if head.bias is not None:
+                # Set
+                head.bias.copy_(torch.randn(head.bias.shape, generator=g) * 0.1)
+    # Done
+    return model
+
+
 def forecasts(model, x, gid):
     """The model's forecast (B, M, C, 3) for inputs x under graph ids gid, no gradients."""
     # No gradients
@@ -167,10 +246,84 @@ def forecasts(model, x, gid):
         return model(x, graph_ids=gid)
 
 
+def correction(model, x, gid):
+    """
+    The learned correction of the model's forecast: the forecast minus the
+    persistence base the model adds under predict_delta (same keep rule as
+    the model: magnitude kept where a valid magnitude existed, both angle
+    components where a valid angle existed). Persistence alone cannot change
+    this quantity, so a change in it comes from the heads' inputs.
+    """
+    # Forecast
+    y = forecasts(model, x, gid)
+    # Not a delta model: the forecast is the readout itself
+    if not getattr(model, "predict_delta", False):
+        # Done
+        return y
+    # Persistence base and validity
+    base, ok = sm.persistence_forecast(x, model.C)
+    # The model's keep rule
+    keep = torch.cat([ok[..., 0:1], ok[..., 1:2], ok[..., 1:2]], dim=-1)
+    # Subtract
+    return y - torch.where(keep, base, torch.zeros_like(base))
+
+
 def max_change(a, b):
     """Largest absolute difference between two tensors."""
     # Value
     return float((a - b).abs().max())
+
+
+def valid_flags(x, C):
+    """
+    Set the two validity flags (features 3 and 4 of every channel) of a test
+    input to 1.0 and return the result: an all-valid synthetic input. x has
+    C * F numbers in its last dimension. Real inputs contain validity flags
+    of 0 or 1, and the model treats a reading as valid when its flag is
+    above 0.5. Random flags would make
+    most readings invalid, so the persistence base would be copied from an
+    earlier slot instead of the last one.
+    """
+    # Split the last dimension into channels and features, on a copy
+    xf = x.reshape(x.shape[:-1] + (C, x.shape[-1] // C)).clone()
+    # Mark every magnitude and every angle as valid
+    xf[..., 3:5] = 1.0
+    # Back to the input layout
+    return xf.reshape(x.shape)
+
+
+def draw_inputs(shape, C):
+    """A random test input of the given shape (last dimension C * F) with every validity flag at 1.0."""
+    # Random values, then valid flags
+    return valid_flags(torch.randn(*shape), C)
+
+
+def redraw(x, C):
+    """New random values with the shape of x (last dimension C * F) and every validity flag at 1.0, used to perturb part of an input."""
+    # Random values, then valid flags
+    return valid_flags(torch.randn_like(x), C)
+
+
+def own_history_control(model, x, gid, b, m):
+    """
+    Positive control on one model: replace meter m's history in example b in
+    every slot but the last, and return (base_same, change). base_same says
+    the persistence base of that meter is identical before and after, which
+    holds since the last slot is untouched and valid. change is the largest
+    change of the meter's learned correction. A live path from the meter's
+    history to the heads gives base_same True and a change above the
+    tolerance.
+    """
+    # Copy of the input
+    xo = x.clone()
+    # New earlier history for the meter; the last slot stays as it was
+    xo[b, :-1, m, :] = redraw(xo[b, :-1, m, :], model.C)
+    # Persistence base of the meter before and after
+    base_same = bool(torch.equal(sm.persistence_forecast(x, model.C)[0][b, m], sm.persistence_forecast(xo, model.C)[0][b, m]))
+    # Change of the meter's learned correction
+    change = max_change(correction(model, x, gid)[b, m], correction(model, xo, gid)[b, m])
+    # Both
+    return base_same, change
 
 
 def main():
@@ -195,6 +348,18 @@ def main():
     ok = True
     # Alignment first
     ok &= report("meter order of the manifest equals the graph node order", list(manifest["meters"]) == names)
+    # Where the checked-out model code zeroes the heads
+    zl = zero_head_lines(ROOT)
+    # Print
+    print("zero-head initialization in the checked-out socal_models.py: " + "; ".join(f"line {n}: {t}" for n, t in zl))
+    # Must be found, since the readout below depends on it being understood
+    ok &= report("the checked-out model code zeroes both heads under predict_delta (zero_head calls found)", any("head_mag" in t for _, t in zl) and any("head_ang" in t for _, t in zl))
+    # Positive controls that responded
+    n_pos = 0
+    # Positive controls attempted, counted apart from those that responded
+    n_att = 0
+    # Neighbor pairs tried by the real-graph positive controls, over all edge sets
+    n_pairs = 0
     # ---- 1. graph selection at every switching boundary, on the aligned grid ----
     periods = timeline["periods"]
     # Periods that received at least one window as selected graph
@@ -241,6 +406,10 @@ def main():
     ok &= report("every period that holds an aligned slot was selected by some window", set(q["index"] for q in periods if q["index"] not in no_slot) <= seen)
     # ---- 2. edge and weight delivery ----
     model = sm.make_model("gcn", manifest, edges="true", edge_weights="admittance", seed=args.seed, timeline=timeline)
+    # The heads start at zero by design; randomize them so forecasts depend on the encoder and node states
+    randomize_heads(model, args.seed)
+    # Say so once
+    print("note: forecast heads given nonzero test weights (the project zero-initializes them for predict_delta); test inputs are all-valid synthetic inputs (real inputs contain validity flags of 0 or 1); every response and invariance case below reads the learned correction, and the positive controls show whether it responds")
     # Evaluation mode
     model.eval()
     # Each edge set
@@ -281,20 +450,31 @@ def main():
     ok &= report("the parameter copy left every graph buffer unchanged", unchanged, f"{len(before)} buffers")
     # Evaluation
     model_b.eval()
-    # Inputs
-    x = torch.randn(4, args.history, M, C * F)
+    # Inputs: random values with valid flags, so the persistence base is the last slot
+    x = draw_inputs((4, args.history, M, C * F), C)
     # Graph ids: two examples on graph 0, one on graph 1, one on the last graph
     gid = torch.tensor([0, 0, 1, len(body["graphs"]) - 1])
-    # Forecasts
-    ya, yb = forecasts(model, x, gid), forecasts(model_b, x, gid)
-    # Check
-    ok &= report("with identical learned parameters, admittance and binary models give identical forecasts (rtol 0)", bool(torch.allclose(ya, yb, rtol=0, atol=args.tolerance)), f"largest difference {max_change(ya, yb):.2e}")
+    # Learned corrections (forecast minus persistence base), the readout used for every forecast-based case
+    ya, yb = correction(model, x, gid), correction(model_b, x, gid)
+    # Positive control, main model: the correction responds to the meter's own earlier history while the persistence base is held fixed
+    base_same, own_resp = own_history_control(model, x, gid, 0, 0)
+    # Passed
+    passed = base_same and own_resp > args.tolerance
+    # One control attempted
+    n_att += 1
+    # Count
+    n_pos += int(passed)
+    # Report
+    ok &= report("positive control, main model: the learned correction responds to the meter's own earlier history with the persistence base held fixed", passed, f"base fixed {base_same}, correction change {own_resp:.2e}")
+    # Equivalence on the corrections, identical heads included through the parameter copy
+    ok &= report("with identical learned parameters, heads included, admittance and binary models give identical corrections (rtol 0)", bool(torch.allclose(ya, yb, rtol=0, atol=args.tolerance)), f"largest difference {max_change(ya, yb):.2e}")
     # An intentionally different graph buffer must be detected, not overwritten: a random-edge model has different edge indices
     model_r = sm.make_model("gcn", manifest, edges="random", edge_weights="admittance", seed=args.seed, timeline=timeline)
     # Compare buffers as above
     differs = any(not torch.equal(model.edge_set(g)[0], model_r.edge_set(g)[0]) for g in range(len(body["graphs"])))
     # Check
     ok &= report("an intentionally different graph buffer (random edges) is detected by the buffer comparison", differs)
+    # Coverage: how many edge sets the delivery checks covered
     print(f"edge sets exercised: {len(body['graphs'])}")
     # ---- 3. batch isolation ----
     ei, ew = model.batch_edges(4, gid, x.device)
@@ -310,44 +490,66 @@ def main():
     ok &= report("batch edges: every edge joins two nodes of the same example and each example carries its own edge set's count", blocks_ok, f"{ei.shape[1]} directed edges over 4 examples")
     # Perturb example 1
     x2 = x.clone()
-    # Random
-    x2[1] = torch.randn_like(x2[1])
-    # Forecasts
-    y2 = forecasts(model, x2, gid)
-    # Check: the others unchanged (the perturbed one is not required to change)
-    ok &= report("batch isolation: changing one example's inputs leaves the other examples' forecasts unchanged", max_change(ya[[0, 2, 3]], y2[[0, 2, 3]]) <= args.tolerance, f"largest change elsewhere {max_change(ya[[0, 2, 3]], y2[[0, 2, 3]]):.2e}")
+    # New random history for every meter of example 1
+    x2[1] = redraw(x2[1], C)
+    # Corrections
+    y2 = correction(model, x2, gid)
+    # Positive control inside the batch case: the perturbed example's own corrections must change
+    batch_resp = max_change(ya[1], y2[1])
+    # One control attempted
+    n_att += 1
+    # Count
+    n_pos += int(batch_resp > args.tolerance)
+    # Check: the perturbed example responds and the others are unchanged
+    ok &= report("batch isolation: the perturbed example's corrections change and the other examples' corrections are unchanged", batch_resp > args.tolerance and max_change(ya[[0, 2, 3]], y2[[0, 2, 3]]) <= args.tolerance, f"perturbed change {batch_resp:.2e}, largest change elsewhere {max_change(ya[[0, 2, 3]], y2[[0, 2, 3]]):.2e}")
     # ---- 4. message reach on the controlled fixture ----
     fman, fbody, ftl = fixture_manifest_and_timeline(F)
     # Counters
-    n_resp_nb, n_resp_two, n_iso = 0, 0, 0
+    n_resp_nb, n_resp_two, n_own_fix = 0, 0, 0
     # Draws
     for s in range(args.reach_seeds):
         # Model
         fm = sm.make_model("gcn", fman, edges="true", edge_weights="admittance", seed=args.seed + s, timeline=ftl)
+        # Random heads, as above
+        randomize_heads(fm, args.seed + s)
         # Evaluation
         fm.eval()
         # Inputs: three meters, one channel
         torch.manual_seed(args.seed + s)
-        # Base
-        xf = torch.randn(1, args.history, 3, 1 * F)
-        # Base forecast
-        yf = forecasts(fm, xf, torch.tensor([0]))
+        # Base input with valid flags; the fixture has one channel
+        xf = draw_inputs((1, args.history, 3, 1 * F), 1)
+        # Base correction
+        yf = correction(fm, xf, torch.tensor([0]))
+        # Own-history positive control on this fixture model: a's earlier history, base held fixed
+        f_same, f_resp = own_history_control(fm, xf, torch.tensor([0]), 0, 0)
+        # Counted only when the base stayed fixed and the correction changed
+        n_own_fix += int(f_same and f_resp > args.tolerance)
         # Perturb b (a's neighbor)
         xb = xf.clone()
         # Random history for b
-        xb[:, :, 1, :] = torch.randn_like(xb[:, :, 1, :])
-        # Response of a
-        n_resp_nb += int(max_change(yf[0, 0], forecasts(fm, xb, torch.tensor([0]))[0, 0]) > args.tolerance)
+        xb[:, :, 1, :] = redraw(xb[:, :, 1, :], 1)
+        # Response of a's correction
+        n_resp_nb += int(max_change(yf[0, 0], correction(fm, xb, torch.tensor([0]))[0, 0]) > args.tolerance)
         # Perturb c (two hops from a)
         xc = xf.clone()
         # Random history for c
-        xc[:, :, 2, :] = torch.randn_like(xc[:, :, 2, :])
-        # a must not respond
-        n_resp_two += int(max_change(yf[0, 0], forecasts(fm, xc, torch.tensor([0]))[0, 0]) > args.tolerance)
-    # Checks
-    ok &= report(f"fixture a-b-c: a's forecast responded to its neighbor b in {n_resp_nb} of {args.reach_seeds} initializations (at least one required)", n_resp_nb >= 1)
+        xc[:, :, 2, :] = redraw(xc[:, :, 2, :], 1)
+        # a's correction must not respond
+        n_resp_two += int(max_change(yf[0, 0], correction(fm, xc, torch.tensor([0]))[0, 0]) > args.tolerance)
+    # Positive controls on the fixture models: own history must respond in every initialization
+    ok &= report(f"positive control, fixture models: a's correction responded to its own earlier history with the persistence base held fixed in {n_own_fix} of {args.reach_seeds} initializations (all required)", n_own_fix == args.reach_seeds)
+    # One own-history control attempted per initialization
+    n_att += args.reach_seeds
+    # Count
+    n_pos += n_own_fix
+    # Neighbor response
+    ok &= report(f"fixture a-b-c: a's correction responded to its neighbor b in {n_resp_nb} of {args.reach_seeds} initializations (at least one required)", n_resp_nb >= 1)
+    # One neighbor control attempted per initialization
+    n_att += args.reach_seeds
+    # Count
+    n_pos += n_resp_nb
     # Two hops never
-    ok &= report(f"fixture a-b-c: a's forecast never responded to the two-hop meter c ({n_resp_two} of {args.reach_seeds} responded; zero required)", n_resp_two == 0)
+    ok &= report(f"fixture a-b-c: a's correction never responded to the two-hop meter c ({n_resp_two} of {args.reach_seeds} responded; zero required)", n_resp_two == 0)
     # Isolated meters on the real graph: unchanged by every other meter, in every edge set where they are isolated
     n_iso_cases = 0
     # Each edge set
@@ -360,34 +562,84 @@ def main():
             deg[e["source"]] += 1
             # Target
             deg[e["target"]] += 1
+        # Base input and correction for this edge set, shared by the isolated cases and the positive control
+        x1 = x[:1].clone()
+        # Base
+        y1 = correction(model, x1, torch.tensor([g]))
         # Isolated
         for i in np.flatnonzero(deg == 0):
-            # Base
-            x1 = x[:1].clone()
-            # Base forecast
-            y1 = forecasts(model, x1, torch.tensor([g]))
             # Perturb all others
             xp = x1.clone()
             # Others
             others = [j for j in range(M) if j != i]
             # Random
-            xp[:, :, others, :] = torch.randn_like(xp[:, :, others, :])
-            # Forecast
-            yp = forecasts(model, xp, torch.tensor([g]))
+            xp[:, :, others, :] = redraw(xp[:, :, others, :], C)
+            # Correction
+            yp = correction(model, xp, torch.tensor([g]))
             # Count
             n_iso_cases += 1
             # Check
             ok &= report(f"edge set {g}: isolated {names[i]} unchanged when every other meter changes", max_change(y1[0, i], yp[0, i]) <= args.tolerance, f"largest change {max_change(y1[0, i], yp[0, i]):.2e}")
+        # Real-graph positive control: in the same model and input, at least one connected meter's correction responds to a neighbor
+        nb_sets = {}
+        # Neighbor lists from this edge set
+        for e in graph["edges"]:
+            # Both ways
+            nb_sets.setdefault(e["source"], set()).add(e["target"])
+            # Reverse
+            nb_sets.setdefault(e["target"], set()).add(e["source"])
+        # Try connected meters in order until one responds
+        responded = None
+        # Neighbor pairs tried in this edge set
+        tried = 0
+        # Loop
+        for i in sorted(nb_sets):
+            # Its first neighbor
+            j = sorted(nb_sets[i])[0]
+            # One more pair tried
+            tried += 1
+            # Perturb the neighbor only
+            xn = x1.clone()
+            # Random history for j
+            xn[:, :, j, :] = redraw(xn[:, :, j, :], C)
+            # Response of i's correction
+            r = max_change(y1[0, i], correction(model, xn, torch.tensor([g]))[0, i])
+            # Found
+            if r > args.tolerance:
+                # Record
+                responded = (i, j, r)
+                # Stop
+                break
+        # One control attempted for this edge set
+        n_att += 1
+        # Pairs tried, added to the total
+        n_pairs += tried
+        # Count
+        n_pos += int(responded is not None)
+        # Check
+        ok &= report(f"positive control, edge set {g}: a connected meter's correction responds to a neighbor in the same model and input as the isolated cases", responded is not None, f"{names[responded[0]]} responded to {names[responded[1]]} by {responded[2]:.2e}; neighbor pairs tried {tried}" if responded else f"no connected meter responded; neighbor pairs tried {tried}")
     # Coverage
-    print(f"reach cases exercised: fixture neighbor {args.reach_seeds} draws, fixture two-hop {args.reach_seeds} draws, isolated-meter cases on the real graph {n_iso_cases}")
+    print(f"reach cases exercised: fixture neighbor {args.reach_seeds} draws, fixture two-hop {args.reach_seeds} draws, isolated-meter cases on the real graph {n_iso_cases}, real-graph neighbor positive controls {len(body['graphs'])}")
     # ---- 5. no-edge invariance ----
     model_n = sm.make_model("gcn", manifest, edges="none", edge_weights="admittance", seed=args.seed, timeline=timeline)
+    # Random heads, as above
+    randomize_heads(model_n, args.seed)
     # Evaluation
     model_n.eval()
     # Base
     x1 = x[:1].clone()
-    # Base forecast
-    y1 = forecasts(model_n, x1, torch.tensor([0]))
+    # Base correction under graph 0
+    y1 = correction(model_n, x1, torch.tensor([0]))
+    # Positive control on the no-edge model: own earlier history, base held fixed
+    same_n, own_n = own_history_control(model_n, x1, torch.tensor([0]), 0, 0)
+    # Passed only when the base stayed fixed and the correction changed
+    passed_n = same_n and own_n > args.tolerance
+    # One control attempted
+    n_att += 1
+    # Count
+    n_pos += int(passed_n)
+    # Check
+    ok &= report("positive control, no-edge model: the learned correction responds to the meter's own earlier history with the persistence base held fixed", passed_n, f"base fixed {same_n}, correction change {own_n:.2e}")
     # Worst change over meters
     worst = 0.0
     # Each meter
@@ -397,13 +649,19 @@ def main():
         # Others
         others = [j for j in range(M) if j != i]
         # Random
-        xp[:, :, others, :] = torch.randn_like(xp[:, :, others, :])
-        # Forecast
-        yp = forecasts(model_n, xp, torch.tensor([0]))
+        xp[:, :, others, :] = redraw(xp[:, :, others, :], C)
+        # Correction
+        yp = correction(model_n, xp, torch.tensor([0]))
         # Largest change on meter i
         worst = max(worst, max_change(y1[0, i], yp[0, i]))
     # Check
-    ok &= report("no-edge model: no meter's forecast changes when every other meter changes", worst <= args.tolerance, f"largest change {worst:.2e}")
+    ok &= report("no-edge model: no meter's correction changes when every other meter changes", worst <= args.tolerance, f"largest change {worst:.2e}")
+    # Positive controls attempted, with what they are made of
+    print(f"positive controls attempted: {n_att} (main model own history 1, batch perturbed example 1, fixture own history {args.reach_seeds}, fixture neighbor {args.reach_seeds}, real-graph neighbor controls {len(body['graphs'])}, no-edge own history 1)")
+    # Positive controls responding, a separate count; the fixture neighbor control needs at least one response, every other control needs all
+    print(f"positive controls responding: {n_pos} of {n_att} attempted (fixture neighbor responses {n_resp_nb} of {args.reach_seeds}, at least one required)")
+    # Real-graph neighbor pairs tried, since each edge set's control tries pairs until one responds
+    print(f"real-graph neighbor pairs tried: {n_pairs} over {len(body['graphs'])} edge sets")
     # ---- 6. a history-valid sender stays in the model input when its target is missing ----
     T = args.history + 1
     # Fixture arrays: meter b has valid history and an invalid target slot
