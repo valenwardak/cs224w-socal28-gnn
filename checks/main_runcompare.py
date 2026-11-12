@@ -55,6 +55,19 @@
 #              features per channel and no optional inputs), otherwise
 #              "not independently verified".
 #
+#              Sender gating (sender_gate, added 2026-11-12) is a later key
+#              with a stated meaning when absent: a run saved before the
+#              option existed did not use sender gating, so its absence is
+#              read as False (ABSENT_MEANS), the same reading the training
+#              script applies to old checkpoints. Runs are compared on that
+#              effective value. A difference is a FAIL, since a gated and
+#              an ungated run pass different messages and must not be
+#              pooled as seeds of one model. The key present on one side
+#              only with the same effective value is INFO, not REVIEW. This
+#              check is about seeds of one configuration. The planned
+#              controlled comparison between a gated and an ungated
+#              configuration is a different thing and is not refused here.
+#
 #              Scoring evidence: main_score.py last changed in commit
 #              81c4857 (authored 2026-11-05 21:55 -0400, which is 2026-11-06
 #              01:55 UTC) and unchanged since; it writes a JSON
@@ -134,7 +147,9 @@ import tempfile
 # The keys the training script logged when the original runs were made (see the header for the commits)
 REQUIRED_KEYS = ["kind", "history", "horizon", "max_gap", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "predict_delta", "edges", "edge_weights", "min_meters", "graph_id", "graph_selection", "masked", "maskable_meters", "mask_chunk", "lr", "weight_decay", "batch_size", "angle_weight", "epochs", "patience", "min_delta", "seed", "train_blocks", "splits_file"]
 # Keys later script revisions added; reported separately, never required
-LATER_KEYS = ["physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings"]
+LATER_KEYS = ["physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate"]
+# Later keys whose absence has a stated meaning: a run saved before sender gating existed did not use it
+ABSENT_MEANS = {"sender_gate": False}
 # Files every complete run must have
 REQUIRED_FILES = ["train_log.txt", "scale.json", "checkpoint_best.pt"]
 # Score files with the statistic and scoring version each must carry
@@ -341,8 +356,8 @@ def show_run(run):
         print("later metadata (not required):")
         # Each
         for k in LATER_KEYS:
-            # Line
-            print(f"  {k:<18} {o.get(k, '<absent>')}")
+            # Line, with the stated meaning of an absent key where there is one
+            print(f"  {k:<18} {o.get(k, '<absent, read as ' + str(ABSENT_MEANS[k]) + '>' if k in ABSENT_MEANS else '<absent>')}")
         # Blocks
         blocks = o.get("train_blocks")
         # Title
@@ -503,8 +518,20 @@ def check_runs(runs, seeds, n_blocks, graph):
                 else:
                     # Fail
                     out.append(("FAIL", f"{cand['name']}: train_blocks differ from the reference; only on one side: {sorted(set(rb) ^ set(cb))}; order differs: {sorted(rb) == sorted(cb)}"))
+            # Later keys whose absence has a stated meaning are compared on their effective value
+            for k, default in ABSENT_MEANS.items():
+                # Effective values, the default standing in for an absent key
+                rv, cv = ro.get(k, default), co.get(k, default)
+                # Different: not the same message passing, so not seeds of one model
+                if rv != cv:
+                    # Fail
+                    out.append(("FAIL", f"{cand['name']}: option {k}: reference {rv}, candidate {cv} (an absent key is read as {default})"))
+                # Same value, key on one side only
+                elif (k in ro) != (k in co):
+                    # Info
+                    out.append(("INFO", f"{cand['name']}: {k} recorded on {'reference' if k in ro else 'candidate'} only; absent is read as {default}, so both sides are {rv}"))
             # Later metadata on one side only
-            for k in LATER_KEYS:
+            for k in [k for k in LATER_KEYS if k not in ABSENT_MEANS]:
                 # One side
                 if (k in ro) != (k in co):
                     # Review
@@ -728,6 +755,11 @@ SELF_TEST_CASES = [
     ("parameter count differs on candidate 2", 1, "model parameters 36600, reference 36500", [{}, {}, {"params": 36600}]),
     ("parameter line missing on candidate 1", 0, "no parameter-count line in train_log.txt", [{}, {"params": None}, {}]),
     ("unexpected key on candidate 1", 1, "key extra_key present on one side only", [{}, {"options": {"extra_key": 1}}, {}]),
+    ("sender_gate False recorded on candidate 1 only", 0, "sender_gate recorded on candidate only; absent is read as False, so both sides are False", [{}, {"options": {"sender_gate": False}}, {}]),
+    ("sender_gate True on candidate 2, absent on the reference", 1, "option sender_gate: reference False, candidate True", [{}, {}, {"options": {"sender_gate": True}}]),
+    ("sender_gate True on the reference, absent on candidate 1", 1, "gcn_dyn_aw001_s1: option sender_gate: reference True, candidate False", [{"options": {"sender_gate": True}}, {}, {"options": {"sender_gate": True}}]),
+    ("sender_gate True on all three", 0, "training compatibility: pass", [{"options": {"sender_gate": True}}] * 3),
+    ("sender_gate False on all three", 0, "training compatibility: pass", [{"options": {"sender_gate": False}}] * 3),
 ]
 
 

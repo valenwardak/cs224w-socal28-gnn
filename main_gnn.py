@@ -61,6 +61,19 @@
 #              a resume or --score-only with the other kind of file is
 #              refused. --masked with a timeline is refused for now.
 #
+#              Sender gating (--sender-gate, added 2026-11-12): the course
+#              staff's milestone feedback asked whether nodes without
+#              readings hurt. The diagnostics showed that meters without
+#              usable history stay connected and keep sending messages.
+#              With --sender-gate such a meter sends no message in that
+#              window; it keeps its self-loop and still receives. The rule
+#              is the gap rule of --max-gap on the history only. The graph
+#              file and the edge sets are unchanged. GCN only. Off by
+#              default, so every earlier command trains and scores the same
+#              model it did before. The run records sender_gate, so a
+#              resume or --score-only with the other setting is refused,
+#              and a checkpoint from before the option compares as off.
+#
 #              Ablations (the proposal's "does the graph help" test):
 #                --edges true     the real wiring            (default)
 #                --edges random   same number of edges, random node pairs
@@ -87,6 +100,8 @@
 #     python main_gnn.py --train-months 2023-09 --epochs 2 --hidden 16 --angle-weight 0.01 --run-name smoke_dyn --graph graph_meters_periods.json --splits splits_v2.json --score-splits validation
 #   Time-indexed meter graph, full run:
 #     python main_gnn.py --run-name gcn_dyn --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01
+#   Sender gating on the time-indexed meter graph, matched to gcn_dyn_aw001 at seed 0:
+#     python main_gnn.py --kind gcn --run-name gcn_dyn_aw001_gate --sender-gate --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0
 #   GAT and GraphSAGE with the same settings:
 #     python main_gnn.py --kind gat --run-name gat_dyn_aw001 --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01
 #     python main_gnn.py --kind sage --run-name sage_dyn_aw001 --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01
@@ -165,6 +180,8 @@ def parse_args():
     parser.add_argument("--gnn-layers", type=int, default=1, help="Number of message passing layers (hops)")
     # Window rule for synchronized batches
     parser.add_argument("--min-meters", type=int, default=1, help="Keep a time slot only if at least this many meters pass the gap rule")
+    # Sender gating, off by default: every earlier command builds the same model it did before
+    parser.add_argument("--sender-gate", action="store_true", help="Sender gating: a meter without usable history (the --max-gap rule on the history only) sends no message in that window; it keeps its self-loop and still receives; gcn only")
     # Masked objective
     parser.add_argument("--masked", action="store_true", help="Masked objective: hide one meter per window and forecast it from its neighbors; see socal_models.py")
     # Meters per masked evaluation pass
@@ -231,6 +248,10 @@ def parse_args():
     if args.kind == "gat" and args.heads < 1:
         # Refuse
         parser.error("--heads must be at least 1 for --kind gat")
+    # Sender gating is defined for the GCN layer only
+    if args.sender_gate and args.kind != "gcn":
+        # Refuse
+        parser.error("--sender-gate is defined for --kind gcn only")
     # The masked evaluation chunk must hide at least one meter per pass
     if args.mask_chunk < 1:
         # Refuse
@@ -476,6 +497,8 @@ def main():
         "hidden": args.hidden, "embed": args.embed, "layers": args.layers, "dropout": args.dropout, "gnn_layers": args.gnn_layers, "heads": args.heads if args.kind == "gat" else 0, "predict_delta": predict_delta,
         # Graph options
         "edges": args.edges, "edge_weights": args.edge_weights, "min_meters": args.min_meters,
+        # Sender gating: whether meters without usable history are silenced as senders; its gap rule is max_gap above
+        "sender_gate": args.sender_gate,
         # Graph identity, how each window's graph is chosen, and the masked objective
         "graph_id": graph_id, "graph_selection": graph_selection, "masked": args.masked, "maskable_meters": maskable_meters, "mask_chunk": args.mask_chunk,
         # Training
@@ -555,12 +578,16 @@ def main():
     else:
         # Time-indexed
         log(f"graph {args.graph}: time-indexed, {len(graph['nodes'])} nodes, {len(timeline['graphs'])} edge sets ({[len(g['edges']) for g in timeline['graphs']]} edges) over {len(timeline['periods'])} periods, edges={args.edges}, edge_weights={args.edge_weights}, selection last_history_slot")
+    # Report sender gating
+    if args.sender_gate:
+        # Line
+        log(f"sender gating on: a meter with a run of {args.max_gap} or more absent slots in its {args.history}-slot history sends no message in that window; self-loops and incoming messages are kept; graph file and edge sets unchanged")
     # Report the masked setup
     if args.masked:
         # Names
         log(f"masked objective: {len(maskable_meters)} maskable meters {maskable_meters}; not maskable: {[m for m in manifest['meters'] if m not in maskable_meters]}; {args.mask_chunk} meters per evaluation pass")
     # Model
-    model = sm.make_model(args.kind, manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, heads=args.heads, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters, timeline=timeline, n_features=sd.n_features()).to(device)
+    model = sm.make_model(args.kind, manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, heads=args.heads, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters, timeline=timeline, n_features=sd.n_features(), sender_gate=args.sender_gate, gate_max_gap=args.max_gap).to(device)
     # Parameter count
     log(f"model {args.kind} with {sum(p.numel() for p in model.parameters())} parameters" + (f", {args.heads} attention heads" if args.kind == "gat" else ""))
     # Checkpoint path

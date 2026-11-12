@@ -88,6 +88,27 @@
 #              the same state_dict keys as before, so older checkpoints load.
 #              Masked mode with a time-indexed graph is refused for now.
 #
+# Sender gating (--sender-gate, added 2026-11-12 after the graph
+#              diagnostics): off by default, so every earlier run and
+#              checkpoint behaves exactly as before. With it, a meter
+#              without usable history sends no message in that window. The
+#              rule is the pipeline's gap rule on the history only (no run
+#              of max_gap absent slots, a slot being absent when no channel
+#              has a valid magnitude). Each message's existing edge weight
+#              is multiplied by 1 or 0 before the GCN layer normalizes, so
+#              a silenced sender does not count in any receiver's degree. Every node keeps its
+#              self-loop and still receives. In masked mode the hidden
+#              meter's history is zeroed first, so it is silenced as a
+#              sender by the same rule and keeps its incoming messages.
+#              Masked mode itself is still for a fixed graph only. The
+#              graph file and the edge sets are unchanged. The helper
+#              functions are in socal_sendergate.py. GCN only: attention
+#              and the neighbor mean would change differently and are not
+#              part of this option. The option adds no parameter and no
+#              buffer, so the state_dict keys are the same with it on or
+#              off. A checkpoint saved before the option existed compares
+#              as sender_gate False.
+#
 # Batches:     assembled in bulk with array indexing (get_batch on the
 #              datasets, iter_batches below), not one example at a time,
 #              which was the cost in the first smoke test.
@@ -213,6 +234,8 @@ from tqdm import tqdm
 import socal_modeldata as sd
 # Project: the period lookup for the time-indexed graph
 import socal_metergraph as smg
+# Project: sender gating, the rule that silences meters without usable history
+import socal_sendergate as sg
 
 # Feature count per channel, from the data module
 F = sd.F
@@ -612,11 +635,29 @@ class GraphForecaster(nn.Module):
     period to its graph and is a plain tensor attribute, not a buffer:
     graph_ids converts period indices with it. forward takes graph ids,
     never period indices.
+
+    sender_gate (default False) turns sender gating on: a meter without
+    usable history sends no message in that window. gate_max_gap is the
+    gap length of the history rule and must be the run's max_gap. See
+    socal_sendergate.py. With sender_gate False the forward pass is the
+    one it always was.
     """
 
-    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_sets, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None, period_graph=None, n_features=None):
+    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_sets, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None, period_graph=None, n_features=None, sender_gate=False, gate_max_gap=None):
         # Base class
         super().__init__()
+        # Sender gating: off unless asked for, so earlier runs are unchanged
+        self.sender_gate = bool(sender_gate)
+        # The gap length of the history rule, kept as a plain number so the state_dict does not change
+        self.gate_max_gap = int(gate_max_gap) if gate_max_gap is not None else None
+        # Sender gating is defined for the GCN layer only, where a zero weight removes the message and its share of the degree
+        if self.sender_gate and kind != "gcn":
+            # Raise
+            raise ValueError(f"sender gating is defined for kind gcn only, got {kind}")
+        # Sender gating needs the gap length of the run
+        if self.sender_gate and (self.gate_max_gap is None or self.gate_max_gap < 1):
+            # Raise
+            raise ValueError("sender gating needs gate_max_gap, the run's max_gap, at least 1")
         # Features per channel, as for MeterGRU
         self.n_features = int(n_features) if n_features is not None else sd.n_features()
         # A single pair is accepted as a list of one
@@ -814,6 +855,15 @@ class GraphForecaster(nn.Module):
         nodes = nodes / self.node_count.clamp(min=1)[None, :, None]
         # Message passing per example: PyG works on one graph at a time, so batch by stacking independent graphs
         ei, ew = self.batch_edges(B, graph_ids, x.device)
+        # Sender gating: silence the meters without usable history before the layer normalizes the weights
+        if self.sender_gate:
+            # Usable history per window and meter, from the same inputs the encoder read.
+            # In a masked forward the hidden meter's history is already zeroed, so it is found unavailable here.
+            available = sg.history_available(x, self.C, self.gate_max_gap)
+            # A node may send when one of its meters has usable history; a node without a meter keeps sending
+            senders = sg.node_senders(available, self.meter_node, self.node_count)
+            # Weight 0 for every message from a silenced sender; receivers and self-loops are untouched
+            ew = sg.gate_edge_weights(ei, ew, senders)
         # Stacked node features
         mixed = nodes.reshape(B * self.n_nodes, self.hidden)
         # Each layer is one hop, with a residual connection
@@ -1049,7 +1099,7 @@ def residuals(y_hat, y, y_valid):
 # Training
 # -----------------------------------------------------------------------------
 
-def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None, timeline=None, n_features=None):
+def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None, timeline=None, n_features=None, sender_gate=False, gate_max_gap=None):
     """
     Build a model by name: "gru", "gcn", "gat", or "sage". With masked,
     maskable_meters is the list of meter names that may be hidden, fixed
@@ -1059,6 +1109,8 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
     period-to-graph table goes to the model. n_features is the number of
     input features per channel (default: what socal_modeldata builds now,
     5 or 9 with physics inputs on); it is recorded in the run's options.
+    sender_gate turns sender gating on (gcn only) and gate_max_gap is the
+    run's max_gap for its history rule; see socal_sendergate.py.
     """
     # Sizes
     M, C = len(manifest["meters"]), len(manifest["channels"])
@@ -1070,6 +1122,10 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
         if masked:
             # Raise
             raise ValueError("masked mode needs a graph model")
+        # No sender gating for the GRU: it passes no messages
+        if sender_gate:
+            # Raise
+            raise ValueError("sender gating needs a graph model")
         # Build
         return MeterGRU(M, C, hidden, embed, layers, dropout, predict_delta, n_features=n_features)
     # Time-indexed: the graphs come from the timeline
@@ -1113,7 +1169,7 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
         # Flags
         maskable = [m in maskable_meters for m in manifest["meters"]]
     # Build
-    return GraphForecaster(kind, M, C, len(graphs[0]["nodes"]), meter_node, edge_sets, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable, period_graph, n_features=n_features)
+    return GraphForecaster(kind, M, C, len(graphs[0]["nodes"]), meter_node, edge_sets, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable, period_graph, n_features=n_features, sender_gate=sender_gate, gate_max_gap=gate_max_gap)
 
 
 def new_sums():
@@ -1284,18 +1340,20 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
 
 
 # Options that define the experiment; a resumed run must match them
-EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings")
+EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate")
 # Keys added after the first checkpoints were written. A checkpoint without "masked" was not masked, so it
 # compares as False, and a checkpoint without "graph_selection" used one fixed graph, so it compares as "fixed";
 # the other two are compared only when the checkpoint holds them. graph_selection is "fixed" (one graph for
 # every window) or "last_history_slot" (the time-indexed rule)
-LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed", "physics": "none", "n_features": F, "features": list(sd.FEATURES), "physics_scale": None, "angdiff": "none", "angdiff_settings": None}
+LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed", "physics": "none", "n_features": F, "features": list(sd.FEATURES), "physics_scale": None, "angdiff": "none", "angdiff_settings": None, "sender_gate": False}
 # Later keys whose default stands in for a missing saved value instead of skipping the comparison. A checkpoint
 # without "physics" was trained without physics inputs ("none") on the F standard features in their standard order
 # and with no physics divisors, so a run with physics inputs can never resume from it, and the other way round; a
 # physics run whose divisors or feature order differ from the checkpoint's is refused too. The same holds for the
-# neighbor angle inputs ("angdiff", the late files' identity, and "angdiff_settings", the cutoffs and phase map)
-DEFAULTED_KEYS = ("masked", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings")
+# neighbor angle inputs ("angdiff", the late files' identity, and "angdiff_settings", the cutoffs and phase map).
+# A checkpoint without "sender_gate" was trained before sender gating existed, so it compares as False:
+# a gated run can never resume from it, and an ungated run loads it as before
+DEFAULTED_KEYS = ("masked", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate")
 
 
 def save_atomic(body, path):
