@@ -125,6 +125,38 @@
 #   slots, so the comparison isolates aggregation and calibration from
 #   sensor coverage. The channels dropped by the restriction are listed.
 #
+# Sensitivity exclusion (settings["exclude"], the --exclude option, added
+# 2026-11-11 as a labeled sensitivity analysis; the primary results are the
+# full-period results and are not changed by it).
+#   The quiet block holds a real, unlogged change in the grid (July 29 to
+#   about August 10, 2025) that the label-based evaluation counts as false
+#   alarms. The course staff's guidance is to keep that period in the
+#   primary count and to report a sensitivity analysis without it,
+#   separately. The exclusion is a list of [start, end) UTC intervals. With
+#   it given: thresholds, references and the grid threshold are exactly the
+#   ones of the full-period scoring (calibration blocks are untouched, and
+#   an exclusion that touches a calibration or design block raises); the
+#   excluded slots are removed from the monitored slots, so monitored
+#   exposure (slots and days) is recomputed and an excluded slot can be
+#   neither an alarm nor monitored; alarm merging runs separately on each
+#   stretch of kept slots, split at every excluded slot and at every
+#   exclusion boundary that falls between two recorded slots, so no alarm
+#   episode can bridge an exclusion even when no recorded slot lies inside
+#   it (an alarm in progress at the boundary ends there, and one after it
+#   starts fresh); an event episode whose window touches an exclusion is dropped
+#   from scope and listed, and its window is removed from monitoring like a
+#   partly covered episode. The exclusions, the excluded slot counts per
+#   block and the dropped episodes are recorded in the output. With no
+#   exclusion the code path and the output are unchanged. Before a
+#   sensitivity result is written, main_score.py checks its protected
+#   values (thresholds, missing-threshold lists, references, grid
+#   thresholds, calibration assignments, settings other than the exclusion
+#   record) against the saved primary file with protected_mismatches below:
+#   every requested mode with non-empty model and persistence results and
+#   the calibration evidence must be present on both sides (a field missing
+#   from both sides fails), and then every protected value must be the
+#   same; otherwise nothing is written.
+#
 # These are residual-only detections: a meter that goes silent produces no
 # residual and no alarm here. A silence detector from the feature mask is a
 # separate component.
@@ -161,6 +193,11 @@
 #                                         (T,) bool, slots inside the given episodes' windows
 #     alarm_episodes(t, alarm, merge_slots)
 #                                         list of (start, end) timestamps
+#     exclusion_bounds(exclusions)        [(start, end), ...] as UTC Timestamps, checked
+#     exclusion_mask(t, exclusions)       (T,) bool, slots inside any [start, end) exclusion
+#     kept_segments(t, exclusions)        index ranges of the stretches of kept slots, split at every exclusion boundary
+#     alarm_episodes_outside(t, alarm, merge_slots, exclusions)
+#                                         alarm episodes merged within each kept stretch only
 #   Events
 #     load_episodes(path)                 scored events grouped into episodes
 #     episodes_in_scope(episodes, blocks, before, after)
@@ -172,6 +209,11 @@
 #                                         recall interval; conditional precision and F1 intervals
 #     score_source(run_dir, prefix, settings, other_prefix)
 #                                         the whole pipeline for one source, returns a dict
+#   Sensitivity check
+#     evidence_findings(result, side, grid_expected)
+#                                         missing or malformed calibration evidence in one saved result
+#     protected_mismatches(new, primary, modes, ignore_settings)
+#                                         structure, then differences in the values a sensitivity result must share with its primary file
 # =============================================================================
 
 # Standard library: ceilings for the conformal rank
@@ -550,6 +592,92 @@ def alarm_episodes(t, alarm, merge_slots):
     return out
 
 
+def exclusion_bounds(exclusions):
+    """[(start, end), ...] of the exclusion intervals as UTC Timestamps, naive bounds read as UTC, each start before its end."""
+    # Result
+    out = []
+    # Loop over intervals
+    for start, end in exclusions:
+        # Bounds as timestamps
+        s0, e0 = pd.Timestamp(start), pd.Timestamp(end)
+        # Localize naive bounds as UTC
+        s0 = s0.tz_localize("UTC") if s0.tzinfo is None else s0.tz_convert("UTC")
+        # Same for the end
+        e0 = e0.tz_localize("UTC") if e0.tzinfo is None else e0.tz_convert("UTC")
+        # Must be ordered
+        if not s0 < e0:
+            # Raise
+            raise ValueError(f"exclusion start must be before its end: {start} to {end}")
+        # Keep
+        out.append((s0, e0))
+    # Return
+    return out
+
+
+def exclusion_mask(t, exclusions):
+    """(T,) bool: slots that fall inside any of the [start, end) UTC exclusion intervals. Empty list gives all False."""
+    # Timestamps
+    times = pd.to_datetime(t, utc=True)
+    # Start empty
+    mask = np.zeros(len(times), dtype=bool)
+    # Loop over intervals
+    for s0, e0 in exclusion_bounds(exclusions):
+        # Half-open interval
+        mask |= np.asarray((times >= s0) & (times < e0))
+    # Return
+    return mask
+
+
+def kept_segments(t, exclusions):
+    """
+    List of (first, last_plus_one) index ranges of the stretches of kept
+    slots, in order. A stretch ends at an excluded slot, and also where an
+    exclusion boundary falls between two consecutive recorded slots, so two
+    kept slots on opposite sides of an exclusion are never in one stretch
+    even when no recorded slot lies inside it.
+    """
+    # Timestamps
+    times = pd.to_datetime(t, utc=True)
+    # Kept slots
+    kept = ~exclusion_mask(t, exclusions)
+    # None kept
+    if not kept.any():
+        # Empty
+        return []
+    # Side of each slot: how many exclusion ends lie at or before it, so slots across any exclusion differ
+    side = np.zeros(len(times), dtype=np.int64)
+    # Count per slot, compared as timestamps so the time unit does not matter
+    for _, e0 in exclusion_bounds(exclusions):
+        # Add
+        side += np.asarray(times >= e0, dtype=np.int64)
+    # A stretch breaks where the kept flag changes or the side changes
+    breaks = np.flatnonzero((kept[1:] != kept[:-1]) | (side[1:] != side[:-1])) + 1
+    # Stretch bounds
+    bounds = np.concatenate(([0], breaks, [len(kept)]))
+    # Kept stretches only
+    return [(int(a), int(b)) for a, b in zip(bounds[:-1], bounds[1:]) if kept[a]]
+
+
+def alarm_episodes_outside(t, alarm, merge_slots, exclusions):
+    """
+    Alarm episodes merged within each stretch of kept slots only, so no
+    episode can bridge an exclusion. Excluded slots are never alarms. With
+    no exclusions this is exactly alarm_episodes on the whole table.
+    """
+    # No exclusions: the unchanged path
+    if not exclusions:
+        # Whole table
+        return alarm_episodes(t, alarm, merge_slots)
+    # Episodes
+    out = []
+    # Each kept stretch on its own
+    for a, b in kept_segments(t, exclusions):
+        # Merge inside the stretch
+        out.extend(alarm_episodes(t[a:b], alarm[a:b], merge_slots))
+    # Return
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Events
 # -----------------------------------------------------------------------------
@@ -871,6 +999,8 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
     restrict = bool(settings.get("restrict_common", False))
     # Events
     episodes = load_episodes(settings["events"])
+    # Sensitivity exclusion intervals, [start, end) UTC; empty by default
+    exclusions = list(settings.get("exclude", []) or [])
     # Test tables, every requested prefix must have at least one
     labels = [lab for p in settings["test_prefixes"] for lab in list_tables(run_dir, p)]
     # Calibration block per test label
@@ -879,6 +1009,16 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
     calib_labels = sorted(set(calib_of.values()), key=lambda c: (c != settings["calib_label"], c))
     # Every calibration block must be held out of training; record the splits identity
     splits_files = {c: check_held_out(run_dir, c) for c in calib_labels}
+    # An exclusion must not touch a calibration block or the design block: thresholds and references stay those of the full-period scoring
+    for c in list(calib_labels) + ([settings["design_label"]] if (use_grid or restrict) else []):
+        # Block bounds
+        b0, b1 = label_bounds(c)
+        # Each interval
+        for s0, e0 in exclusion_bounds(exclusions):
+            # Overlap
+            if s0 < b1 and b0 < e0:
+                # Raise
+                raise ValueError(f"exclusion {s0.isoformat()} to {e0.isoformat()} overlaps calibration or design block {c}; the sensitivity analysis keeps calibration unchanged")
     # One calibration per block in use; each gets its own copy of the references, since the restriction edits them
     cal_sets = {}
     # Loop
@@ -921,14 +1061,38 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
     blocks = [(pd.to_datetime(arr["t"][0], utc=True), pd.to_datetime(arr["t"][-1], utc=True)) for _, arr in tables]
     # Episodes fully inside the scored blocks, and those only partly covered
     scoped, partial = episodes_in_scope(episodes, blocks, before, after)
+    # Episodes whose window touches an exclusion leave the scope and are treated like partly covered ones
+    dropped = []
+    # Only with exclusions
+    if exclusions and len(scoped):
+        # Flags
+        touch = np.zeros(len(scoped), dtype=bool)
+        # Each episode
+        for i, (_, e) in enumerate(scoped.iterrows()):
+            # Window bounds
+            w0, w1 = e["first"] - before, e["last"] + after
+            # Each interval
+            for s0, e0 in exclusion_bounds(exclusions):
+                # Touching
+                touch[i] |= bool(w0 < e0 and s0 <= w1)
+        # Record
+        dropped = [{"episode": int(e["episode"]), "first": e["first"].isoformat()} for _, e in scoped[touch].iterrows()]
+        # Their windows join the partial set for monitoring, and they leave the scope
+        partial = pd.concat([partial, scoped[touch]]).reset_index(drop=True)
+        # Scope
+        scoped = scoped[~touch].reset_index(drop=True)
     # Alarms, monitored time, per-block records over all test tables
     alarms, monitored_s, per_block = [], 0.0, []
     # Exceedance counts by available-meter count, grid statistic only: pooled, and per calibration block
     by_avail = {}
     # Per calibration block
     by_avail_cal = {c: {} for c in calib_labels}
+    # Excluded slots over all tables
+    excluded_total = 0
     # Loop over tables
     for label, arr in tables:
+        # Slots inside an exclusion interval, none by default
+        excl = exclusion_mask(arr["t"], exclusions)
         # The calibration set this block uses
         cset = cal_sets[calib_of[label]]
         # Its thresholds and grid
@@ -943,6 +1107,8 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
             mon = monitored_slots(arr, b_thr, settings["mode"], settings["min_meters"])
             # Slots inside a partly covered event window are neither alarms nor monitored
             mon &= ~window_mask(arr["t"], partial, before, after)
+            # Excluded slots are neither alarms nor monitored
+            mon &= ~excl
             # Alarm slots: enough meters firing, and the slot is monitored
             alarm = (score >= settings["min_meters"]) & mon
         # Grid statistic
@@ -951,6 +1117,8 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
             gscore, gavail = grid_scores(arr, b_grid["refs"], settings["mode"], b_grid["need"])
             # Monitored: enough available meters, outside partial windows
             mon = np.isfinite(gscore) & ~window_mask(arr["t"], partial, before, after)
+            # Excluded slots are neither alarms nor monitored
+            mon &= ~excl
             # Alarm: score above this calibration block's threshold
             alarm = mon & (np.nan_to_num(gscore, nan=-np.inf) > b_grid["threshold"])
             # Exceedance by available-meter count, pooled and for this block's calibration set
@@ -967,8 +1135,10 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
                 rec_c = by_avail_cal[calib_of[label]].setdefault(int(a), {"slots": 0, "alarm_slots": 0})
                 # Add
                 rec_c["slots"] += n_sel; rec_c["alarm_slots"] += n_alarm
-        # Episodes
-        eps = alarm_episodes(arr["t"], alarm, settings["merge_slots"])
+        # Episodes, merged within each stretch of kept slots so none bridges an exclusion, with or without recorded slots inside it
+        eps = alarm_episodes_outside(arr["t"], alarm, settings["merge_slots"], exclusions)
+        # Count
+        excluded_total += int(excl.sum())
         # Keep
         alarms.extend(eps)
         # Monitored seconds
@@ -978,7 +1148,8 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         # Per-block record, with its calibration block, the alarm-slot fraction, and the merged-span summary
         per_block.append({"label": label, "calib_label": calib_of[label], "slots": int(len(arr["t"])), "monitored_slots": int(mon.sum()), "alarm_slots": int(alarm.sum()),
                           "alarm_slot_fraction": (float(alarm.sum()) / float(mon.sum())) if mon.sum() else None,
-                          "alarm_episodes": len(eps), "merged_span_median_s": float(np.median(spans)) if spans else None, "merged_span_max_s": float(max(spans)) if spans else None})
+                          "alarm_episodes": len(eps), "merged_span_median_s": float(np.median(spans)) if spans else None, "merged_span_max_s": float(max(spans)) if spans else None,
+                          **({"excluded_slots": int(excl.sum())} if exclusions else {})})
     # Match
     results, unmatched = match(alarms, scoped, before, after)
     # Counts
@@ -1061,6 +1232,9 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         "block_calibration": calib_of,
         # Era rules that matched no test block
         "era_rules_unused": unused_rules,
+        # Sensitivity exclusion, only when given: intervals, excluded slots, episodes dropped from scope
+        **({"exclusions": {"intervals": [[str(a), str(b)] for a, b in exclusions], "excluded_slots": excluded_total, "episodes_dropped": dropped,
+                            "note": "sensitivity analysis: excluded slots removed from monitoring and alarms, calibration unchanged, no alarm episode bridges an exclusion; the full-period results are primary"}} if exclusions else {}),
         # Blocks
         "blocks": per_block,
         # Episodes
@@ -1082,3 +1256,263 @@ def score_source(run_dir, prefix, settings, other_prefix=None):
         # Intervals
         "bootstrap": boot,
     }
+
+
+# -----------------------------------------------------------------------------
+# Sensitivity check
+# -----------------------------------------------------------------------------
+
+def evidence_findings(result, side, grid_expected):
+    """
+    Missing or malformed calibration evidence in one mode/source result,
+    as the saved JSON holds it; side names the file for the message. The
+    protected values can only be compared when both sides carry them, so a
+    field missing from both sides is a finding, not a match. Allowed as the
+    scoring writes them: null thresholds and null coverage for channels
+    without a threshold, empty missing-channel lists, and under the channel
+    statistic a null grid record with null grid fields in the calibration
+    records; under the grid statistic the grid record and those fields are
+    required.
+    """
+    # Findings
+    out = []
+    # Not a record
+    if not isinstance(result, dict) or not result:
+        # Finding
+        return [f"{side}: result record missing or empty"]
+    # Per-channel thresholds of the default block: axes and two (meters x channels) lists
+    thr = result.get("thresholds")
+    # Shape
+    if not isinstance(thr, dict) or not all(isinstance(thr.get(k), list) and thr.get(k) for k in ("meters", "channels", "mag", "ang")):
+        # Finding
+        out.append(f"{side}: thresholds record missing or lacking non-empty meters, channels, mag and ang lists")
+    # Missing-threshold lists of the default block
+    cal = result.get("calibration")
+    # Shape
+    if not isinstance(cal, dict) or not isinstance(cal.get("channels_without_threshold"), dict) or not all(isinstance(cal["channels_without_threshold"].get(k), list) for k in ("mag", "ang")):
+        # Finding
+        out.append(f"{side}: calibration.channels_without_threshold missing or lacking mag and ang lists")
+    # Block-to-calibration map and the per-block labels
+    bc = result.get("block_calibration")
+    # Shape
+    if not isinstance(bc, dict) or not bc:
+        # Finding
+        out.append(f"{side}: block_calibration missing or empty")
+    # Blocks
+    blocks = result.get("blocks")
+    # Shape
+    if not isinstance(blocks, list) or not blocks or not all(isinstance(b, dict) and "label" in b and "calib_label" in b for b in blocks):
+        # Finding
+        out.append(f"{side}: blocks missing, empty, or lacking label and calib_label")
+    # Calibration records: one per block in use, each with its thresholds, missing lists and grid fields
+    cals = result.get("calibrations")
+    # Shape
+    if not isinstance(cals, dict) or not cals:
+        # Finding
+        out.append(f"{side}: calibrations missing or empty")
+    # Each record
+    else:
+        # Must cover exactly the calibration blocks the test blocks use
+        if isinstance(bc, dict) and bc and set(cals) != set(bc.values()):
+            # Finding
+            out.append(f"{side}: calibrations cover {sorted(cals)} but the blocks use {sorted(set(bc.values()))}")
+        # Loop
+        for c, rec in cals.items():
+            # Record
+            if not isinstance(rec, dict):
+                # Finding
+                out.append(f"{side}: calibrations[{c}] is not a record")
+                # Next
+                continue
+            # Always-required fields
+            for f in ("label", "alpha", "channels_without_threshold", "thresholds", "held_out_of_training", "splits_file"):
+                # Missing
+                if f not in rec:
+                    # Finding
+                    out.append(f"{side}: calibrations[{c}].{f} missing")
+            # Thresholds and missing lists in shape
+            if not (isinstance(rec.get("thresholds"), dict) and all(isinstance(rec["thresholds"].get(k), list) and rec["thresholds"].get(k) for k in ("mag", "ang"))):
+                # Finding
+                out.append(f"{side}: calibrations[{c}].thresholds lacking non-empty mag and ang lists")
+            # Missing lists
+            if not (isinstance(rec.get("channels_without_threshold"), dict) and all(isinstance(rec["channels_without_threshold"].get(k), list) for k in ("mag", "ang"))):
+                # Finding
+                out.append(f"{side}: calibrations[{c}].channels_without_threshold lacking mag and ang lists")
+            # Grid fields: present as keys always; non-null under the grid statistic, null under the channel statistic
+            for f in ("grid_threshold", "grid_calibration_coverage", "grid_n_calibration", "grid_channels_without_reference", "grid_channels_at_floor"):
+                # Missing key
+                if f not in rec:
+                    # Finding
+                    out.append(f"{side}: calibrations[{c}].{f} missing")
+                # Null where the grid statistic needs a value
+                elif grid_expected and rec[f] is None:
+                    # Finding
+                    out.append(f"{side}: calibrations[{c}].{f} is null under the grid statistic")
+                # A value where the channel statistic writes null
+                elif not grid_expected and rec[f] is not None:
+                    # Finding
+                    out.append(f"{side}: calibrations[{c}].{f} is set under the channel statistic")
+    # Grid record: required under the grid statistic, null under the channel statistic
+    grid = result.get("grid", "<missing>")
+    # Missing key
+    if grid == "<missing>":
+        # Finding
+        out.append(f"{side}: grid key missing")
+    # Grid statistic
+    elif grid_expected:
+        # Record with references and threshold
+        if not isinstance(grid, dict):
+            # Finding
+            out.append(f"{side}: grid record missing under the grid statistic")
+        # Fields
+        else:
+            # References as non-empty lists, threshold and counts as numbers, channel lists as dicts
+            if not all(isinstance(grid.get(k), list) and grid.get(k) for k in ("ref_mag", "ref_ang")):
+                # Finding
+                out.append(f"{side}: grid.ref_mag and grid.ref_ang must be non-empty lists")
+            # Numbers
+            for f in ("threshold", "calibration_coverage", "n_calibration", "meters_needed"):
+                # Missing or null
+                if not isinstance(grid.get(f), (int, float)) or isinstance(grid.get(f), bool):
+                    # Finding
+                    out.append(f"{side}: grid.{f} missing or not a number")
+            # Channel lists and design settings
+            for f in ("channels_without_reference", "channels_at_floor", "design_label", "ref_percentile", "ref_min_count", "ref_floor_mag", "ref_floor_ang"):
+                # Missing
+                if f not in grid:
+                    # Finding
+                    out.append(f"{side}: grid.{f} missing")
+    # Channel statistic
+    elif grid is not None:
+        # Finding
+        out.append(f"{side}: grid record present under the channel statistic")
+    # Restriction and era bookkeeping keys must exist (null and empty are their usual values)
+    for f in ("restriction", "era_rules_unused"):
+        # Missing
+        if f not in result:
+            # Finding
+            out.append(f"{side}: {f} key missing")
+    # Return
+    return out
+
+
+def protected_mismatches(new, primary, modes, ignore_settings=("exclude", "exclude_note")):
+    """
+    Compare a sensitivity result (the dict main_score.py is about to write,
+    after its JSON cleaning) with the saved primary result it must agree
+    with. First the structure: both files must hold a settings record,
+    every requested mode with a non-empty model and persistence result, and
+    in every such result the calibration evidence that evidence_findings
+    requires (a field missing from both sides fails). Then the values: the
+    settings other than the exclusion record, and per mode and source the
+    thresholds, the missing-threshold lists, every calibration record's
+    thresholds and grid threshold, the grid references and grid threshold,
+    and the calibration assignment of every block. Returns a list of
+    findings, each naming the mode, source and field; an empty list means
+    every protected value is present on both sides and the same. Nothing
+    is substituted.
+    """
+    # Findings
+    out = []
+    # Settings records
+    a_set, b_set = new.get("settings"), primary.get("settings")
+    # Both must exist
+    for side, rec in (("sensitivity", a_set), ("primary", b_set)):
+        # Missing
+        if not isinstance(rec, dict) or not rec:
+            # Finding
+            out.append(f"{side} file has no settings record")
+    # Compare settings when both exist
+    if isinstance(a_set, dict) and isinstance(b_set, dict):
+        # Without the exclusion record
+        a = {k: v for k, v in a_set.items() if k not in ignore_settings}
+        # Every key on either side
+        for k in sorted(set(a) | set(b_set)):
+            # Differ or missing
+            if k not in a or k not in b_set or a[k] != b_set[k]:
+                # Finding
+                out.append(f"settings.{k}: sensitivity {a.get(k, '<missing>')!r} against primary {b_set.get(k, '<missing>')!r}")
+    # The statistic decides which calibration evidence is required
+    grid_expected = isinstance(a_set, dict) and a_set.get("statistic") == "grid"
+    # Protected fields of a result, top level
+    top = ["thresholds", "block_calibration", "era_rules_unused", "restriction"]
+    # Protected fields inside calibration records
+    cal_fields = ["label", "alpha", "channels_without_threshold", "thresholds", "grid_threshold", "grid_calibration_coverage", "grid_n_calibration",
+                  "grid_channels_without_reference", "grid_channels_at_floor", "restriction", "held_out_of_training", "splits_file"]
+    # Protected fields of the grid record
+    grid_fields = ["design_label", "ref_percentile", "ref_min_count", "ref_floor_mag", "ref_floor_ang", "ref_mag", "ref_ang",
+                   "channels_without_reference", "channels_at_floor", "threshold", "calibration_coverage", "n_calibration", "meters_needed"]
+    # Mode tables
+    a_modes = new.get("modes") if isinstance(new.get("modes"), dict) else {}
+    # Primary
+    b_modes = primary.get("modes") if isinstance(primary.get("modes"), dict) else {}
+    # Every requested mode
+    if not modes:
+        # Finding
+        out.append("no modes requested for the check")
+    # Loop
+    for mode in modes:
+        # Sources
+        for src in ("model", "persistence"):
+            # Records
+            r = a_modes.get(mode, {}).get(src) if isinstance(a_modes.get(mode), dict) else None
+            # Primary
+            p = b_modes.get(mode, {}).get(src) if isinstance(b_modes.get(mode), dict) else None
+            # Missing or empty on either side
+            missing = [name for name, rec in (("sensitivity", r), ("primary", p)) if not isinstance(rec, dict) or not rec]
+            # Finding
+            if missing:
+                # Record
+                out.append(f"{mode}/{src}: required mode/source missing or empty in the {' and '.join(missing)} result")
+                # Next
+                continue
+            # Evidence on both sides before any value is compared
+            evidence = evidence_findings(r, f"{mode}/{src} sensitivity", grid_expected) + evidence_findings(p, f"{mode}/{src} primary", grid_expected)
+            # Stop here for this pair
+            if evidence:
+                # Record
+                out.extend(evidence)
+                # Next
+                continue
+            # Top-level fields
+            for f in top:
+                # Differ
+                if r.get(f, "<missing>") != p.get(f, "<missing>"):
+                    # Finding
+                    out.append(f"{mode}/{src}: {f} differs from the primary file")
+            # Version-1 calibration record of the default block
+            if r["calibration"]["channels_without_threshold"] != p["calibration"]["channels_without_threshold"]:
+                # Finding
+                out.append(f"{mode}/{src}: calibration.channels_without_threshold differs from the primary file")
+            # Calibration records, every block in use
+            rc, pc = r["calibrations"], p["calibrations"]
+            # Same set of blocks
+            if set(rc) != set(pc):
+                # Finding
+                out.append(f"{mode}/{src}: calibration blocks {sorted(rc)} against primary {sorted(pc)}")
+            # Fields of the shared ones
+            for c in sorted(set(rc) & set(pc)):
+                # Each field
+                for f in cal_fields:
+                    # Differ
+                    if rc[c].get(f, "<missing>") != pc[c].get(f, "<missing>"):
+                        # Finding
+                        out.append(f"{mode}/{src}: calibrations[{c}].{f} differs from the primary file")
+            # Grid record under the grid statistic
+            if grid_expected:
+                # Each field
+                for f in grid_fields:
+                    # Differ
+                    if r["grid"].get(f, "<missing>") != p["grid"].get(f, "<missing>"):
+                        # Finding
+                        out.append(f"{mode}/{src}: grid.{f} differs from the primary file")
+            # Calibration label of every block
+            rb = {b["label"]: b["calib_label"] for b in r["blocks"]}
+            # Primary
+            pb = {b["label"]: b["calib_label"] for b in p["blocks"]}
+            # Differ
+            if rb != pb:
+                # Finding
+                out.append(f"{mode}/{src}: per-block calibration labels differ from the primary file")
+    # Return
+    return out

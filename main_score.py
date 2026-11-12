@@ -35,12 +35,40 @@
 #              blocks and an overlap raises. The version and freeze date
 #              are recorded in the JSON; write version 2 to its own file.
 #
+#              Sensitivity exclusion (--exclude START END, added
+#              2026-11-11, repeatable). A labeled sensitivity analysis that
+#              removes the given [START, END) interval from monitoring and
+#              alarms on the test blocks, keeps every threshold and
+#              reference of the full-period scoring, recomputes monitored
+#              exposure and merges alarms only within kept stretches, so no
+#              alarm bridges the exclusion. Naive timestamps are read in
+#              fixed Pacific Standard Time (UTC minus 8 hours), the
+#              project's block convention; timestamps with an offset are
+#              used as given. The intervals are recorded in the JSON in
+#              UTC. The output must go to a file of its own: any --out
+#              that resolves to one of the four primary files in the run
+#              folder (score.json, score_grid.json, score_era.json,
+#              score_grid_era.json, by resolved path, so ./score.json and
+#              an absolute path count) is refused with --exclude, so the
+#              primary results cannot be overwritten. Before a sensitivity
+#              result is written it is checked against the saved primary
+#              file of the same statistic and version (--primary, by
+#              default that file in the run folder): the thresholds,
+#              missing-threshold lists, references, grid thresholds,
+#              calibration assignments and every setting other than the
+#              exclusion record must be present on both sides and
+#              identical, for every requested mode (magnitude and angle at
+#              least) and both sources, or nothing is written and the
+#              differences are printed. Without --exclude nothing changes.
+#
 # Usage:
 #   python main_score.py --run-dir data/processed/models/gru_full_aw001
 #   python main_score.py --run-dir /content/drive/MyDrive/socal_runs/gcn_full_aw001 --events /content/features/events.csv
 #   python main_score.py --run-dir ... --modes mag ang both --alpha 1e-4 --min-meters 2
 #   Version 2, per-era calibration, on a run trained with splits_v2.json:
 #     python main_score.py --run-dir ... --era-calib test_events_2023=validation_2023-11-01_2023-11-14 --out score_era.json
+#   Sensitivity analysis without the July 29 to August 10, 2025 period (fixed PST), to its own file, checked against score.json:
+#     python main_score.py --run-dir ... --exclude 2025-07-29T00:00 2025-08-11T00:00 --out score_sens.json
 #   Options: python main_score.py --help
 #
 # Output:
@@ -51,6 +79,10 @@
 #
 # Functions:
 #   parse_args()        command-line options with defaults, checked for sense
+#   protected_name(run_dir, out)
+#                       the primary file name that --out resolves to, or None
+#   primary_name(statistic, era_calib)
+#                       the primary file name of a statistic and version
 #   clean(obj)          replace NaN and infinities with None so the JSON is standard
 #   line(name, r)       one summary line for the table
 #   main()              score the model and persistence in each mode, print, write
@@ -64,6 +96,8 @@ import json
 import os
 # Standard library: finite checks for the JSON cleaning
 import math
+# Third party: timestamps for the exclusion option
+import pandas as pd
 # Project: the scoring method
 import socal_score as ss
 
@@ -116,8 +150,48 @@ def parse_args():
     parser.add_argument("--out", default="score.json", help="JSON file name written into the run folder")
     # Scoring version 2: per-era calibration rules
     parser.add_argument("--era-calib", nargs="*", default=[], metavar="PREFIX=CALIB_LABEL", help="Version 2: test blocks whose label starts with PREFIX are calibrated on CALIB_LABEL instead of --calib-label; e.g. test_events_2023=validation_2023-11-01_2023-11-14")
+    # Sensitivity exclusion intervals, repeatable, [START, END), naive times in fixed PST
+    parser.add_argument("--exclude", nargs=2, action="append", default=[], metavar=("START", "END"), help="Sensitivity analysis: remove the [START, END) interval from monitoring and alarms, calibration unchanged; naive times are fixed PST (UTC-8); repeatable; needs --out other than the four primary files")
+    # The saved primary file a sensitivity result is checked against
+    parser.add_argument("--primary", default=None, help="With --exclude: the saved primary file whose protected values the sensitivity result must match; default is the primary file of the same statistic and version in the run folder")
     # Parse
     args = parser.parse_args()
+    # Exclusion intervals to UTC strings
+    exclusions = []
+    # Loop
+    for start, end in args.exclude:
+        # Parse both
+        try:
+            # Timestamps
+            s0, e0 = pd.Timestamp(start), pd.Timestamp(end)
+        # Unreadable
+        except (ValueError, TypeError):
+            # Reject
+            parser.error(f"--exclude needs two timestamps, got {start} {end}")
+        # Naive means fixed PST, which is UTC minus 8 hours all year
+        s0 = (s0 + pd.Timedelta(hours=8)).tz_localize("UTC") if s0.tzinfo is None else s0.tz_convert("UTC")
+        # End
+        e0 = (e0 + pd.Timedelta(hours=8)).tz_localize("UTC") if e0.tzinfo is None else e0.tz_convert("UTC")
+        # Ordered
+        if not s0 < e0:
+            # Reject
+            parser.error(f"--exclude start must be before end: {start} {end}")
+        # Keep as ISO strings in UTC
+        exclusions.append([s0.isoformat(), e0.isoformat()])
+    # Store
+    args.exclude = exclusions
+    # The primary files are never written by a sensitivity run, whatever path spelling names them
+    if args.exclude and protected_name(args.run_dir, args.out) is not None:
+        # Reject
+        parser.error(f"--exclude writes a sensitivity file; --out resolves to the primary file {protected_name(args.run_dir, args.out)}, got {args.out}")
+    # The primary check needs --exclude
+    if args.primary is not None and not args.exclude:
+        # Reject
+        parser.error("--primary is only used with --exclude")
+    # A sensitivity run scores magnitude and angle, both checked against the primary file
+    if args.exclude and not {"mag", "ang"} <= set(args.modes):
+        # Reject
+        parser.error(f"--exclude needs --modes to include mag and ang, got {args.modes}")
     # Era rules: "prefix=label" pairs, non-empty, no duplicate prefix
     rules = []
     # Loop
@@ -189,6 +263,26 @@ def parse_args():
     return args
 
 
+def protected_name(run_dir, out):
+    """The primary file name (score.json, score_grid.json, score_era.json or score_grid_era.json) that --out resolves to inside the run folder, or None."""
+    # Resolved destination, relative names inside the run folder as main writes them
+    dest = os.path.realpath(os.path.join(run_dir, out))
+    # Each primary file
+    for name in ("score.json", "score_grid.json", "score_era.json", "score_grid_era.json"):
+        # Same resolved file
+        if dest == os.path.realpath(os.path.join(run_dir, name)):
+            # Name
+            return name
+    # None
+    return None
+
+
+def primary_name(statistic, era_calib):
+    """The primary file name of a statistic and scoring version: score.json, score_grid.json (grid), score_era.json (version 2), score_grid_era.json (both)."""
+    # Name
+    return "score" + ("_grid" if statistic == "grid" else "") + ("_era" if era_calib else "") + ".json"
+
+
 def clean(obj):
     """Walk a nested result and turn NaN and infinities into None, so json.dump writes null."""
     # Dictionaries
@@ -244,6 +338,8 @@ def main():
         "scoring_version": 2 if args.era_calib else 1,
         "scoring_version_date": "2026-11-06" if args.era_calib else "2026-11-05",
         "scoring_note": ("version 2, per-era calibration: retrospective, the calibration blocks follow the events of their era in time; the quiet block's result is the version-1 result reused" if args.era_calib else "version 1, one calibration block for every test block"),
+        # Sensitivity exclusion, recorded only when given so the frozen settings layout is unchanged otherwise
+        **({"exclude": args.exclude, "exclude_note": "sensitivity analysis: the listed [start, end) UTC intervals are removed from monitoring and alarms on the test blocks; calibration unchanged; no alarm episode bridges an exclusion; the full-period results are primary"} if args.exclude else {}),
     }
     # Results per mode
     out = {"run_dir": os.path.abspath(args.run_dir), "settings": settings, "modes": {}}
@@ -251,6 +347,10 @@ def main():
     print(f"scoring version {settings['scoring_version']} ({settings['scoring_version_date']}): {settings['scoring_note']}")
     # Statistic line
     print(f"statistic: {args.statistic}" + (" (exploratory; references from the design block, one threshold from the calibration block)" if args.statistic == "grid" else " (primary)") + ("; restricted to channels with both a threshold and a reference (sensitivity analysis)" if args.restrict_common else ""))
+    # Exclusion line
+    if args.exclude:
+        # Say
+        print("sensitivity analysis: excluding " + "; ".join(f"[{a}, {b})" for a, b in args.exclude) + " from monitoring and alarms; calibration unchanged; full-period results remain primary")
     # Header
     print(f"{'source / mode':<22} {'det':>7} {'FA/day':>8} {'prec':>7} {'recall':>7}{'':<14} {'F1':>7} {'delay s':>8}")
     # Loop over modes
@@ -271,6 +371,10 @@ def main():
             if model["era_rules_unused"]:
                 # Say so
                 print(f"  WARNING: era rules that matched no test block: {model['era_rules_unused']}")
+        # Exclusion record, once per mode
+        if model.get("exclusions") is not None:
+            # Print
+            print(f"  excluded slots over the test blocks: {model['exclusions']['excluded_slots']}; episodes dropped from scope: {[d['episode'] for d in model['exclusions']['episodes_dropped']] or 'none'}")
         # Print
         print(line(f"model / {mode}", model))
         # Print
@@ -313,6 +417,34 @@ def main():
             print(f"  (model, calibration {c}: no threshold for {len(miss['mag'])} mag and {len(miss['ang'])} ang channels; coverage mag {g(rec['coverage_mag_mean'])} ang {g(rec['coverage_ang_mean'])}" + (f"; grid threshold {g(rec['grid_threshold'], 3)}, coverage {g(rec['grid_calibration_coverage'])}" if rec["grid_threshold"] is not None else "") + ")")
     # Path
     path = os.path.join(args.run_dir, args.out)
+    # The result as it will be written: NaN to null, timestamps to strings, as the primary file was written
+    final = json.loads(json.dumps(clean(out), default=str, allow_nan=False))
+    # A sensitivity result is checked against its saved primary file before anything is written
+    if args.exclude:
+        # Primary file: given, or the one of this statistic and version in the run folder
+        primary_path = args.primary if args.primary is not None else os.path.join(args.run_dir, primary_name(args.statistic, args.era_calib))
+        # Say
+        print(f"\nchecking protected values against the primary file {primary_path}")
+        # Must exist, nothing is substituted
+        if not os.path.isfile(primary_path):
+            # Refuse
+            raise SystemExit(f"FAIL: primary file {primary_path} not found; the sensitivity result was not written")
+        # Load
+        with open(primary_path) as f:
+            # Saved result
+            primary = json.load(f)
+        # Differences
+        findings = ss.protected_mismatches(final, primary, args.modes)
+        # Any difference refuses the write
+        if findings:
+            # Each
+            for item in findings:
+                # Print
+                print(f"FAIL  {primary_path}: {item}")
+            # Refuse
+            raise SystemExit(f"FAIL: {len(findings)} protected value(s) differ from {primary_path}; the sensitivity result was not written")
+        # Say
+        print(f"PASS  protected values identical to {primary_path} for modes {list(out['modes'])}, model and persistence")
     # Write, with no NaN allowed so the file is standard JSON
     with open(path, "w") as f:
         # Pretty JSON, timestamps as strings
