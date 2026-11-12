@@ -42,6 +42,11 @@
 #              meter's history, so inference runs on all meters and only
 #              the chosen channel is printed. The GRU forecasts the chosen
 #              meter alone.
+#              The check rebuilds the model from the run's saved options.
+#              A run trained with sender gating is rebuilt with it. A
+#              masked run or a run on a time-indexed graph is refused:
+#              this check forecasts with one fixed graph and no mask, so
+#              it could not rebuild such a run as it was trained.
 #
 #              Single file on purpose: it is a check, not pipeline code.
 #              Lives in checks/ and is run from the repo root. Needs torch,
@@ -129,10 +134,16 @@ def load_run(run_dir, manifest, graph_path, device):
     body = torch.load(os.path.join(run_dir, "checkpoint.pt"), map_location=device, weights_only=False)
     # Options
     options = body["options"]
+    # This check forecasts with one fixed graph and no mask. A run it cannot rebuild as trained is refused, never rebuilt as something else.
+    if options.get("masked") or options.get("graph_selection", "fixed") != "fixed":
+        # Raise
+        raise ValueError(f"{run_dir}: this check handles ordinary fixed-graph runs only; the run has masked {options.get('masked')} and graph_selection {options.get('graph_selection', 'fixed')}")
+    # Sender gating as saved. A run saved before the option existed has no such key and was not gated.
+    gated = bool(options.get("sender_gate", False))
     # Graph for the graph models
     graph = sm.load_graph(graph_path) if options["kind"] != "gru" else None
     # Model as trained
-    model = sm.make_model(options["kind"], manifest, graph, edges=options["edges"], edge_weights=options["edge_weights"], hidden=options["hidden"], embed=options["embed"], layers=options["layers"], dropout=options["dropout"], heads=options["heads"], seed=options["seed"], gnn_layers=options["gnn_layers"], predict_delta=options["predict_delta"]).to(device)
+    model = sm.make_model(options["kind"], manifest, graph, edges=options["edges"], edge_weights=options["edge_weights"], hidden=options["hidden"], embed=options["embed"], layers=options["layers"], dropout=options["dropout"], heads=options["heads"], seed=options["seed"], gnn_layers=options["gnn_layers"], predict_delta=options["predict_delta"], sender_gate=gated, gate_max_gap=options["max_gap"]).to(device)
     # Best weights
     model.load_state_dict(torch.load(os.path.join(run_dir, "checkpoint_best.pt"), map_location=device))
     # Evaluation mode

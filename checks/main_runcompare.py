@@ -68,6 +68,14 @@
 #              controlled comparison between a gated and an ungated
 #              configuration is a different thing and is not refused here.
 #
+#              The mask policy (mask_policy, added 2026-11-12) is handled
+#              the same way. A run saved before the option existed used
+#              the first masked trial's rule, so its absence is read as
+#              "legacy". An ordinary run records "legacy" too, so the key
+#              on one side only is INFO. Runs whose effective policies
+#              differ hide and score different targets and are a FAIL as
+#              seeds of one configuration.
+#
 #              Scoring evidence: main_score.py last changed in commit
 #              81c4857 (authored 2026-11-05 21:55 -0400, which is 2026-11-06
 #              01:55 UTC) and unchanged since; it writes a JSON
@@ -147,9 +155,10 @@ import tempfile
 # The keys the training script logged when the original runs were made (see the header for the commits)
 REQUIRED_KEYS = ["kind", "history", "horizon", "max_gap", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "predict_delta", "edges", "edge_weights", "min_meters", "graph_id", "graph_selection", "masked", "maskable_meters", "mask_chunk", "lr", "weight_decay", "batch_size", "angle_weight", "epochs", "patience", "min_delta", "seed", "train_blocks", "splits_file"]
 # Keys later script revisions added; reported separately, never required
-LATER_KEYS = ["physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate"]
-# Later keys whose absence has a stated meaning: a run saved before sender gating existed did not use it
-ABSENT_MEANS = {"sender_gate": False}
+LATER_KEYS = ["physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate", "mask_policy"]
+# Later keys whose absence has a stated meaning: a run saved before sender gating existed did not use it,
+# and a run saved before the mask policies existed used the first masked trial's rule, "legacy"
+ABSENT_MEANS = {"sender_gate": False, "mask_policy": "legacy"}
 # Files every complete run must have
 REQUIRED_FILES = ["train_log.txt", "scale.json", "checkpoint_best.pt"]
 # Score files with the statistic and scoring version each must carry
@@ -760,6 +769,11 @@ SELF_TEST_CASES = [
     ("sender_gate True on the reference, absent on candidate 1", 1, "gcn_dyn_aw001_s1: option sender_gate: reference True, candidate False", [{"options": {"sender_gate": True}}, {}, {"options": {"sender_gate": True}}]),
     ("sender_gate True on all three", 0, "training compatibility: pass", [{"options": {"sender_gate": True}}] * 3),
     ("sender_gate False on all three", 0, "training compatibility: pass", [{"options": {"sender_gate": False}}] * 3),
+    ("mask_policy legacy recorded on candidate 1 only", 0, "mask_policy recorded on candidate only; absent is read as legacy, so both sides are legacy", [{}, {"options": {"mask_policy": "legacy"}}, {}]),
+    ("mask_policy legacy on all three", 0, "training compatibility: pass", [{"options": {"mask_policy": "legacy"}}] * 3),
+    ("mask_policy available_neighbor on all three", 0, "training compatibility: pass", [{"options": {"mask_policy": "available_neighbor"}}] * 3),
+    ("mask_policy available_neighbor on candidate 2, absent on the reference", 1, "option mask_policy: reference legacy, candidate available_neighbor", [{}, {}, {"options": {"mask_policy": "available_neighbor"}}]),
+    ("mask_policy available_neighbor on the reference, legacy on candidate 1", 1, "gcn_dyn_aw001_s1: option mask_policy: reference available_neighbor, candidate legacy", [{"options": {"mask_policy": "available_neighbor"}}, {"options": {"mask_policy": "legacy"}}, {"options": {"mask_policy": "available_neighbor"}}]),
 ]
 
 

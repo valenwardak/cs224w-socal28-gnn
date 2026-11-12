@@ -34,6 +34,11 @@
 #              graph. Prints PASS, FAIL, or NOTE per check and exits with 1
 #              on any failure. Checks 2 and 3 are about trained weights, so
 #              run this on a trained run; check 1 holds for any weights.
+#              The model is rebuilt with the run's saved sender gating and
+#              mask policy (a run saved before those options existed was
+#              not gated and used the legacy policy). A masked run on a
+#              time-indexed graph is refused here, since this check reads
+#              one edge set; checks/main_maskedtimeline.py covers that path.
 #
 #              Single file on purpose: it is a check, not pipeline code.
 #              Lives in checks/ and is run from the repo root.
@@ -123,6 +128,10 @@ def load_run(args):
     if not options.get("masked"):
         # Raise
         raise ValueError("this run was not trained with --masked")
+    # This check reads one edge set, so a run on a time-indexed graph is refused, never checked against the wrong edges
+    if options.get("graph_selection", "fixed") != "fixed":
+        # Raise
+        raise ValueError(f"this check handles fixed-graph masked runs only; the run has graph_selection {options.get('graph_selection')}. Use checks/main_maskedtimeline.py for the time-indexed path")
     # The graph file must be the one the run used, else the rebuilt buffers would not match the weights
     if options.get("graph_id") != graph_identity(args.graph):
         # Raise
@@ -136,7 +145,7 @@ def load_run(args):
         # Parse
         manifest = json.load(f)
     # Model as the run built it
-    model = sm.make_model(options["kind"], manifest, graph, edges=options["edges"], edge_weights=options["edge_weights"], hidden=options["hidden"], embed=options["embed"], layers=options["layers"], dropout=options["dropout"], seed=options["seed"], gnn_layers=options["gnn_layers"], predict_delta=options["predict_delta"], masked=True, maskable_meters=options["maskable_meters"])
+    model = sm.make_model(options["kind"], manifest, graph, edges=options["edges"], edge_weights=options["edge_weights"], hidden=options["hidden"], embed=options["embed"], layers=options["layers"], dropout=options["dropout"], seed=options["seed"], gnn_layers=options["gnn_layers"], predict_delta=options["predict_delta"], masked=True, maskable_meters=options["maskable_meters"], sender_gate=bool(options.get("sender_gate", False)), gate_max_gap=options["max_gap"], mask_policy=options.get("mask_policy", "legacy"))
     # Best weights
     model.load_state_dict(torch.load(os.path.join(args.run_dir, "checkpoint_best.pt"), map_location="cpu"))
     # Evaluation mode

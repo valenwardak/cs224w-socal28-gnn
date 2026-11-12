@@ -86,7 +86,8 @@
 #              every call (cached=False). With a fixed graph file nothing
 #              changes: one edge set, graph_ids None, the same tensors and
 #              the same state_dict keys as before, so older checkpoints load.
-#              Masked mode with a time-indexed graph is refused for now.
+#              Masked mode runs on a time-indexed graph under the mask
+#              policy available_neighbor (see "Mask policy" below).
 #
 # Sender gating (--sender-gate, added 2026-11-12 after the graph
 #              diagnostics): off by default, so every earlier run and
@@ -100,7 +101,8 @@
 #              self-loop and still receives. In masked mode the hidden
 #              meter's history is zeroed first, so it is silenced as a
 #              sender by the same rule and keeps its incoming messages.
-#              Masked mode itself is still for a fixed graph only. The
+#              Masked mode runs on a time-indexed graph under the mask
+#              policy available_neighbor (see "Mask policy" below). The
 #              graph file and the edge sets are unchanged. The helper
 #              functions are in socal_sendergate.py. GCN only: attention
 #              and the neighbor mean would change differently and are not
@@ -108,6 +110,35 @@
 #              buffer, so the state_dict keys are the same with it on or
 #              off. A checkpoint saved before the option existed compares
 #              as sender_gate False.
+#
+# Mask policy (--mask-policy, added 2026-11-12): which meters may be
+#              hidden in a window in masked mode. "legacy" is the rule
+#              of the first masked trial and the default, so that
+#              trial's checkpoints load and behave as they did: a
+#              permitted meter with a valid target, on a fixed graph
+#              only. "available_neighbor" is the rule the reviewers
+#              agreed on after the graph diagnostics: a permitted meter
+#              with a valid target and at least one neighbor that has
+#              usable history in the window, under the edge set in
+#              force for the window. The hidden meter's own history
+#              need not be usable, since it is blanked out anyway. The
+#              neighbors come from the graph file's own edges, never
+#              from the edges messages pass over, so the no-edge
+#              control hides and scores the same targets as the wired
+#              models. This policy works on a fixed and on a
+#              time-indexed graph: the mask blanks a meter's history
+#              and graph_ids picks each window's edge set. It needs the
+#              window dataset to hand out unfiltered target validity
+#              (raw_targets); the persistence baseline keeps the usual
+#              filter, rebuilt from the inputs, so its residual tables
+#              do not change. Hiding a meter does not make its
+#              neighbors the only source of information: its embedding
+#              and the shared weights remain, which is why a matched
+#              no-edge masked run is the comparison. The rule lives in
+#              socal_maskpolicy.py. It adds no saved buffer and no
+#              parameter, so the state_dict keys are the same under
+#              either policy. A checkpoint saved before the option
+#              existed compares as mask_policy "legacy".
 #
 # Batches:     assembled in bulk with array indexing (get_batch on the
 #              datasets, iter_batches below), not one example at a time,
@@ -195,8 +226,9 @@
 #                                     and per-example edge sets for the time-indexed graph
 #     persistence_forecast(x, C)      last valid reading as the forecast, with validity
 #     strip_extra(x, n_channels)      zero the added features (physics or neighbor angles) in masked mode, so the hidden meter does not leak through them
-#     draw_masks(y_valid, maskable)   one hidden meter per window for training
-#     masked_forecast(model, x, chunk)
+#     draw_masks(y_valid, maskable, eligible)
+#                                     one hidden meter per window for training
+#     masked_forecast(model, x, chunk, graph_ids)
 #                                     every maskable meter hidden in turn, for evaluation and scoring
 #   Loss and metrics
 #     masked_loss(y_hat, y, y_valid, angle_weight)
@@ -206,6 +238,7 @@
 #     make_model(kind, ...)           build a model by name, masked or not
 #     run_batches(...)                one pass over a batch iterator, accumulates error sums
 #     pooled(sums)                    pooled losses from the sums
+#     wants_raw_targets(model)        whether the model needs unfiltered target validity (available_neighbor mask policy)
 #     make_dataset(...)               the right dataset kind for one piece
 #     evaluate(...)                   pooled loss on a split, plus per meter
 #     train(...)                      epochs over the train split, early stopping, checkpoints
@@ -236,6 +269,8 @@ import socal_modeldata as sd
 import socal_metergraph as smg
 # Project: sender gating, the rule that silences meters without usable history
 import socal_sendergate as sg
+# Project: which meters may be hidden in masked forecasting (masked mode on any graph)
+import socal_maskpolicy as mp
 
 # Feature count per channel, from the data module
 F = sd.F
@@ -253,6 +288,9 @@ class GraphWindowDataset:
       y        (M, C, 3)             every meter's target
       y_valid  (M, C, 2)             target validity, zeroed for meters whose
                                      history fails the gap rule in this window
+                                     (with raw_targets the validity is handed
+                                     out unfiltered, for the available_neighbor
+                                     mask policy; see socal_maskpolicy.py)
     A window is kept when at least min_meters meters pass the gap rule and
     have a valid target. The per-meter rule is the same one WindowDataset
     uses, so the GRU and the GNNs train on the same target slots; the
@@ -267,9 +305,12 @@ class GraphWindowDataset:
     is (B,) target slots, as before.
     """
 
-    def __init__(self, X, mag_valid, ang_valid, history, horizon, max_gap, min_meters=1, t=None, timeline=None):
+    def __init__(self, X, mag_valid, ang_valid, history, horizon, max_gap, min_meters=1, t=None, timeline=None, raw_targets=False):
         # Keep the arrays
         self.X, self.history, self.horizon = X, history, horizon
+        # Whether y_valid is handed out unfiltered. Off by default, so every existing run is unchanged.
+        # The available_neighbor mask policy turns it on: a hidden meter's target counts even when its own history has a gap.
+        self.raw_targets = bool(raw_targets)
         # Sizes
         T, M, C, _ = X.shape
         # Targets: scaled magnitude, cos, sin
@@ -305,8 +346,8 @@ class GraphWindowDataset:
         target = s + self.history + self.horizon - 1
         # History, channels and features flattened per meter
         x = self.X[s:s + self.history].reshape(self.history, self.X.shape[1], -1)
-        # Validity, zeroed for meters that fail the gap rule in this window
-        y_valid = self.y_valid[target] & self.usable[i][:, None, None]
+        # Validity, zeroed for meters that fail the gap rule in this window, unless the unfiltered validity was asked for
+        y_valid = self.y_valid[target] if self.raw_targets else self.y_valid[target] & self.usable[i][:, None, None]
         # Extra: target slot, with the period when time-indexed
         extra = int(target) if self.period is None else np.array([target, self.period[i]], dtype=np.int64)
         # Return
@@ -329,8 +370,8 @@ class GraphWindowDataset:
         x = self.X[rows].reshape(len(idx), self.history, self.X.shape[1], -1)
         # Target slots
         target = s + self.history + self.horizon - 1
-        # Validity with the per-meter gap rule applied
-        y_valid = self.y_valid[target] & self.usable[idx][:, :, None, None]
+        # Validity with the per-meter gap rule applied, unless the unfiltered validity was asked for
+        y_valid = self.y_valid[target] if self.raw_targets else self.y_valid[target] & self.usable[idx][:, :, None, None]
         # Extra: target slot alone, or with the period index
         extra = target.astype(np.int64) if self.period is None else np.stack([target.astype(np.int64), self.period[idx]], axis=1)
         # Return
@@ -643,7 +684,7 @@ class GraphForecaster(nn.Module):
     one it always was.
     """
 
-    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_sets, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None, period_graph=None, n_features=None, sender_gate=False, gate_max_gap=None):
+    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_sets, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None, period_graph=None, n_features=None, sender_gate=False, gate_max_gap=None, mask_policy=mp.LEGACY, mask_adjacency=None):
         # Base class
         super().__init__()
         # Sender gating: off unless asked for, so earlier runs are unchanged
@@ -668,10 +709,24 @@ class GraphForecaster(nn.Module):
         if not edge_sets:
             # Raise
             raise ValueError("at least one edge set is required")
-        # Masked mode is for a fixed graph only, for now
-        if masked and len(edge_sets) > 1:
+        # Which meters may be hidden in a window: the rule of the first masked trial, or the available-neighbor rule
+        self.mask_policy = mp.check_policy(mask_policy)
+        # The first trial's rule knows nothing of periods, so it stays with a fixed graph, where its checkpoints were made
+        if masked and len(edge_sets) > 1 and self.mask_policy == mp.LEGACY:
             # Raise
-            raise ValueError("masked mode with a time-indexed graph is not supported yet")
+            raise ValueError("masked mode with a time-indexed graph needs the mask policy available_neighbor")
+        # The available-neighbor rule needs the run's gap length and the graph file's own neighbor matrices
+        if masked and self.mask_policy == mp.AVAILABLE_NEIGHBOR:
+            # The gap length of the history rule
+            if self.gate_max_gap is None or self.gate_max_gap < 1:
+                # Raise
+                raise ValueError("the mask policy available_neighbor needs gate_max_gap, the run's max_gap, at least 1")
+            # One neighbor matrix per edge set, from the file's edges and not from the edges messages pass over
+            if mask_adjacency is None or tuple(mask_adjacency.shape) != (len(edge_sets), n_meters, n_meters):
+                # Raise
+                raise ValueError(f"the mask policy available_neighbor needs mask_adjacency of shape ({len(edge_sets)}, {n_meters}, {n_meters})")
+            # Kept out of the state_dict (persistent False), so the saved weights have the same keys under either policy
+            self.register_buffer("mask_adjacency", torch.as_tensor(mask_adjacency, dtype=torch.bool), persistent=False)
         # Masked mode: hidden meters are forecast from their neighbors, never from persistence
         self.masked = masked
         # Whether the head outputs a correction to the persistence forecast; never in masked mode
@@ -772,6 +827,23 @@ class GraphForecaster(nn.Module):
         # Map
         return table[period_index]
 
+    def mask_eligible(self, x, y_valid, graph_ids=None):
+        """
+        Which meters may be hidden in each window under the
+        available_neighbor policy: (eligible (B, M) bool, lonely (B, M)
+        bool). x is the input before anything is hidden, y_valid the
+        unfiltered target validity, graph_ids the edge set per window
+        (None for a fixed graph). lonely marks permitted meters with a
+        valid target and no neighbor with usable history: they are left
+        out and counted. See socal_maskpolicy.py for the rule.
+        """
+        # Only for a masked model under that policy
+        if not self.masked or self.mask_policy != mp.AVAILABLE_NEIGHBOR:
+            # Raise
+            raise ValueError("mask_eligible is for a masked model with the mask policy available_neighbor")
+        # The rule, with this model's permitted meters, neighbor matrices and gap length
+        return mp.eligible_meters(x, y_valid, self.maskable, self.mask_adjacency, graph_ids, self.C, self.gate_max_gap)
+
     def batch_edges(self, B, graph_ids, device):
         """
         Edges of the B stacked graphs: example b's nodes sit at offset
@@ -817,14 +889,12 @@ class GraphForecaster(nn.Module):
         in the same pass; only the hidden meters' forecasts are neighbor-based.
         graph_ids (B,) long: the edge set each example passes messages
         over, from graph_ids(); None uses graph 0 for every example, the
-        fixed-graph path.
+        fixed-graph path. A mask and graph_ids may be given together:
+        the mask blanks a meter's history, graph_ids picks the edges, and
+        neither depends on the other.
         """
         # Sizes
         B, H, M, _ = x.shape
-        # Masked mode with per-example graphs is refused
-        if mask is not None and graph_ids is not None:
-            # Raise
-            raise ValueError("masked mode with per-example graphs is not supported yet")
         # Hide the masked meters before the encoder, persistence, or anything else sees x
         if mask is not None:
             # Must be in masked mode
@@ -967,7 +1037,7 @@ def strip_extra(x, n_channels):
     return xf.reshape(x.shape)
 
 
-def draw_masks(y_valid, maskable):
+def draw_masks(y_valid, maskable, eligible=None):
     """
     One hidden meter per window for training. y_valid (B, M, C, 2) is the
     target validity before any masking; maskable (M,) bool. A meter is
@@ -975,9 +1045,11 @@ def draw_masks(y_valid, maskable):
     window. One eligible meter is drawn uniformly per example with torch's
     generator (its state is checkpointed). Returns mask (B, M) bool; a
     window with no eligible meter gets an all-False row, so its loss is zero.
+    With eligible (B, M) bool given, that decides which meters may be
+    drawn instead (the available_neighbor policy, from mask_eligible).
     """
-    # Eligible meters: maskable with any valid target
-    eligible = y_valid.any(dim=-1).any(dim=-1) & maskable[None, :]
+    # Eligible meters: maskable with any valid target, unless the caller decided eligibility
+    eligible = (y_valid.any(dim=-1).any(dim=-1) & maskable[None, :]) if eligible is None else eligible.clone()
     # Sampling weights
     weights = eligible.float()
     # Windows with no eligible meter get uniform dummy weights so multinomial does not fail
@@ -996,23 +1068,26 @@ def draw_masks(y_valid, maskable):
     return mask
 
 
-def masked_forecast(model, x, chunk):
+def masked_forecast(model, x, chunk, graph_ids=None):
     """
     Every maskable meter hidden in turn, deterministically. For meters
     m_1 .. m_k in a chunk, the batch is repeated k times, copy j hides
     meter m_j, and the forecast kept for meter m_j is the one from copy j.
     Returns (y_hat (B, M, C, 3), keep (M,) bool) where keep is the model's
     maskable buffer: entries for non-maskable meters are zero and must be
-    treated as invalid by the caller.
+    treated as invalid by the caller. graph_ids (B,) names each example's
+    edge set on a time-indexed graph; every copy of an example keeps its
+    example's edge set. Each copy hides exactly one meter, so no hidden
+    meter's forecast is affected by another meter being hidden.
     """
     # A chunk below one would hide nothing and return zeros marked valid
     if chunk < 1:
         # Raise
         raise ValueError(f"mask chunk must be at least 1, got {chunk}")
-    # Masked evaluation runs on the fixed graph only
-    if getattr(model, "n_graphs", 1) != 1:
+    # A model with several edge sets must be told which one each example uses
+    if getattr(model, "n_graphs", 1) != 1 and graph_ids is None:
         # Raise
-        raise ValueError("masked mode with a time-indexed graph is not supported yet")
+        raise ValueError("masked_forecast on a time-indexed graph needs graph_ids, the edge set of each example")
     # Sizes
     B, H, M, _ = x.shape
     # Meters to hide, in index order
@@ -1031,8 +1106,10 @@ def masked_forecast(model, x, chunk):
         mask = torch.zeros(B * k, M, dtype=torch.bool, device=x.device)
         # Set
         mask[torch.arange(B * k, device=x.device), ms.repeat(B)] = True
+        # Each copy keeps its example's edge set
+        gr = graph_ids.repeat_interleave(k) if graph_ids is not None else None
         # Forward
-        y = model(xr, mask).reshape(B, k, M, model.C, 3)
+        y = model(xr, mask, graph_ids=gr).reshape(B, k, M, model.C, 3)
         # Keep each copy's hidden meter
         out[:, ms] = y[:, torch.arange(k, device=x.device), ms]
     # Return
@@ -1099,7 +1176,7 @@ def residuals(y_hat, y, y_valid):
 # Training
 # -----------------------------------------------------------------------------
 
-def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None, timeline=None, n_features=None, sender_gate=False, gate_max_gap=None):
+def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None, timeline=None, n_features=None, sender_gate=False, gate_max_gap=None, mask_policy=mp.LEGACY):
     """
     Build a model by name: "gru", "gcn", "gat", or "sage". With masked,
     maskable_meters is the list of meter names that may be hidden, fixed
@@ -1111,6 +1188,13 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
     5 or 9 with physics inputs on); it is recorded in the run's options.
     sender_gate turns sender gating on (gcn only) and gate_max_gap is the
     run's max_gap for its history rule; see socal_sendergate.py.
+    mask_policy decides which meters may be hidden in a window:
+    "legacy" (the first masked trial's rule, fixed graph only) or
+    "available_neighbor" (a valid target and a neighbor with usable
+    history; any graph; needs gate_max_gap). Its neighbor matrices are
+    built here from the graph file's own edges, whatever --edges control
+    is in use, so every control hides the same targets; see
+    socal_maskpolicy.py.
     """
     # Sizes
     M, C = len(manifest["meters"]), len(manifest["channels"])
@@ -1130,10 +1214,6 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
         return MeterGRU(M, C, hidden, embed, layers, dropout, predict_delta, n_features=n_features)
     # Time-indexed: the graphs come from the timeline
     if timeline is not None:
-        # Masked mode is refused with a timeline
-        if masked:
-            # Raise
-            raise ValueError("masked mode with a time-indexed graph is not supported yet")
         # Graphs
         graphs = timeline["graphs"]
         # Table
@@ -1168,14 +1248,16 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
             raise ValueError(f"maskable meters not in the manifest: {unknown}")
         # Flags
         maskable = [m in maskable_meters for m in manifest["meters"]]
+    # Neighbor matrices for the available_neighbor policy, from the file's own edges of every edge set
+    mask_adjacency = mp.adjacency_stack(graphs, meter_node.tolist()) if (masked and mp.check_policy(mask_policy) == mp.AVAILABLE_NEIGHBOR) else None
     # Build
-    return GraphForecaster(kind, M, C, len(graphs[0]["nodes"]), meter_node, edge_sets, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable, period_graph, n_features=n_features, sender_gate=sender_gate, gate_max_gap=gate_max_gap)
+    return GraphForecaster(kind, M, C, len(graphs[0]["nodes"]), meter_node, edge_sets, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable, period_graph, n_features=n_features, sender_gate=sender_gate, gate_max_gap=gate_max_gap, mask_policy=mask_policy, mask_adjacency=mask_adjacency)
 
 
 def new_sums():
     """Empty accumulator for pooled losses: squared-error sums and valid counts."""
     # Dictionary
-    return {"mag_se": 0.0, "mag_n": 0.0, "ang_se": 0.0, "ang_n": 0.0, "per_meter_se": {}, "per_meter_n": {}, "skipped_windows": 0}
+    return {"mag_se": 0.0, "mag_n": 0.0, "ang_se": 0.0, "ang_n": 0.0, "per_meter_se": {}, "per_meter_n": {}, "skipped_windows": 0, "masked_no_neighbor": 0}
 
 
 def pooled(sums, angle_weight):
@@ -1196,40 +1278,55 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None, 
     over any number of pieces without batch-size bias. In masked mode,
     training hides one drawn meter per window and counts only its targets;
     evaluation hides every maskable meter in turn (mask_chunk per pass)
-    and counts the targets of maskable meters only.
+    and counts the targets of maskable meters only. Under the
+    available_neighbor mask policy the batches must carry unfiltered
+    target validity (make_dataset with raw_targets), only eligible
+    meters are drawn or counted, and permitted meters left out for want
+    of a neighbor with usable history are added to
+    sums["masked_no_neighbor"].
     """
     # Mode
     model.train(optimizer is not None)
     # Masked model
     masked = getattr(model, "masked", False)
-    # Loop
+    # Whether hidden meters are chosen by the available_neighbor policy
+    neighbor_policy = wants_raw_targets(model)
+    # Loop over batches
     for x, y, y_valid, extra in batches:
         # Time-indexed batch: extra is (B, 2) [target slot, period index]; convert the period to a graph id
         graph_ids = model.graph_ids(extra[:, 1]) if (graph_mode and extra.dim() == 2) else None
-        # Masked mode never takes per-example graphs
-        if masked and graph_ids is not None:
-            # Raise
-            raise ValueError("masked mode with a time-indexed graph is not supported yet")
+        # Under the available_neighbor policy, eligibility comes from the inputs before anything is hidden
+        eligible = None
+        # Compute it once per batch
+        if neighbor_policy:
+            # Eligible meters, and permitted meters left out for want of a neighbor with usable history
+            eligible, lonely = model.mask_eligible(x, y_valid, graph_ids)
+            # Count the ones left out, for the report
+            sums["masked_no_neighbor"] += int(lonely.sum())
         # Masked training: one hidden meter per window, loss on it alone
         if masked and optimizer is not None:
-            # Draw from the validity before masking
-            mask = draw_masks(y_valid, model.maskable)
+            # Draw from the validity before masking, or from the eligible meters under the available_neighbor policy
+            mask = draw_masks(y_valid, model.maskable, eligible)
             # Windows with no eligible meter, counted for the epoch report
             sums["skipped_windows"] += int((~mask.any(dim=1)).sum())
             # A batch with no eligible window at all gets no step: Adam's momentum would still move the weights on a zero gradient
             if not bool(mask.any()):
                 # Next batch
                 continue
-            # Forward with the mask
-            y_hat = model(x, mask)
+            # Forward with the mask, over each window's own edge set
+            y_hat = model(x, mask, graph_ids=graph_ids)
             # Only the hidden meter's targets count
             y_valid = y_valid & mask[:, :, None, None]
         # Masked evaluation: every maskable meter hidden in turn
         elif masked:
-            # Deterministic passes
-            y_hat, keep = masked_forecast(model, x, mask_chunk)
+            # Deterministic passes, over each window's own edge set
+            y_hat, keep = masked_forecast(model, x, mask_chunk, graph_ids)
             # Non-maskable meters have no masked forecast
             y_valid = y_valid & keep[None, :, None, None]
+            # Under the available_neighbor policy only eligible meters are scored
+            if neighbor_policy:
+                # Keep the eligible ones
+                y_valid = y_valid & eligible[:, :, None, None]
         # Ordinary forward
         else:
             # Forward, with the per-example graphs when time-indexed
@@ -1283,14 +1380,20 @@ def run_batches(model, batches, graph_mode, angle_weight, sums, optimizer=None, 
                 sums["per_meter_n"][int(mi)] = sums["per_meter_n"].get(int(mi), 0.0) + float(n)
 
 
-def make_dataset(piece, graph_mode, history, horizon, max_gap, min_meters=1, timeline=None):
-    """The right dataset kind over one block-month piece, or None when it has no window. With a timeline, the synchronized dataset carries period indices."""
+def wants_raw_targets(model):
+    """Whether the model is a masked model under the available_neighbor policy, whose batches must carry unfiltered target validity."""
+    # Masked, and under that policy
+    return bool(getattr(model, "masked", False)) and getattr(model, "mask_policy", mp.LEGACY) == mp.AVAILABLE_NEIGHBOR
+
+
+def make_dataset(piece, graph_mode, history, horizon, max_gap, min_meters=1, timeline=None, raw_targets=False):
+    """The right dataset kind over one block-month piece, or None when it has no window. With a timeline, the synchronized dataset carries period indices. raw_targets hands out unfiltered target validity (graph models only), for the available_neighbor mask policy."""
     # Unpack
     _, _, t, X, mag_valid, ang_valid = piece
     # Dataset
     if graph_mode:
         # Synchronized, time-indexed when a timeline is given
-        ds = GraphWindowDataset(X, mag_valid, ang_valid, history, horizon, max_gap, min_meters, t=t, timeline=timeline)
+        ds = GraphWindowDataset(X, mag_valid, ang_valid, history, horizon, max_gap, min_meters, t=t, timeline=timeline, raw_targets=raw_targets)
     else:
         # Per meter
         ds = sd.WindowDataset(X, mag_valid, ang_valid, history, horizon, max_gap)
@@ -1320,7 +1423,7 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
         # Loop over pieces, with a progress bar that clears when done
         for piece in tqdm(sd.iter_blocks(features_dir, subset, split_name, scale, manifest=manifest), total=n_pieces, desc=f"{split_name} pieces", leave=False):
             # Dataset
-            ds = make_dataset(piece, graph_mode, history, horizon, max_gap, timeline=timeline)
+            ds = make_dataset(piece, graph_mode, history, horizon, max_gap, timeline=timeline, raw_targets=wants_raw_targets(model))
             # Skip empty
             if ds is None:
                 # Next
@@ -1340,20 +1443,23 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
 
 
 # Options that define the experiment; a resumed run must match them
-EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate")
+EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate", "mask_policy")
 # Keys added after the first checkpoints were written. A checkpoint without "masked" was not masked, so it
 # compares as False, and a checkpoint without "graph_selection" used one fixed graph, so it compares as "fixed";
 # the other two are compared only when the checkpoint holds them. graph_selection is "fixed" (one graph for
 # every window) or "last_history_slot" (the time-indexed rule)
-LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed", "physics": "none", "n_features": F, "features": list(sd.FEATURES), "physics_scale": None, "angdiff": "none", "angdiff_settings": None, "sender_gate": False}
+LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed", "physics": "none", "n_features": F, "features": list(sd.FEATURES), "physics_scale": None, "angdiff": "none", "angdiff_settings": None, "sender_gate": False, "mask_policy": mp.LEGACY}
 # Later keys whose default stands in for a missing saved value instead of skipping the comparison. A checkpoint
 # without "physics" was trained without physics inputs ("none") on the F standard features in their standard order
 # and with no physics divisors, so a run with physics inputs can never resume from it, and the other way round; a
 # physics run whose divisors or feature order differ from the checkpoint's is refused too. The same holds for the
 # neighbor angle inputs ("angdiff", the late files' identity, and "angdiff_settings", the cutoffs and phase map).
 # A checkpoint without "sender_gate" was trained before sender gating existed, so it compares as False:
-# a gated run can never resume from it, and an ungated run loads it as before
-DEFAULTED_KEYS = ("masked", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate")
+# a gated run can never resume from it, and an ungated run loads it as before.
+# A checkpoint without "mask_policy" was made before the available_neighbor policy existed, so it compares as
+# "legacy": the first masked trial's checkpoints load and behave as they did, and a run under the new policy
+# can never resume from one of them
+DEFAULTED_KEYS = ("masked", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate", "mask_policy")
 
 
 def save_atomic(body, path):
@@ -1483,7 +1589,7 @@ def train(model, features_dir, splits, scale, manifest, device, options, checkpo
                 # Next
                 continue
             # Dataset, the piece tuple needs the two label slots the function ignores
-            ds = make_dataset((None, None) + piece, graph_mode, options["history"], options["horizon"], options["max_gap"], options.get("min_meters", 1), timeline=timeline)
+            ds = make_dataset((None, None) + piece, graph_mode, options["history"], options["horizon"], options["max_gap"], options.get("min_meters", 1), timeline=timeline, raw_targets=wants_raw_targets(model))
             # Skip empty
             if ds is None:
                 # Next
@@ -1503,7 +1609,7 @@ def train(model, features_dir, splits, scale, manifest, device, options, checkpo
         # Masked mode: windows that had no eligible meter to hide
         if options.get("masked"):
             # Count
-            log(f"  masked: {int(tr['mag_n'])} hidden-meter magnitude targets, {sums['skipped_windows']} windows skipped with no eligible meter")
+            log(f"  masked: {int(tr['mag_n'])} hidden-meter magnitude targets, {sums['skipped_windows']} windows skipped with no eligible meter, {sums['masked_no_neighbor']} permitted meter-windows with a valid target left out for want of a neighbor with usable history (0 under the legacy policy, which does not apply that rule)")
         # Per-meter report, worst three
         worst = sorted(val["per_meter_mag"].items(), key=lambda kv: -kv[1])[:3]
         # Print
@@ -1549,7 +1655,11 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
       <out_dir>/<label>.json     summary: slots scored, median and 99th
         percentile of mag_res and ang_res, options used
     Every slot that is the target of a usable window gets a row; other
-    slots are absent, never written as zero.
+    slots are absent, never written as zero. Under the available_neighbor
+    mask policy a row is written when the model or persistence has a
+    valid residual in either mode, so a window with no eligible hidden
+    meter keeps its persistence residuals; entries that are not valid
+    stay NaN with their validity flag off.
     """
     # Graph models take synchronized batches
     graph_mode = options["kind"] != "gru"
@@ -1568,7 +1678,7 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
         # Loop over pieces
         for label, month, t, X, mag_valid, ang_valid in sd.iter_blocks(features_dir, splits, split_name, scale, manifest=manifest):
             # Dataset, every meter kept so residuals exist wherever a meter is usable
-            ds = make_dataset((label, month, t, X, mag_valid, ang_valid), graph_mode, options["history"], options["horizon"], options["max_gap"], min_meters=1, timeline=timeline)
+            ds = make_dataset((label, month, t, X, mag_valid, ang_valid), graph_mode, options["history"], options["horizon"], options["max_gap"], min_meters=1, timeline=timeline, raw_targets=wants_raw_targets(model))
             # Nothing
             if ds is None:
                 # Next
@@ -1585,14 +1695,23 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
             for x, y, y_valid, extra in loader:
                 # Persistence forecast from the untouched history, and whether it held anything to copy
                 y_pers, p_ok = persistence_forecast(x, C)
-                # Persistence validity: a target to compare with and a value to copy
-                p_valid = y_valid & p_ok
+                # Persistence validity: a target to compare with and a value to copy. Under the available_neighbor mask policy
+                # the batch carries unfiltered validity, so the usual per-meter filter is rebuilt here and the persistence tables stay as in an ordinary run
+                p_valid = (mp.own_usable_valid(x, y_valid, C, options["max_gap"]) if wants_raw_targets(model) else y_valid) & p_ok
                 # Masked model: every maskable meter hidden in turn, non-maskable meters invalid
                 if getattr(model, "masked", False):
+                    # Each window's own edge set when the batch carries period indices
+                    graph_ids = model.graph_ids(extra[:, 1]) if extra.dim() == 2 else None
+                    # Under the available_neighbor policy, which meters are eligible, from the inputs before anything is hidden
+                    eligible = model.mask_eligible(x, y_valid, graph_ids)[0] if wants_raw_targets(model) else None
                     # Forecasts
-                    y_hat, keep = masked_forecast(model, x, options.get("mask_chunk", 7))
+                    y_hat, keep = masked_forecast(model, x, options.get("mask_chunk", 7), graph_ids)
                     # Model validity
                     y_valid = y_valid & keep[None, :, None, None]
+                    # Only eligible meters get a masked residual under that policy
+                    if eligible is not None:
+                        # Keep the eligible ones
+                        y_valid = y_valid & eligible[:, :, None, None]
                 # Ordinary forecast
                 else:
                     # Per-example graphs when the batch carries period indices
@@ -1637,6 +1756,12 @@ def score_split(model, features_dir, splits, split_name, scale, manifest, device
                 pos += B
             # Rows that got any residual
             scored = np.isfinite(res["mag_res"]).any(axis=(1, 2))
+            # Under the available_neighbor mask policy a kept window can hold no eligible hidden meter and still hold valid
+            # persistence residuals, or a valid result in one mode only. Such a row must not be lost, so a row is written
+            # when either source has a valid residual in either mode. Every other run keeps the rule above, unchanged.
+            if wants_raw_targets(model):
+                # Any valid entry of the model or of persistence, magnitude or angle
+                scored = np.any([val[k].any(axis=(1, 2)) for k in val], axis=0)
             # Columns
             cols = {}
             # Loop over meters and channels

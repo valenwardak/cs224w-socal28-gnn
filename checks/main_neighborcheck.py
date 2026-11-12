@@ -64,6 +64,12 @@
 #              its period names, selected from the window's actual last
 #              history slot by the dataset, and donors come from the same
 #              period.
+#              A run trained with sender gating is rebuilt with sender
+#              gating (the saved sender_gate and max_gap options), so the
+#              model measured is the model that was trained. Without
+#              that, a gated run would be rebuilt ungated and the report
+#              would describe a different model. Masked runs are refused,
+#              as before.
 #
 #              Single file on purpose: it is a check, not pipeline code.
 #              Lives in checks/ and is run from the repo root. Needs torch
@@ -183,6 +189,8 @@ def load_run(run_dir, graph_path, manifest, device):
     if options.get("masked"):
         # Raise
         raise ValueError(f"{run_dir}: this check is for ordinary forecasters, not masked runs")
+    # Sender gating is rebuilt from the saved options below. A run saved before the option existed has no such key and was not gated.
+    gated = bool(options.get("sender_gate", False))
     # Graph file
     gbody = sm.load_graph(graph_path)
     # Kind
@@ -190,7 +198,7 @@ def load_run(run_dir, graph_path, manifest, device):
     # Graph for the fixed path
     graph = gbody if timeline is None else None
     # Model
-    model = sm.make_model(options["kind"], manifest, graph, edges=options["edges"], edge_weights=options["edge_weights"], hidden=options["hidden"], embed=options["embed"], layers=options["layers"], dropout=options["dropout"], seed=options["seed"], gnn_layers=options["gnn_layers"], predict_delta=options["predict_delta"], timeline=timeline)
+    model = sm.make_model(options["kind"], manifest, graph, edges=options["edges"], edge_weights=options["edge_weights"], hidden=options["hidden"], embed=options["embed"], layers=options["layers"], dropout=options["dropout"], seed=options["seed"], gnn_layers=options["gnn_layers"], predict_delta=options["predict_delta"], timeline=timeline, sender_gate=gated, gate_max_gap=options["max_gap"])
     # Best weights
     model.load_state_dict(torch.load(os.path.join(run_dir, "checkpoint_best.pt"), map_location="cpu"))
     # Evaluation mode, on the device

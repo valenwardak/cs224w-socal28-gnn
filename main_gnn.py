@@ -59,7 +59,30 @@
 #              seed. The run records graph_selection = "last_history_slot"
 #              (a fixed graph records "fixed") and the file's identity, so
 #              a resume or --score-only with the other kind of file is
-#              refused. --masked with a timeline is refused for now.
+#              refused.
+#
+#              Mask policy (--mask-policy, added 2026-11-12): which meters
+#              may be hidden in a window in masked mode. The course
+#              staff's milestone feedback asked whether the model uses the
+#              graph, and masked forecasting is the direct test. The test
+#              says something about the graph only when the hidden meter
+#              has a neighbor with data, and the diagnostics showed that
+#              neighbors without data are common. "available_neighbor"
+#              therefore hides a permitted meter only when its target is
+#              valid and at least one neighbor has usable history in the
+#              window (the --max-gap rule on the history only), under the
+#              edge set in force for the window. It works with a fixed and
+#              with a time-indexed graph file. The neighbors come from the
+#              graph file's own edges, so --edges none hides and scores the
+#              same targets as --edges true and is the matched comparison.
+#              "legacy" is the rule of the first masked trial (a permitted
+#              meter with a valid target, fixed graph only) and the
+#              default, so that trial's command and checkpoints behave as
+#              they did. --masked with a time-indexed graph needs
+#              --mask-policy available_neighbor. The run records
+#              mask_policy, so a resume or --score-only with the other
+#              policy is refused, and a checkpoint from before the option
+#              compares as "legacy". See socal_maskpolicy.py.
 #
 #              Sender gating (--sender-gate, added 2026-11-12): the course
 #              staff's milestone feedback asked whether nodes without
@@ -96,6 +119,9 @@
 #     python main_gnn.py --run-name gcn_v1 --score-only
 #   Masked model on the meter graph with the held-out 2023 block:
 #     python main_gnn.py --run-name gcn_masked --masked --graph graph_meters.json --splits splits_v2.json --angle-weight 0.01
+#   Masked objective on the time-indexed graph, with its matched no-edge control:
+#     python main_gnn.py --kind gcn --run-name gcn_dyn_masked --masked --mask-policy available_neighbor --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0
+#     python main_gnn.py --kind gcn --run-name gcn_dyn_masked_none --masked --mask-policy available_neighbor --edges none --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0
 #   Time-indexed meter graph, smoke test on September 2023 (holds two transfers):
 #     python main_gnn.py --train-months 2023-09 --epochs 2 --hidden 16 --angle-weight 0.01 --run-name smoke_dyn --graph graph_meters_periods.json --splits splits_v2.json --score-splits validation
 #   Time-indexed meter graph, full run:
@@ -156,6 +182,8 @@ import socal_modeldata as sd
 import socal_angdiff as sa
 # Project: models and training
 import socal_models as sm
+# Project: the mask policies of masked mode
+import socal_maskpolicy as mp
 
 
 def parse_args():
@@ -184,6 +212,8 @@ def parse_args():
     parser.add_argument("--sender-gate", action="store_true", help="Sender gating: a meter without usable history (the --max-gap rule on the history only) sends no message in that window; it keeps its self-loop and still receives; gcn only")
     # Masked objective
     parser.add_argument("--masked", action="store_true", help="Masked objective: hide one meter per window and forecast it from its neighbors; see socal_models.py")
+    # Which meters may be hidden in a window; the default is the first masked trial's rule, so its command builds the same run
+    parser.add_argument("--mask-policy", choices=list(mp.POLICIES), default=mp.LEGACY, help="Masked mode: legacy = a permitted meter with a valid target (fixed graph only); available_neighbor = also at least one neighbor with usable history in the window (fixed or time-indexed graph)")
     # Meters per masked evaluation pass
     parser.add_argument("--mask-chunk", type=int, default=7, help="Masked evaluation and scoring: meters hidden per forward pass (the batch is repeated this many times)")
     # Output
@@ -252,6 +282,10 @@ def parse_args():
     if args.sender_gate and args.kind != "gcn":
         # Refuse
         parser.error("--sender-gate is defined for --kind gcn only")
+    # The mask policy says how hidden meters are chosen, so it means nothing without --masked
+    if args.mask_policy != mp.LEGACY and not args.masked:
+        # Refuse
+        parser.error("--mask-policy applies to --masked runs only")
     # The masked evaluation chunk must hide at least one meter per pass
     if args.mask_chunk < 1:
         # Refuse
@@ -449,10 +483,10 @@ def main():
     graph = body if timeline is None else timeline["graphs"][0]
     # How each window's graph is chosen, recorded with the run
     graph_selection = "fixed" if timeline is None else "last_history_slot"
-    # Masked mode with a timeline is refused for now
-    if args.masked and timeline is not None:
+    # The first masked trial's rule knows nothing of periods, so on a time-indexed graph the available_neighbor policy is required
+    if args.masked and timeline is not None and args.mask_policy == mp.LEGACY:
         # Raise
-        raise ValueError("--masked with a time-indexed graph is not supported yet; use a fixed graph file")
+        raise ValueError("--masked with a time-indexed graph needs --mask-policy available_neighbor; the legacy policy is for a fixed graph file")
     # Identity of the graph file, checked on resume: its name and a hash of its contents, not its path, so Colab and local runs agree
     graph_id = graph_identity(args.graph)
     # Neighbor angle inputs on, before anything reads a month; the graph body gives the neighbors and the phase map
@@ -477,6 +511,10 @@ def main():
         log(f"neighbor angle feature valid in {ang_valid} meter-channel values of the {ang_slots} history slots of the {ang_windows} retained training windows")
     # Maskable meters, from the file as written, the same for every --edges control
     maskable_meters = maskable_from_graph(graph) if args.masked else None
+    # With a time-indexed graph a meter is permitted when it has an edge in any edge set; whether it has a neighbor in a given window is decided per window by the mask policy
+    if args.masked and timeline is not None:
+        # Union over the edge sets, in meter-number order
+        maskable_meters = sorted({m for g in timeline["graphs"] for m in maskable_from_graph(g)}, key=lambda m: int(m.split("_")[1]))
     # Masked mode forecasts the absolute value, never a correction to persistence
     predict_delta = args.predict_delta and not args.masked
     # Say so when the flag was overridden
@@ -501,6 +539,8 @@ def main():
         "sender_gate": args.sender_gate,
         # Graph identity, how each window's graph is chosen, and the masked objective
         "graph_id": graph_id, "graph_selection": graph_selection, "masked": args.masked, "maskable_meters": maskable_meters, "mask_chunk": args.mask_chunk,
+        # How hidden meters are chosen in masked mode; "legacy" for a run that is not masked, as before the option existed
+        "mask_policy": args.mask_policy if args.masked else mp.LEGACY,
         # Training
         "lr": args.lr, "weight_decay": args.weight_decay, "batch_size": args.batch_size, "angle_weight": args.angle_weight,
         # Stopping
@@ -586,8 +626,10 @@ def main():
     if args.masked:
         # Names
         log(f"masked objective: {len(maskable_meters)} maskable meters {maskable_meters}; not maskable: {[m for m in manifest['meters'] if m not in maskable_meters]}; {args.mask_chunk} meters per evaluation pass")
+        # The policy in force
+        log(f"mask policy {args.mask_policy}: " + ("a permitted meter is hidden only when its target is valid and at least one neighbor, under the graph file's own edges for the window's period, has usable history (no run of " + str(args.max_gap) + " or more absent slots); its own history need not be usable; the same targets are hidden and scored under every --edges control" if args.mask_policy == mp.AVAILABLE_NEIGHBOR else "a permitted meter with a valid target may be hidden, as in the first masked trial"))
     # Model
-    model = sm.make_model(args.kind, manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, heads=args.heads, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters, timeline=timeline, n_features=sd.n_features(), sender_gate=args.sender_gate, gate_max_gap=args.max_gap).to(device)
+    model = sm.make_model(args.kind, manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, heads=args.heads, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters, timeline=timeline, n_features=sd.n_features(), sender_gate=args.sender_gate, gate_max_gap=args.max_gap, mask_policy=args.mask_policy).to(device)
     # Parameter count
     log(f"model {args.kind} with {sum(p.numel() for p in model.parameters())} parameters" + (f", {args.heads} attention heads" if args.kind == "gat" else ""))
     # Checkpoint path
