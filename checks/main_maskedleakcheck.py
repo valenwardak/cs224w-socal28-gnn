@@ -65,9 +65,11 @@
 #                    result is used. A model trained with no connections
 #                    is exempt.
 #
-#              "Connected" means within as many edges as the run has
-#              message-passing layers, counted on the edges the model
+#              "Connected" means within as many edges as a message can
+#              travel in the run's model, counted on the edges the model
 #              saved (after --edges true, none or random was applied).
+#              That is one edge per message-passing layer, and for a
+#              TAGConv run (--kind tag) the run's tag_hops edges per layer.
 #              Every forecast and every difference must be a finite
 #              number: a NaN fails its case by name and cannot pass as "no
 #              change". Every mandatory test must cover at least one case.
@@ -105,6 +107,8 @@
 #   graph_identity(path)    the graph file's name and content hash, as main_gnn.py records it
 #   Tally                   largest difference over a set of cases, with nonfinite cases kept by name
 #   Response                how often a connected meter moved the forecast
+#   tag_hops_of(options)    the reach of the run's TAGConv layer, or the default for a run of another kind
+#   edges_reached(options)  how many edges a message can travel in the run's model
 #   load_run(args)          options, manifest, timeline, scale and the model with the best weights
 #   synthetic(B, H, M, C, seed, drop, extra)
 #                           a made-up input window
@@ -302,6 +306,25 @@ class Response:
         return f"moved in {self.moved} of {self.tried} cases, change from {self.low:.2e} to {self.high:.2e}" + bad
 
 
+def tag_hops_of(options):
+    """The reach of the run's TAGConv layer in edges. A run of another kind saved 0 or nothing; the model ignores the value then, so the default is handed over."""
+    # The saved reach when it is a real one, else the default
+    return int(options.get("tag_hops") or sm.TAG_HOPS)
+
+
+def edges_reached(options):
+    """
+    How many edges a message can travel in the run's model: one per
+    message-passing layer, and for a TAGConv run the run's tag_hops per
+    layer. The tests that say which meters may and may not reach a hidden
+    meter's forecast are built on this number.
+    """
+    # Edges per layer: tag_hops for TAGConv, one for every other kind
+    per_layer = tag_hops_of(options) if options["kind"] == "tag" else 1
+    # Over all layers
+    return int(options["gnn_layers"]) * per_layer
+
+
 def load_run(args):
     """Options from the checkpoint, the manifest, the timeline, the scale, and the model with its best weights on the CPU, after the refusals and the graph identity check."""
     # Checkpoint
@@ -335,7 +358,7 @@ def load_run(args):
         # Parse
         manifest = json.load(f)
     # Model as the run built it: same control, weights, sizes, input features, sender gating and rule for hidden meters
-    model = sm.make_model(options["kind"], manifest, timeline["graphs"][0], edges=options["edges"], edge_weights=options["edge_weights"], hidden=options["hidden"], embed=options["embed"], layers=options["layers"], dropout=options["dropout"], heads=options.get("heads", 4), seed=options["seed"], gnn_layers=options["gnn_layers"], predict_delta=options["predict_delta"], masked=True, maskable_meters=options["maskable_meters"], timeline=timeline, n_features=int(options.get("n_features", sd.F)), sender_gate=bool(options.get("sender_gate", False)), gate_max_gap=options["max_gap"], mask_policy=options.get("mask_policy", "legacy"))
+    model = sm.make_model(options["kind"], manifest, timeline["graphs"][0], edges=options["edges"], edge_weights=options["edge_weights"], hidden=options["hidden"], embed=options["embed"], layers=options["layers"], dropout=options["dropout"], heads=options.get("heads", 4), seed=options["seed"], gnn_layers=options["gnn_layers"], predict_delta=options["predict_delta"], masked=True, maskable_meters=options["maskable_meters"], timeline=timeline, n_features=int(options.get("n_features", sd.F)), sender_gate=bool(options.get("sender_gate", False)), gate_max_gap=options["max_gap"], mask_policy=options.get("mask_policy", "legacy"), tag_hops=tag_hops_of(options))
     # Best weights
     model.load_state_dict(torch.load(os.path.join(args.run_dir, "checkpoint_best.pt"), map_location="cpu"))
     # Evaluation mode
@@ -382,8 +405,8 @@ def reach_sets(model, k, M, hops):
     """
     Meter index -> sorted list of the other meters whose history may reach
     its forecast under saved edge set k: meters on the same node, or on a
-    node at most `hops` saved edges away. One message-passing layer moves
-    information across one edge, so hops is the run's number of layers.
+    node at most `hops` saved edges away. hops is how many edges a message
+    can travel in the run's model, from edges_reached().
     """
     # Node per meter
     node_of = model.meter_node.tolist()
@@ -403,7 +426,7 @@ def reach_sets(model, k, M, hops):
         seen = {node_of[i]}
         # Nodes added in the last round
         frontier = {node_of[i]}
-        # One round per message-passing layer
+        # One round per edge a message can travel
         for _ in range(hops):
             # Nodes that send into the last round's nodes and are new
             frontier = {v for u in frontier for v in senders.get(u, ())} - seen
@@ -776,7 +799,7 @@ def check_added(model, options, manifest, timeline, extra, args):
         # The separate model's weights are drawn at random, so the draw is seeded and the test repeats exactly
         torch.manual_seed(args.seed)
         # A separate model with added features: same graph, control, sizes, sender gating and rule for hidden meters
-        subject = sm.make_model(options["kind"], manifest, timeline["graphs"][0], edges=options["edges"], edge_weights=options["edge_weights"], hidden=options["hidden"], embed=options["embed"], layers=options["layers"], dropout=options["dropout"], heads=options.get("heads", 4), seed=options["seed"], gnn_layers=options["gnn_layers"], predict_delta=options["predict_delta"], masked=True, maskable_meters=options["maskable_meters"], timeline=timeline, n_features=sd.F + args.extra_features, sender_gate=bool(options.get("sender_gate", False)), gate_max_gap=options["max_gap"], mask_policy=options.get("mask_policy", "legacy")).eval()
+        subject = sm.make_model(options["kind"], manifest, timeline["graphs"][0], edges=options["edges"], edge_weights=options["edge_weights"], hidden=options["hidden"], embed=options["embed"], layers=options["layers"], dropout=options["dropout"], heads=options.get("heads", 4), seed=options["seed"], gnn_layers=options["gnn_layers"], predict_delta=options["predict_delta"], masked=True, maskable_meters=options["maskable_meters"], timeline=timeline, n_features=sd.F + args.extra_features, sender_gate=bool(options.get("sender_gate", False)), gate_max_gap=options["max_gap"], mask_policy=options.get("mask_policy", "legacy"), tag_hops=tag_hops_of(options)).eval()
         # Its label says what it is
         n_extra, label = args.extra_features, f"a SEPARATE freshly built model with {args.extra_features} added features per channel; not applicable to the trained run, which has none"
     # One window per edge set
@@ -910,9 +933,9 @@ def main():
     # Whether the model was trained with connections; without them no neighbor can respond
     wired = options["edges"] != "none"
     # Reach under every saved edge set
-    reach = [reach_sets(model, k, M, options["gnn_layers"]) for k in range(G)]
+    reach = [reach_sets(model, k, M, edges_reached(options)) for k in range(G)]
     # Report what is checked
-    print(f"edges={options['edges']}, sender_gate={bool(options.get('sender_gate', False))}, mask_policy={options.get('mask_policy', 'legacy')}, n_features={sd.F + extra}: {G} edge sets, {len(options['maskable_meters'])} meters that may be hidden, {options['gnn_layers']} message-passing layer(s), tolerance {args.tol:g}", flush=True)
+    print(f"edges={options['edges']}, sender_gate={bool(options.get('sender_gate', False))}, mask_policy={options.get('mask_policy', 'legacy')}, n_features={sd.F + extra}: {G} edge sets, {len(options['maskable_meters'])} meters that may be hidden, {options['gnn_layers']} message-passing layer(s) of kind {options['kind']}, a message travels at most {edges_reached(options)} edge(s), tolerance {args.tol:g}", flush=True)
     # Whether a required part could not be run
     incomplete = False
     # No gradient

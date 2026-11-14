@@ -31,6 +31,18 @@
 #              kind is refused. A new model (for example an R-GCN) gets a
 #              model class in socal_models.py and a line in make_model.
 #
+#              TAGConv (--kind tag, added 2026-11-14): the course staff's
+#              milestone feedback named TAGConv as a cheap way to give a
+#              meter a deeper reach. A gcn, gat or sage layer carries a
+#              message across one edge. A tag layer carries it across
+#              --tag-hops edges (default 3) in one layer, with the same
+#              edge weights and normalization as gcn. It shares the
+#              encoder, head, loss and data path with the other kinds and
+#              works with --masked, where the rule for which meters are
+#              hidden is unchanged. The run records tag_hops (0 for every
+#              other kind), so a resume with another reach is refused, and
+#              a checkpoint from before the option compares as 0.
+#
 #              By default the model predicts the change from the last valid
 #              reading (--predict-delta), so persistence is its starting
 #              point and it only has to learn what persistence misses.
@@ -128,6 +140,9 @@
 #     python main_gnn.py --run-name gcn_dyn --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01
 #   Sender gating on the time-indexed meter graph, matched to gcn_dyn_aw001 at seed 0:
 #     python main_gnn.py --kind gcn --run-name gcn_dyn_aw001_gate --sender-gate --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0
+#   TAGConv with a reach of three edges, ordinary and masked, on the time-indexed meter graph:
+#     python main_gnn.py --kind tag --tag-hops 3 --run-name tag_dyn_aw001 --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0
+#     python main_gnn.py --kind tag --tag-hops 3 --run-name tag_mask_dyn_aw001 --masked --mask-policy available_neighbor --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01 --seed 0
 #   GAT and GraphSAGE with the same settings:
 #     python main_gnn.py --kind gat --run-name gat_dyn_aw001 --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01
 #     python main_gnn.py --kind sage --run-name sage_dyn_aw001 --graph graph_meters_periods.json --splits splits_v2.json --angle-weight 0.01
@@ -201,9 +216,11 @@ def parse_args():
     # How to weight the edges
     parser.add_argument("--edge-weights", choices=["admittance", "binary"], default="admittance", help="admittance = scaled admittance_abs from graph.json, binary = all ones")
     # Message passing layer
-    parser.add_argument("--kind", choices=["gcn", "gat", "sage"], default="gcn", help="gcn = GCN normalization with edge weights, gat = attention over neighbors, sage = mean of neighbors")
+    parser.add_argument("--kind", choices=["gcn", "gat", "sage", "tag"], default="gcn", help="gcn = GCN normalization with edge weights, gat = attention over neighbors, sage = mean of neighbors, tag = TAGConv, which reaches --tag-hops edges in one layer")
     # Attention heads, used by gat only
     parser.add_argument("--heads", type=int, default=4, help="Attention heads for --kind gat (ignored otherwise)")
+    # Reach of a TAGConv layer, used by tag only
+    parser.add_argument("--tag-hops", type=int, default=sm.TAG_HOPS, help="Edges a message travels in one layer for --kind tag (ignored otherwise)")
     # Message passing depth
     parser.add_argument("--gnn-layers", type=int, default=1, help="Number of message passing layers (hops)")
     # Window rule for synchronized batches
@@ -278,6 +295,10 @@ def parse_args():
     if args.kind == "gat" and args.heads < 1:
         # Refuse
         parser.error("--heads must be at least 1 for --kind gat")
+    # TAGConv must reach at least one edge
+    if args.kind == "tag" and args.tag_hops < 1:
+        # Refuse
+        parser.error("--tag-hops must be at least 1 for --kind tag")
     # Sender gating is defined for the GCN layer only
     if args.sender_gate and args.kind != "gcn":
         # Refuse
@@ -537,6 +558,8 @@ def main():
         "edges": args.edges, "edge_weights": args.edge_weights, "min_meters": args.min_meters,
         # Sender gating: whether meters without usable history are silenced as senders; its gap rule is max_gap above
         "sender_gate": args.sender_gate,
+        # The reach of the TAGConv layer in edges; 0 for every other kind, which has no such setting
+        "tag_hops": args.tag_hops if args.kind == "tag" else 0,
         # Graph identity, how each window's graph is chosen, and the masked objective
         "graph_id": graph_id, "graph_selection": graph_selection, "masked": args.masked, "maskable_meters": maskable_meters, "mask_chunk": args.mask_chunk,
         # How hidden meters are chosen in masked mode; "legacy" for a run that is not masked, as before the option existed
@@ -629,9 +652,9 @@ def main():
         # The policy in force
         log(f"mask policy {args.mask_policy}: " + ("a permitted meter is hidden only when its target is valid and at least one neighbor, under the graph file's own edges for the window's period, has usable history (no run of " + str(args.max_gap) + " or more absent slots); its own history need not be usable; the same targets are hidden and scored under every --edges control" if args.mask_policy == mp.AVAILABLE_NEIGHBOR else "a permitted meter with a valid target may be hidden, as in the first masked trial"))
     # Model
-    model = sm.make_model(args.kind, manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, heads=args.heads, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters, timeline=timeline, n_features=sd.n_features(), sender_gate=args.sender_gate, gate_max_gap=args.max_gap, mask_policy=args.mask_policy).to(device)
+    model = sm.make_model(args.kind, manifest, graph, edges=args.edges, edge_weights=args.edge_weights, hidden=args.hidden, embed=args.embed, layers=args.layers, dropout=args.dropout, heads=args.heads, seed=args.seed, gnn_layers=args.gnn_layers, predict_delta=predict_delta, masked=args.masked, maskable_meters=maskable_meters, timeline=timeline, n_features=sd.n_features(), sender_gate=args.sender_gate, gate_max_gap=args.max_gap, mask_policy=args.mask_policy, tag_hops=args.tag_hops).to(device)
     # Parameter count
-    log(f"model {args.kind} with {sum(p.numel() for p in model.parameters())} parameters" + (f", {args.heads} attention heads" if args.kind == "gat" else ""))
+    log(f"model {args.kind} with {sum(p.numel() for p in model.parameters())} parameters" + (f", {args.heads} attention heads" if args.kind == "gat" else "") + (f", a reach of {args.tag_hops} edges per layer" if args.kind == "tag" else ""))
     # Checkpoint path
     checkpoint_path = os.path.join(run_dir, "checkpoint.pt")
     # Train unless scoring only

@@ -6,8 +6,8 @@
 # Created:     2026-10-22
 #
 # Purpose:     The learned models and everything around them: the shared
-#              meter-conditioned GRU, the three GNNs built on top of it
-#              (GCN, GAT, GraphSAGE), the persistence baseline, the loss,
+#              meter-conditioned GRU, the GNNs built on top of it
+#              (GCN, GAT, GraphSAGE, TAGConv), the persistence baseline, the loss,
 #              the training loop with checkpoints, and the scoring that
 #              writes a residual per slot, meter, and channel. The data
 #              side lives in socal_modeldata.py. Imported by the thin main
@@ -274,6 +274,9 @@ import socal_maskpolicy as mp
 
 # Feature count per channel, from the data module
 F = sd.F
+# The reach of the TAGConv layer when none is given: how many edges away a meter's message travels in one layer.
+# The course staff's milestone feedback named TAGConv as a cheap way to reach further than one edge.
+TAG_HOPS = 3
 
 
 # -----------------------------------------------------------------------------
@@ -664,9 +667,15 @@ class GraphForecaster(nn.Module):
     grid graph, and a head that reads each meter's own state together with
     its node's mixed state.
 
-    kind: "gcn", "gat", or "sage". Needs torch_geometric. gnn_layers is
-    the number of message-passing hops; one hop does not reach a meter
-    that sits two edges away behind an unmetered node.
+    kind: "gcn", "gat", "sage", or "tag". Needs torch_geometric. gnn_layers
+    is the number of message-passing layers. A gcn, gat or sage layer is
+    one hop, and one hop does not reach a meter that sits two edges away
+    behind an unmetered node. A tag layer (TAGConv) reaches tag_hops edges
+    in one layer: it adds up the node's own state and the states carried
+    1, 2, ... tag_hops edges, each through its own learned weights. It
+    uses the edge weights with the GCN normalization and adds no
+    self-loops, since the node's own state is its first term. tag_hops is
+    ignored by the other kinds.
 
     edge_sets is a list of (edge_index, edge_weight) pairs, one per graph.
     A fixed graph gives a list of one. Graph 0 is stored under the buffer
@@ -684,9 +693,15 @@ class GraphForecaster(nn.Module):
     one it always was.
     """
 
-    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_sets, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None, period_graph=None, n_features=None, sender_gate=False, gate_max_gap=None, mask_policy=mp.LEGACY, mask_adjacency=None):
+    def __init__(self, kind, n_meters, n_channels, n_nodes, meter_node, edge_sets, hidden=64, embed=8, layers=1, dropout=0.0, heads=4, gnn_layers=1, predict_delta=True, masked=False, maskable=None, period_graph=None, n_features=None, sender_gate=False, gate_max_gap=None, mask_policy=mp.LEGACY, mask_adjacency=None, tag_hops=TAG_HOPS):
         # Base class
         super().__init__()
+        # The reach of a TAGConv layer in edges, kept as a plain number; only kind tag uses it
+        self.tag_hops = int(tag_hops)
+        # A TAGConv layer must reach at least one edge
+        if kind == "tag" and self.tag_hops < 1:
+            # Raise
+            raise ValueError(f"kind tag needs tag_hops of at least 1, got {tag_hops}")
         # Sender gating: off unless asked for, so earlier runs are unchanged
         self.sender_gate = bool(sender_gate)
         # The gap length of the history rule, kept as a plain number so the state_dict does not change
@@ -742,7 +757,7 @@ class GraphForecaster(nn.Module):
             # Learned vector added to a hidden meter's state, so a mask is not mistaken for an outage
             self.mask_token = nn.Parameter(torch.zeros(hidden))
         # Layers from PyTorch Geometric, imported here so the GRU runs without it
-        from torch_geometric.nn import GCNConv, GATConv, SAGEConv
+        from torch_geometric.nn import GCNConv, GATConv, SAGEConv, TAGConv
         # Sizes
         self.C, self.hidden, self.n_nodes, self.kind = n_channels, hidden, n_nodes, kind
         # Shared encoder, sized to the features in use
@@ -785,6 +800,9 @@ class GraphForecaster(nn.Module):
             elif kind == "sage":
                 # Mean of neighbors, no weights
                 convs.append(SAGEConv(hidden, hidden))
+            elif kind == "tag":
+                # The node's own state plus the states carried 1 to tag_hops edges, with the edge weights normalized as in GCN
+                convs.append(TAGConv(hidden, hidden, K=self.tag_hops, normalize=True))
             else:
                 # Unknown
                 raise ValueError(f"unknown GNN kind: {kind}")
@@ -936,10 +954,10 @@ class GraphForecaster(nn.Module):
             ew = sg.gate_edge_weights(ei, ew, senders)
         # Stacked node features
         mixed = nodes.reshape(B * self.n_nodes, self.hidden)
-        # Each layer is one hop, with a residual connection
+        # Each layer is one hop (tag_hops hops for kind tag), with a residual connection
         for conv in self.convs:
             # By kind
-            if self.kind == "gcn":
+            if self.kind in ("gcn", "tag"):
                 # Weighted
                 out = conv(mixed, ei, edge_weight=ew)
             elif self.kind == "gat":
@@ -1176,9 +1194,11 @@ def residuals(y_hat, y, y_valid):
 # Training
 # -----------------------------------------------------------------------------
 
-def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None, timeline=None, n_features=None, sender_gate=False, gate_max_gap=None, mask_policy=mp.LEGACY):
+def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittance", hidden=64, embed=8, layers=1, dropout=0.0, heads=4, seed=0, gnn_layers=1, predict_delta=True, masked=False, maskable_meters=None, timeline=None, n_features=None, sender_gate=False, gate_max_gap=None, mask_policy=mp.LEGACY, tag_hops=TAG_HOPS):
     """
-    Build a model by name: "gru", "gcn", "gat", or "sage". With masked,
+    Build a model by name: "gru", "gcn", "gat", "sage", or "tag" (TAGConv,
+    which reaches tag_hops edges in one layer; tag_hops is ignored by the
+    other kinds). With masked,
     maskable_meters is the list of meter names that may be hidden, fixed
     by the caller from the true graph, not from the edges in use. With a
     timeline (load_timeline), graph is ignored: one edge set is built per
@@ -1251,7 +1271,7 @@ def make_model(kind, manifest, graph=None, edges="true", edge_weights="admittanc
     # Neighbor matrices for the available_neighbor policy, from the file's own edges of every edge set
     mask_adjacency = mp.adjacency_stack(graphs, meter_node.tolist()) if (masked and mp.check_policy(mask_policy) == mp.AVAILABLE_NEIGHBOR) else None
     # Build
-    return GraphForecaster(kind, M, C, len(graphs[0]["nodes"]), meter_node, edge_sets, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable, period_graph, n_features=n_features, sender_gate=sender_gate, gate_max_gap=gate_max_gap, mask_policy=mask_policy, mask_adjacency=mask_adjacency)
+    return GraphForecaster(kind, M, C, len(graphs[0]["nodes"]), meter_node, edge_sets, hidden, embed, layers, dropout, heads, gnn_layers, predict_delta, masked, maskable, period_graph, n_features=n_features, sender_gate=sender_gate, gate_max_gap=gate_max_gap, mask_policy=mask_policy, mask_adjacency=mask_adjacency, tag_hops=tag_hops)
 
 
 def new_sums():
@@ -1443,12 +1463,12 @@ def evaluate(model, features_dir, splits, split_name, scale, manifest, device, g
 
 
 # Options that define the experiment; a resumed run must match them
-EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate", "mask_policy")
+EXPERIMENT_KEYS = ("kind", "history", "horizon", "max_gap", "angle_weight", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "edges", "edge_weights", "min_meters", "lr", "weight_decay", "batch_size", "seed", "train_blocks", "splits_file", "predict_delta", "masked", "maskable_meters", "graph_id", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate", "mask_policy", "tag_hops")
 # Keys added after the first checkpoints were written. A checkpoint without "masked" was not masked, so it
 # compares as False, and a checkpoint without "graph_selection" used one fixed graph, so it compares as "fixed";
 # the other two are compared only when the checkpoint holds them. graph_selection is "fixed" (one graph for
 # every window) or "last_history_slot" (the time-indexed rule)
-LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed", "physics": "none", "n_features": F, "features": list(sd.FEATURES), "physics_scale": None, "angdiff": "none", "angdiff_settings": None, "sender_gate": False, "mask_policy": mp.LEGACY}
+LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph_selection": "fixed", "physics": "none", "n_features": F, "features": list(sd.FEATURES), "physics_scale": None, "angdiff": "none", "angdiff_settings": None, "sender_gate": False, "mask_policy": mp.LEGACY, "tag_hops": 0}
 # Later keys whose default stands in for a missing saved value instead of skipping the comparison. A checkpoint
 # without "physics" was trained without physics inputs ("none") on the F standard features in their standard order
 # and with no physics divisors, so a run with physics inputs can never resume from it, and the other way round; a
@@ -1458,8 +1478,10 @@ LATER_KEYS = {"masked": False, "maskable_meters": None, "graph_id": None, "graph
 # a gated run can never resume from it, and an ungated run loads it as before.
 # A checkpoint without "mask_policy" was made before the available_neighbor policy existed, so it compares as
 # "legacy": the first masked trial's checkpoints load and behave as they did, and a run under the new policy
-# can never resume from one of them
-DEFAULTED_KEYS = ("masked", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate", "mask_policy")
+# can never resume from one of them.
+# A checkpoint without "tag_hops" was made before the TAGConv layer existed, so it compares as 0, the value every
+# run of another kind records: such a run loads as before, and a TAGConv run can never resume from it
+DEFAULTED_KEYS = ("masked", "graph_selection", "physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate", "mask_policy", "tag_hops")
 
 
 def save_atomic(body, path):

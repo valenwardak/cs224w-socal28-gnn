@@ -76,6 +76,14 @@
 #              differ hide and score different targets and are a FAIL as
 #              seeds of one configuration.
 #
+#              The reach of the TAGConv layer (tag_hops, added 2026-11-14)
+#              is handled the same way. A run saved before the layer
+#              existed is not a TAGConv run, and every run of another kind
+#              records 0, so its absence is read as 0 and the key on one
+#              side only is INFO. Runs whose effective reaches differ pass
+#              messages over different distances and are a FAIL as seeds of
+#              one configuration.
+#
 #              Scoring evidence: main_score.py last changed in commit
 #              81c4857 (authored 2026-11-05 21:55 -0400, which is 2026-11-06
 #              01:55 UTC) and unchanged since; it writes a JSON
@@ -155,10 +163,11 @@ import tempfile
 # The keys the training script logged when the original runs were made (see the header for the commits)
 REQUIRED_KEYS = ["kind", "history", "horizon", "max_gap", "hidden", "embed", "layers", "dropout", "gnn_layers", "heads", "predict_delta", "edges", "edge_weights", "min_meters", "graph_id", "graph_selection", "masked", "maskable_meters", "mask_chunk", "lr", "weight_decay", "batch_size", "angle_weight", "epochs", "patience", "min_delta", "seed", "train_blocks", "splits_file"]
 # Keys later script revisions added; reported separately, never required
-LATER_KEYS = ["physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate", "mask_policy"]
+LATER_KEYS = ["physics", "n_features", "features", "physics_scale", "angdiff", "angdiff_settings", "sender_gate", "mask_policy", "tag_hops"]
 # Later keys whose absence has a stated meaning: a run saved before sender gating existed did not use it,
-# and a run saved before the mask policies existed used the first masked trial's rule, "legacy"
-ABSENT_MEANS = {"sender_gate": False, "mask_policy": "legacy"}
+# a run saved before the mask policies existed used the first masked trial's rule, "legacy",
+# and a run saved before the TAGConv layer existed has no TAGConv reach, which every run of another kind records as 0
+ABSENT_MEANS = {"sender_gate": False, "mask_policy": "legacy", "tag_hops": 0}
 # Files every complete run must have
 REQUIRED_FILES = ["train_log.txt", "scale.json", "checkpoint_best.pt"]
 # Score files with the statistic and scoring version each must carry
@@ -774,6 +783,12 @@ SELF_TEST_CASES = [
     ("mask_policy available_neighbor on all three", 0, "training compatibility: pass", [{"options": {"mask_policy": "available_neighbor"}}] * 3),
     ("mask_policy available_neighbor on candidate 2, absent on the reference", 1, "option mask_policy: reference legacy, candidate available_neighbor", [{}, {}, {"options": {"mask_policy": "available_neighbor"}}]),
     ("mask_policy available_neighbor on the reference, legacy on candidate 1", 1, "gcn_dyn_aw001_s1: option mask_policy: reference available_neighbor, candidate legacy", [{"options": {"mask_policy": "available_neighbor"}}, {"options": {"mask_policy": "legacy"}}, {"options": {"mask_policy": "available_neighbor"}}]),
+    ("tag_hops 0 recorded on candidate 1 only", 0, "tag_hops recorded on candidate only; absent is read as 0, so both sides are 0", [{}, {"options": {"tag_hops": 0}}, {}]),
+    ("tag_hops 0 on all three", 0, "training compatibility: pass", [{"options": {"tag_hops": 0}}] * 3),
+    ("tag_hops 3 on all three", 0, "training compatibility: pass", [{"options": {"tag_hops": 3}}] * 3),
+    ("tag_hops 3 on candidate 2, absent on the reference", 1, "option tag_hops: reference 0, candidate 3", [{}, {}, {"options": {"tag_hops": 3}}]),
+    ("tag_hops 3 on the reference, absent on candidate 1", 1, "gcn_dyn_aw001_s1: option tag_hops: reference 3, candidate 0", [{"options": {"tag_hops": 3}}, {}, {"options": {"tag_hops": 3}}]),
+    ("tag_hops 3 on the reference, 2 on candidate 1", 1, "gcn_dyn_aw001_s1: option tag_hops: reference 3, candidate 2", [{"options": {"tag_hops": 3}}, {"options": {"tag_hops": 2}}, {"options": {"tag_hops": 3}}]),
 ]
 
 
